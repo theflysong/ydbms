@@ -58,6 +58,15 @@ fn build_database() -> SymbolTable {
     let mut symbols = SymbolTable::new();
     symbols.define("f", f_tab).expect("注册 f");
     symbols.define("t", t_tab).expect("注册 t");
+    // 访问路径只来自**目录**（TODO 3.6）：给 `f.value` 建一条索引，
+    // 否则 `WHERE value = 10` 就是顺序扫描
+    symbols
+        .create_index("f_value", "f", 1, false)
+        .expect("给 f.value 建索引");
+    // 连接内侧要能建索引，索引嵌套循环才挑得出来
+    symbols
+        .create_index("t_x", "t", 0, false)
+        .expect("给 t.x 建索引");
     symbols
 }
 
@@ -437,22 +446,20 @@ fn aggregate_call_now_works() {
 }
 
 #[test]
-fn distinct_is_rejected() {
+fn distinct_on_is_still_rejected() {
     let symbols = build_database();
-    let err = rejected(&symbols, "SELECT DISTINCT x FROM f");
+    // 裸 `DISTINCT` 已经实现（见 `ir_features.rs`）；`DISTINCT ON` 仍然拒绝
+    let err = rejected(&symbols, "SELECT DISTINCT ON (x) x FROM f");
 
     assert!(matches!(err, DbError::Unsupported { .. }), "got {err:?}");
 }
 
 #[test]
-fn in_list_is_rejected() {
+fn in_list_selects_the_expected_rows() {
     let symbols = build_database();
-    let err = rejected(&symbols, "SELECT x FROM f WHERE x IN (1, 2)");
+    let out = query(&symbols, "SELECT x FROM f WHERE x IN (1, 2)").unwrap();
 
-    match err {
-        DbError::Unsupported { ref feature } => assert!(feature.contains("IN"), "{feature}"),
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
+    assert_eq!(col_i32(&out, 0), vec![1, 2]);
 }
 
 #[test]
@@ -603,6 +610,16 @@ fn a_where_on_one_side_of_a_join_is_pushed_below_it() {
         "{rendered}"
     );
     assert!(!rendered.contains("Filter("), "{rendered}");
+
+    // 索引是**目录对象**（`CREATE INDEX` 建的）：把它删掉之后同一张表就退回顺序扫描
+    let mut symbols = symbols;
+    symbols.drop_index("f_value", false).unwrap();
+    let rendered = explain(
+        &symbols,
+        "SELECT f.x FROM f JOIN t ON f.x = t.x WHERE f.value = 10",
+    );
+    assert!(rendered.contains("Scan(f, filter=[value = 10])"), "{rendered}");
+    assert!(!rendered.contains("Scan(f, index="), "{rendered}");
 }
 
 #[test]
@@ -669,4 +686,121 @@ fn pushdown_does_not_change_the_rows() {
 
     assert_eq!(col_i32(&joined, 0), vec![-5, -4]);
     assert_eq!(col_i32(&joined, 0), col_i32(&nested, 0));
+}
+
+// -------------------------------------------- 可空侧：只推 null-rejecting 谓词（3.6）
+
+/// `a(k INT)` 与 `b(k INT, y INT)`，其中 `b` 有一行 `y IS NULL`、还有一行
+/// `k` 压根配不上——左边那两行会被外连接补成 NULL。
+fn nullable_database() -> SymbolTable {
+    let a_shape = ColumnsShape::new(vec![Column::new("k", DataType::Int)]);
+    let mut a_tab = PhysTab::new("a", &a_shape);
+    for k in [1, 2, 3] {
+        a_tab.insert(vec![Value::Int(k)]).unwrap();
+    }
+
+    let b_shape = ColumnsShape::new(vec![
+        Column::new("k", DataType::Int),
+        Column::new("y", DataType::Int),
+    ]);
+    let mut b_tab = PhysTab::new("b", &b_shape);
+    b_tab.insert(vec![Value::Int(1), Value::Int(10)]).unwrap();
+    b_tab.insert(vec![Value::Int(3), Value::Null]).unwrap();
+
+    let mut symbols = SymbolTable::new();
+    symbols.define("a", a_tab).unwrap();
+    symbols.define("b", b_tab).unwrap();
+    symbols
+}
+
+#[test]
+fn a_null_rejecting_predicate_is_also_pushed_into_the_nullable_side() {
+    let symbols = nullable_database();
+
+    let rendered = explain(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y = 10",
+    );
+
+    // 推下去了：少给连接送行
+    assert!(rendered.contains("Scan(b, filter=[y = 10])"), "{rendered}");
+    // 但它**不能**取代连接之上那一份：外连接补出来的 NULL 行没被那张表扫过，
+    // 只有上面的谓词丢得掉它们。所以 `Filter` 还在。
+    assert!(rendered.contains("Filter([y = 10])"), "{rendered}");
+}
+
+#[test]
+fn the_pushed_predicate_does_not_change_the_rows() {
+    let symbols = nullable_database();
+
+    // 只有 a=1 与 b 的那一行真正配对成功；a=2、a=3 都被 `b.y = 10` 丢掉
+    // （a=2 是补出来的 NULL 行，a=3 配对上了但 y 是 NULL）
+    let out = query(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y = 10",
+    )
+    .unwrap();
+    assert_eq!(col_i32(&out, 0), vec![1]);
+}
+
+#[test]
+fn is_null_still_stays_above_the_join() {
+    let symbols = nullable_database();
+
+    // `b.y IS NULL` **不**是 null-rejecting（补出来的 NULL 也满足它），所以不推：
+    // 推下去那两行就没了，而正确答案是两行
+    let rendered = explain(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y IS NULL",
+    );
+    assert!(rendered.contains("Filter([(y IS NULL)])"), "{rendered}");
+    assert!(rendered.contains("Scan(b, filter=[])"), "{rendered}");
+
+    let out = query(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y IS NULL ORDER BY a.k",
+    )
+    .unwrap();
+    assert_eq!(col_i32(&out, 0), vec![2, 3], "配对不上的一行 + y 为 NULL 的一行");
+}
+
+#[test]
+fn is_not_null_is_pushed_into_the_nullable_side() {
+    let symbols = nullable_database();
+
+    let rendered = explain(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y IS NOT NULL",
+    );
+    assert!(rendered.contains("Scan(b, filter=[(y IS NOT NULL)])"), "{rendered}");
+
+    let out = query(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y IS NOT NULL",
+    )
+    .unwrap();
+    assert_eq!(col_i32(&out, 0), vec![1]);
+}
+
+#[test]
+fn an_or_of_null_rejecting_predicates_is_only_pushed_when_all_are() {
+    let symbols = nullable_database();
+
+    // `y = 10 OR y > 20`：两项都 null-rejecting → 整个 `OR` 也是 → 推得下去
+    let rendered = explain(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y = 10 OR b.y > 20",
+    );
+    assert!(
+        rendered.contains("Scan(b, filter=[(y = 10) OR (y > 20)])"),
+        "{rendered}"
+    );
+
+    // `y = 10 OR y IS NULL`：第二项不是 → 整个 `OR` 不是 → 一项都不推
+    let rendered = explain(
+        &symbols,
+        "SELECT a.k FROM a LEFT JOIN b ON a.k = b.k WHERE b.y = 10 OR b.y IS NULL",
+    );
+    assert!(rendered.contains("Scan(b, filter=[])"), "{rendered}");
+    assert!(rendered.contains("Filter([(y = 10) OR (y IS NULL)])"), "{rendered}");
 }

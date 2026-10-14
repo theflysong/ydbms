@@ -317,7 +317,8 @@ fn the_rest_of_the_on_predicate_is_still_checked() {
 
 #[test]
 fn a_single_key_join_on_a_base_table_uses_the_index() {
-    let symbols = ab(&[(1, 10)], &[(1, 100)]);
+    let mut symbols = ab(&[(1, 10)], &[(1, 100)]);
+    symbols.create_index("b_k", "b", 0, false).unwrap();
 
     let rendered = explain(&symbols, "SELECT a.k FROM a JOIN b ON a.k = b.k");
 
@@ -644,7 +645,9 @@ fn counting_pair(a: &[i32], b: &[i32]) -> (SymbolTable, Rc<Counts>, Rc<Counts>) 
 
 #[test]
 fn an_index_scan_fetches_only_the_matching_rows() {
-    let (symbols, counts) = counting(&[10, 11, 12, 13, 14]);
+    let (mut symbols, counts) = counting(&[10, 11, 12, 13, 14]);
+    // 访问路径只来自目录：先 `CREATE INDEX`（它扫一遍这一列把索引建出来）
+    symbols.create_index("t_x", "t", 0, false).unwrap();
 
     let plan = compile("SELECT * FROM t WHERE x = 13", &symbols).unwrap();
     let out = execute(&plan, &symbols).unwrap();
@@ -652,14 +655,21 @@ fn an_index_scan_fetches_only_the_matching_rows() {
     assert_eq!(out.nrows(), 1);
     assert_eq!(out.value(0, 0), Some(Value::Int(13)));
     // 建索引读一遍**这一列**，然后只有命中的那一行被整行取出
-    assert_eq!(counts.cells.get(), 5, "建索引读一列");
+    assert_eq!(counts.cells.get(), 5, "建索引（CREATE INDEX 时）读一列");
     assert_eq!(counts.rows.get(), 1, "只有命中的行被整行取出");
 }
 
 #[test]
 fn explain_shows_the_index_access_path() {
-    let (symbols, _) = counting(&[10, 11, 12]);
+    let (mut symbols, _) = counting(&[10, 11, 12]);
 
+    // **没有** `CREATE INDEX` 就是顺序扫描：本版不再为了"也许有用"先扫一遍表
+    assert_eq!(
+        explain(&symbols, "SELECT * FROM t WHERE x = 12"),
+        "Scan(t, filter=[x = 12])\n"
+    );
+
+    symbols.create_index("t_x", "t", 0, false).unwrap();
     assert_eq!(
         explain(&symbols, "SELECT * FROM t WHERE x = 12"),
         "Scan(t, index=[x], filter=[x = 12])\n"
@@ -681,6 +691,7 @@ fn an_index_scan_ignores_null_keys_and_keeps_duplicates() {
     }
     let mut symbols = SymbolTable::new();
     symbols.define("t", table).unwrap();
+    symbols.create_index("t_x", "t", 0, false).unwrap();
 
     let plan = compile("SELECT * FROM t WHERE x = 5", &symbols).unwrap();
     assert!(
@@ -695,29 +706,33 @@ fn an_index_scan_ignores_null_keys_and_keeps_duplicates() {
 }
 
 #[test]
-fn a_limit_of_zero_never_builds_the_index() {
-    let (symbols, counts) = counting(&[10, 11, 12, 13, 14]);
+fn a_limit_of_zero_never_rebuilds_an_invalidated_index() {
+    let (mut symbols, counts) = counting(&[10, 11, 12, 13, 14]);
+    symbols.create_index("t_x", "t", 0, false).unwrap();
+    let after_build = counts.cells.get();
 
+    // 索引失效之后是**惰性**重建的：上层一行都不要，就一直不建
+    symbols.invalidate_indexes("t");
     let plan = compile("SELECT * FROM t WHERE x = 13 LIMIT 0", &symbols).unwrap();
     let out = execute(&plan, &symbols).unwrap();
 
     assert_eq!(out.nrows(), 0);
-    // 索引是**惰性**建的：上层一行都不要，就一行都不读
-    assert_eq!(counts.cells.get(), 0, "连索引都没建");
+    assert_eq!(counts.cells.get(), after_build, "LIMIT 0 不该重建索引");
     assert_eq!(counts.rows.get(), 0);
 }
 
 #[test]
 fn an_index_join_does_not_materialize_the_inner_rows() {
     // 外侧 3 行、内侧 3 行，只有键 1 对得上
-    let (symbols, _, inner) = counting_pair(&[1, 2, 3], &[1, 4, 5]);
+    let (mut symbols, _, inner) = counting_pair(&[1, 2, 3], &[1, 4, 5]);
+    symbols.create_index("b_k", "b", 0, false).unwrap();
 
     let plan = compile("SELECT a.k FROM a JOIN b ON a.k = b.k", &symbols).unwrap();
     let out = execute(&plan, &symbols).unwrap();
 
     assert_eq!(out.nrows(), 1);
     // 内侧只被**建索引**扫了一遍（一列 3 格），整行只取了命中的那 1 行
-    assert_eq!(inner.cells.get(), 3, "建索引读一列");
+    assert_eq!(inner.cells.get(), 3, "建索引（CREATE INDEX 时）读一列");
     assert_eq!(inner.rows.get(), 1, "内侧没有物化");
 }
 

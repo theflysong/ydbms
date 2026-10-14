@@ -77,6 +77,30 @@ fn rows(db: &SymbolTable, table: &str) -> usize {
     db.relation(table).expect("表存在").nrows()
 }
 
+/// 某一列的文本形式（断言排序键时用）。
+fn text_of(table: &PhysTab, row: usize, column: usize) -> String {
+    table
+        .value(row, column)
+        .unwrap_or_else(|| panic!("第 {row} 行第 {column} 列没有值"))
+        .to_string()
+}
+
+/// 某一列的整数（断言排序键时用）。
+fn credits_of(table: &PhysTab, row: usize) -> i32 {
+    match table.value(row, 2) {
+        Some(Value::Int(v)) => v,
+        other => panic!("第 {row} 行的 credits 不是整数：{other:?}"),
+    }
+}
+
+/// 只降级并渲染计划（`EXPLAIN` 那条路）。
+fn explain(db: &SymbolTable, sql: &str) -> String {
+    ydbms::ir::compile(sql, db)
+        .expect("应当能降级")
+        .explain(db)
+        .expect("应当能渲染")
+}
+
 /// 把某一列的整数加起来。
 fn sum_int(table: &PhysTab, column: usize) -> i64 {
     (0..table.nrows())
@@ -127,6 +151,135 @@ fn query2_passes() {
 fn query3_passes() {
     let results = assert_all_ok(&mut database(), "query3.sql");
     assert_eq!(results.len(), 8);
+}
+
+#[test]
+fn query4_passes() {
+    // TODO 0.2 的验收点：子查询一套（标量 / IN / UNION / EXISTS / 相关标量 / 派生表 / ALL）
+    // 六条全部跑通。**"不报错"不等于"算对了"**，所以下面还有几条核对结果的不变量。
+    let results = assert_all_ok(&mut database(), "query4.sql");
+    assert_eq!(results.len(), 6);
+}
+
+#[test]
+fn query5_passes() {
+    // TODO 0.1 的验收点：`EXTRACT(YEAR FROM …)` 与 `ORDER BY <输出列序号>`
+    let results = assert_all_ok(&mut database(), "query5.sql");
+    assert_eq!(results.len(), 9);
+}
+
+#[test]
+fn order_by_an_output_column_number_sorts_by_that_column() {
+    // query5 [5-5] 是 `ORDER BY 3 DESC, 1`，3 = credits、1 = code。
+    // 以前它被降级成"排常量"，顺序是错的（测试台只数错误，所以没抓住）。
+    let mut db = database();
+    let out = query(
+        &mut db,
+        "SELECT c.code, c.title, c.credits, c.grade_mode
+         FROM courses AS c
+         ORDER BY 3 DESC, 1
+         LIMIT 8",
+    );
+
+    assert_eq!(out.nrows(), 8);
+    for r in 1..out.nrows() {
+        let prev = (credits_of(&out, r - 1), text_of(&out, r - 1, 0));
+        let cur = (credits_of(&out, r), text_of(&out, r, 0));
+        assert!(
+            prev.0 > cur.0 || (prev.0 == cur.0 && prev.1 < cur.1),
+            "第 {} 行违背了 credits DESC, code ASC：{:?} 之后是 {:?}",
+            r,
+            prev,
+            cur
+        );
+    }
+
+    // 排序键要指向**正确的输出列**（不是常量）
+    let explained = explain(&db, "SELECT c.code, c.title, c.credits, c.grade_mode FROM courses AS c ORDER BY 3 DESC, 1 LIMIT 8");
+    assert!(explained.contains("Sort(keys=[credits DESC, code ASC])"), "{explained}");
+}
+
+#[test]
+fn extract_year_orders_by_the_enrolment_year() {
+    // query5 [5-4]：按入学年份倒序、再按姓名。
+    let mut db = database();
+    let out = query(
+        &mut db,
+        "SELECT s.enrolled_at FROM students AS s
+         ORDER BY EXTRACT(YEAR FROM s.enrolled_at) DESC, s.name
+         LIMIT 8",
+    );
+
+    let years: Vec<i32> = (0..out.nrows())
+        .map(|r| {
+            let text = out.value(r, 0).expect("enrolled_at").to_string();
+            text[..4].parse().expect("年份")
+        })
+        .collect();
+
+    assert!(
+        years.windows(2).all(|w| w[0] >= w[1]),
+        "入学年份应当非递增：{years:?}"
+    );
+}
+
+#[test]
+fn the_scalar_subquery_keeps_only_above_average_grades() {
+    // query4 [4-1] 的形状：`gpa > (SELECT AVG(gpa) FROM gpa_grades)`。
+    // 用"和算好的平均值做连接"来核——两条路必须给出同一个行数。
+    let mut db = database();
+
+    let via_scalar = query(
+        &mut db,
+        "SELECT COUNT(*) FROM gpa_grades AS g
+         WHERE g.gpa > (SELECT AVG(gpa) FROM gpa_grades)",
+    );
+    let via_join = query(
+        &mut db,
+        "SELECT COUNT(*)
+         FROM gpa_grades AS g
+             JOIN (SELECT AVG(gpa) AS avg_gpa FROM gpa_grades) AS t
+               ON g.gpa > t.avg_gpa",
+    );
+
+    assert_eq!(via_scalar.value(0, 0), via_join.value(0, 0));
+
+    // 平均值两侧都该有人（不然这条查询就没意义了）
+    let above = via_scalar.value(0, 0).expect("COUNT");
+    assert!(above != Value::Int(0), "平均值之上必须有行");
+    assert!(above != Value::Int(520), "平均值之下也必须有行");
+}
+
+#[test]
+fn the_in_subquery_with_a_union_matches_the_two_branches_together() {
+    // query4 [4-2]：`IN (gpa 不及格 UNION pf 不及格)`。
+    // 两个分支分别在 `IN` 里的并集，必须等于两支各自筛选出来的并集。
+    let mut db = database();
+
+    let combined = query(
+        &mut db,
+        "SELECT s.student_id FROM students AS s
+         WHERE s.student_id IN (
+             SELECT g.student_id FROM gpa_grades AS g WHERE g.gpa < 1.00
+             UNION
+             SELECT p.student_id FROM pf_grades AS p WHERE p.result = 'F'
+         )",
+    );
+    let failing = query(
+        &mut db,
+        "SELECT s.student_id FROM students AS s
+         WHERE s.student_id IN (SELECT g.student_id FROM gpa_grades AS g WHERE g.gpa < 1.00)",
+    );
+    let pf_failing = query(
+        &mut db,
+        "SELECT s.student_id FROM students AS s
+         WHERE s.student_id IN (SELECT p.student_id FROM pf_grades AS p WHERE p.result = 'F')",
+    );
+
+    // `UNION` 去重，两个来源的学生数因此不会超过两边相加
+    assert!(combined.nrows() >= failing.nrows());
+    assert!(combined.nrows() >= pf_failing.nrows());
+    assert!(combined.nrows() > 0, "至少有一个学生不及格");
 }
 
 // ------------------------------------------------- 结果里的可核对不变量

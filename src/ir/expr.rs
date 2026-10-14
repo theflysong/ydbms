@@ -11,159 +11,33 @@
 //!
 //! 手写 IR 时用 [`ProgBuilder`]，它会自动分配寄存器，省掉手数寄存器号这个
 //! 易错活。
+//!
+//! # 子查询在表达式层长什么样
+//!
+//! 表达式里可以有子查询（[`Step::Subquery`]，内层是一份自足的 [`SubPlan`]）与
+//! **外层引用**（[`Step::Outer`]）。它们需要一点求值环境，所以求值分两个入口：
+//!
+//! * [`Prog::eval`] / [`Prog::eval_split`]：**没有环境**（[`NullEnv`]），只用于
+//!   纯程序（INSERT 的值、连接的键、下推的谓词……）；
+//! * [`Prog::eval_with`]：把 `&dyn Env` 带进去，实现见 [`crate::ir::exec`] 的
+//!   `ExecCtx`（外层行栈 + 子查询缓存）。
+//!
+//! [`Step::Outer`] 的类型直接写在 step 上（`verify` 看不到外层链），由
+//! [`crate::ir::Plan::analyze`] 回过头核对——见那里的 `check_subqueries`。
+//!
+//! 寄存器里装的东西（[`Scalar`]）、真值（[`Tri`]）与类型标签（[`ScalarType`]）
+//! 不在本文件，见 [`crate::ir::value`]。
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::fmt;
 
-use crate::db::table::{Column, DecimalOp, DbError, Result, TypeFamily, Value};
+use crate::db::table::{Column, DataType, DecimalOp, DbError, Result, TypeFamily, Value};
+
+use super::plan::Plan;
+use super::value::{Scalar, ScalarType, Tri};
 
 /// 寄存器号。一个程序用到的寄存器是 `0..nregs`。
 pub type Reg = u16;
-
-/// SQL 的**三值逻辑**真值。谓词的结果是它，不是 `bool`：
-/// `1 = NULL` 不是 false，是 `Unknown`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tri {
-    /// 真。
-    True,
-    /// 假。
-    False,
-    /// 未知（SQL 的 NULL 谓词结果）。`WHERE` 会把它丢掉。
-    Unknown,
-}
-
-impl Tri {
-    /// `NOT`。
-    pub fn not(self) -> Tri {
-        match self {
-            Tri::True => Tri::False,
-            Tri::False => Tri::True,
-            Tri::Unknown => Tri::Unknown,
-        }
-    }
-
-    /// Kleene 逻辑的 `AND`：有一侧是 False 就是 False。
-    pub fn and(self, other: Tri) -> Tri {
-        match (self, other) {
-            (Tri::False, _) | (_, Tri::False) => Tri::False,
-            (Tri::True, Tri::True) => Tri::True,
-            _ => Tri::Unknown,
-        }
-    }
-
-    /// Kleene 逻辑的 `OR`：有一侧是 True 就是 True。
-    pub fn or(self, other: Tri) -> Tri {
-        match (self, other) {
-            (Tri::True, _) | (_, Tri::True) => Tri::True,
-            (Tri::False, Tri::False) => Tri::False,
-            _ => Tri::Unknown,
-        }
-    }
-
-    /// 是不是确定的真。`WHERE` / `HAVING` / `CASE` 都只认这个。
-    pub fn is_true(self) -> bool {
-        matches!(self, Tri::True)
-    }
-}
-
-impl fmt::Display for Tri {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Tri::True => f.write_str("true"),
-            Tri::False => f.write_str("false"),
-            Tri::Unknown => f.write_str("NULL"),
-        }
-    }
-}
-
-/// IR 标量。
-///
-/// 可存储的值**直接复用 [`Value`]**，不再抄一份；`Truth` 是 IR 私有的谓词类型，
-/// **不进** [`DataType`](crate::db::table::DataType)、也**不进**[`Value`] 与磁盘格式。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Scalar {
-    /// 一个可存储的值（NULL / INT / TEXT / CHAR / VARCHAR / TIMESTAMP / NUMERIC）。
-    Value(Value),
-    /// 三值逻辑真值。
-    Truth(Tri),
-}
-
-/// 标量的类型。
-///
-/// `Value(_)` 是可存储的大类；`Null` 是**无类型 NULL**；`Bool` 是 IR 私有的谓词
-/// 类型。后两者都明确地被隔离在 [`Value`] 之外。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScalarType {
-    /// 某个可存储的大类。
-    Value(TypeFamily),
-    /// 无类型的 NULL。比较时与任何 `Value(_)` 相容；投影时退化成 `TEXT`。
-    Null,
-    /// 谓词的真值（IR 私有）。
-    Bool,
-}
-
-impl fmt::Display for ScalarType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ScalarType::Value(family) => write!(f, "{}", family),
-            ScalarType::Null => f.write_str("NULL"),
-            ScalarType::Bool => f.write_str("BOOL"),
-        }
-    }
-}
-
-impl Scalar {
-    /// 该值的类型。
-    pub fn ty(&self) -> ScalarType {
-        match self {
-            Scalar::Value(Value::Null) => ScalarType::Null,
-            Scalar::Value(v) => match v.family() {
-                Some(family) => ScalarType::Value(family),
-                None => ScalarType::Null,
-            },
-            Scalar::Truth(_) => ScalarType::Bool,
-        }
-    }
-
-    /// 取出整数内容。
-    pub fn as_int(&self) -> Option<i32> {
-        match self {
-            Scalar::Value(v) => v.as_int(),
-            Scalar::Truth(_) => None,
-        }
-    }
-
-    /// 取出三值真值。
-    pub fn as_truth(&self) -> Option<Tri> {
-        match self {
-            Scalar::Truth(t) => Some(*t),
-            Scalar::Value(_) => None,
-        }
-    }
-
-    /// 是不是 NULL。
-    pub fn is_null(&self) -> bool {
-        matches!(self, Scalar::Value(Value::Null))
-    }
-
-    /// 转成能进结果表的 [`Value`]；真值**进不了**结果表，返回 `None`。
-    pub fn to_value(&self) -> Option<Value> {
-        match self {
-            Scalar::Value(v) => Some(v.clone()),
-            Scalar::Truth(_) => None,
-        }
-    }
-}
-
-impl fmt::Display for Scalar {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Scalar::Value(v) => write!(f, "{}", v),
-            Scalar::Truth(t) => write!(f, "{}", t),
-        }
-    }
-}
 
 /// 二元运算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +66,22 @@ pub enum BinOp {
     And,
     /// 逻辑或
     Or,
+    /// `LIKE`（语法树里写作 `~~`）
+    Like,
+    /// `NOT LIKE`（`!~~`）
+    NotLike,
+    /// `ILIKE`（`~~*`）
+    ILike,
+    /// `NOT ILIKE`（`!~~*`）
+    NotILike,
+    /// `~`：POSIX 正则匹配，区分大小写。
+    Regex,
+    /// `!~`：`~` 取反。
+    NotRegex,
+    /// `~*`：POSIX 正则匹配，忽略大小写。
+    IRegex,
+    /// `!~*`：`~*` 取反。
+    NotIRegex,
 }
 
 impl BinOp {
@@ -210,7 +100,55 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::And => "AND",
             BinOp::Or => "OR",
+            BinOp::Like => "LIKE",
+            BinOp::NotLike => "NOT LIKE",
+            BinOp::ILike => "ILIKE",
+            BinOp::NotILike => "NOT ILIKE",
+            BinOp::Regex => "~",
+            BinOp::NotRegex => "!~",
+            BinOp::IRegex => "~*",
+            BinOp::NotIRegex => "!~*",
         }
+    }
+
+    /// 是不是 `LIKE` 那一族（`LIKE` / `ILIKE` 及其取反）。
+    ///
+    /// 它们**不是**比较运算：操作数与结果都是文本→布尔的另一种规则，
+    /// 求值走 `like_match`，类型检查走 [`pattern_type`]。
+    pub fn is_like(&self) -> bool {
+        matches!(
+            self,
+            BinOp::Like | BinOp::NotLike | BinOp::ILike | BinOp::NotILike
+        )
+    }
+
+    /// 是不是正则匹配那一族（`~` / `~*` 及其取反）。
+    pub fn is_regex(&self) -> bool {
+        matches!(
+            self,
+            BinOp::Regex | BinOp::NotRegex | BinOp::IRegex | BinOp::NotIRegex
+        )
+    }
+
+    /// 是不是「模式匹配」类运算（`LIKE` 族 + 正则族）。
+    pub fn is_pattern(&self) -> bool {
+        self.is_like() || self.is_regex()
+    }
+
+    /// 这一族里「要不要取反」。
+    fn negated(&self) -> bool {
+        matches!(
+            self,
+            BinOp::NotLike | BinOp::NotILike | BinOp::NotRegex | BinOp::NotIRegex
+        )
+    }
+
+    /// 这一族里「是不是忽略大小写」。
+    fn case_insensitive(&self) -> bool {
+        matches!(
+            self,
+            BinOp::ILike | BinOp::NotILike | BinOp::IRegex | BinOp::NotIRegex
+        )
     }
 
     /// 是否是逻辑运算（`AND` / `OR`）。
@@ -232,11 +170,25 @@ impl BinOp {
     }
 }
 
-/// 标量函数。目前只登记了 `ROUND`，要加新函数就在 `apply_call` 里加一个分支。
+/// 标量函数。要加新函数就在 `apply_call` 与 `call_type` 里各加一个分支。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunc {
     /// `ROUND(numeric, digits)`。
     Round,
+    /// `UPPER(text)`。
+    Upper,
+    /// `LEFT(text, n)`（按**字符**数，`n` 为负时去掉右边 `|n|` 个字符）。
+    Left,
+    /// `CONCAT_WS(sep, ...)`：变参，跳过 NULL 参数、分隔符为 NULL 时结果是 NULL。
+    ConcatWs,
+    /// `EXTRACT(YEAR FROM ts)`：本版只认 `YEAR`，见 [`crate::ir::irgen`]。
+    ///
+    /// 值模型里 TIMESTAMP 是定宽规范文本（`YYYY-MM-DD HH:MM:SS.ffffff`），
+    /// DATE 是定宽规范文本（`YYYY-MM-DD`），所以取年份就是取前 4 位——
+    /// 不需要任何日期运算。
+    ExtractYear,
+    /// `LENGTH(text)`：**按字符**数算（与 `VARCHAR` 的长度口径一致）。
+    Length,
 }
 
 impl ScalarFunc {
@@ -244,13 +196,20 @@ impl ScalarFunc {
     pub fn name(&self) -> &'static str {
         match self {
             ScalarFunc::Round => "ROUND",
+            ScalarFunc::Upper => "UPPER",
+            ScalarFunc::Left => "LEFT",
+            ScalarFunc::ConcatWs => "CONCAT_WS",
+            ScalarFunc::ExtractYear => "EXTRACT",
+            ScalarFunc::Length => "LENGTH",
         }
     }
 
-    /// 需要几个参数。
-    pub fn arity(&self) -> usize {
+    /// 需要几个参数；`None` 表示**变参**（具体个数由 `call_type` 判）。
+    pub fn arity(&self) -> Option<usize> {
         match self {
-            ScalarFunc::Round => 2,
+            ScalarFunc::Round | ScalarFunc::Left => Some(2),
+            ScalarFunc::Upper | ScalarFunc::ExtractYear | ScalarFunc::Length => Some(1),
+            ScalarFunc::ConcatWs => None,
         }
     }
 }
@@ -311,21 +270,52 @@ pub enum Step {
         /// 右操作数。
         rhs: Reg,
     },
-    /// `regs[dst] = if regs[cond] is TRUE { regs[then_value] } else { regs[else_value] }`。
+    /// `regs[dst] = if regs[cond] is TRUE { then_prog } else { else_prog }`。
     ///
     /// 走 SQL 的 `CASE` 语义：条件**不是 TRUE**（含 `Unknown`）就取 else 分支。
     ///
-    /// > 已知差异：寄存器机没有跳转，所以**两个分支都会先被算出来**。死分支里的
-    /// > 算术错误（例如除零）会冒出来，而 PostgreSQL 是惰性的。
+    /// **两个分支是自足的子程序**（自己的寄存器空间），只有被选中的那一个才会
+    /// 求值——这正是 SQL 标准给 `CASE` 保证的惰性：`CASE WHEN 1 = 0 THEN 1/0
+    /// ELSE 42 END` 是 42，不是"除以零"。代价是求值多了一层**有界递归**
+    /// （深度 = 表达式嵌套深度，而降级阶段本来就在这个嵌套上递归）。
     Case {
         /// 目的寄存器。
         dst: Reg,
         /// 条件寄存器（真值）。
         cond: Reg,
-        /// 条件为 TRUE 时取它。
-        then_value: Reg,
-        /// 否则取它。
-        else_value: Reg,
+        /// 条件为 TRUE 时求值的子程序。
+        then_prog: Prog,
+        /// 否则求值的子程序。
+        else_prog: Prog,
+        /// 统一后的类型是 `NUMERIC`：取到 `INT` 时要**真的转成**它。
+        ///
+        /// `INT` 与 `NUMERIC` 是唯一允许的隐式放大（见 `unify_branches`），
+        /// 而放行类型之后运行时也得真转，否则物化时会以 `TypeMismatch` 报错。
+        /// 这个标志由**降级**算出来（它要拿两个分支的类型），[`Prog::verify`]
+        /// 强制它与 `unify_branches` 的结果一致——不一致就报 `IrInvalid`，
+        /// 宁可拒绝，也不让 `Int` 悄悄落进 `NUMERIC` 列。
+        widen: bool,
+    },
+    /// `regs[dst] = regs[left] AND right_prog`，**左侧不是 FALSE 才算右侧**。
+    ///
+    /// Kleene 三值逻辑下与"两侧都算完再 AND"完全等价（`FALSE AND 任何` = FALSE），
+    /// 差别只在**右侧会不会被求值**：`WHERE false AND (1/0 = 1)` 不再报除零。
+    And {
+        /// 目的寄存器。
+        dst: Reg,
+        /// 左侧（本程序里的寄存器）。
+        left: Reg,
+        /// 左侧不是 FALSE 时才求值的右侧子程序。
+        right_prog: Prog,
+    },
+    /// `regs[dst] = regs[left] OR right_prog`，**左侧不是 TRUE 才算右侧**。
+    Or {
+        /// 目的寄存器。
+        dst: Reg,
+        /// 左侧（本程序里的寄存器）。
+        left: Reg,
+        /// 左侧不是 TRUE 时才求值的右侧子程序。
+        right_prog: Prog,
     },
     /// 标量函数调用。
     Call {
@@ -335,6 +325,45 @@ pub enum Step {
         func: ScalarFunc,
         /// 参数寄存器。
         args: Vec<Reg>,
+    },
+    /// 类型转换（`x::numeric`）。
+    ///
+    /// 只放行**值模型里真有意义**的几组转换，见 `cast_type`：同族恒等、
+    /// `INT → NUMERIC`、`NULL → 任意`。别的（`int::text` 之类）在验证期就拒绝。
+    Cast {
+        /// 目的寄存器。
+        dst: Reg,
+        /// 源寄存器。
+        src: Reg,
+        /// 目标类型。
+        to: DataType,
+    },
+    /// 求值一个**内层查询**（子查询），结果是一列里的一个值 / 一个存在性 / 一次
+    /// 量化的比较。
+    ///
+    /// 内层计划是**自足**的（自己的 `nodes`/`root`，见 [`SubPlan`]），执行时按当前
+    /// 外层行新建一份源——这正是拉取式执行模型让"相关子查询"变成自然事的地方：
+    /// 内层计划本来就是一个 `RowSource`。
+    Subquery {
+        /// 目的寄存器。
+        dst: Reg,
+        /// 内层计划与它的模式。
+        spec: Box<SubPlan>,
+    },
+    /// 读**外层**查询的某一列（相关子查询的绑定）。
+    ///
+    /// `depth` 是隔了几层（`1` 是直接外层），`index` 是那一层**扁平 schema** 里的
+    /// 下标——与 [`Prog::verify`] 输入的那个下标是同一套。类型直接写在 step 上
+    /// （`verify` 看不到外层链），由 [`crate::ir::Plan::analyze`] 回过头核对。
+    Outer {
+        /// 目的寄存器。
+        dst: Reg,
+        /// 隔了几层，从 1 开始。
+        depth: u16,
+        /// 外层扁平 schema 里的列下标。
+        index: usize,
+        /// 这一列的类型（分析期核对）。
+        ty: ScalarType,
     },
     /// `regs[dst] = (regs[src] IS [NOT] NULL)`。
     ///
@@ -347,6 +376,88 @@ pub enum Step {
         /// 是 `IS NOT NULL` 吗。
         negated: bool,
     },
+}
+
+/// 一个内层查询（子查询）。
+///
+/// 它**不是**外层计划的一部分：`plan` 有自己的节点数组与 root，所以"为外层每一行
+/// 重新建一份源"只是多调一次构建。内层对外的引用走 [`Step::Outer`]，`outers` 就是
+/// 那些引用面对的 schema 链。
+///
+/// 校验分两处（因为 [`Prog::verify`] 拿不到符号表）：`verify` 只看 step 自己的类型，
+/// 深一层的一致性（内层计划本身、`outers[0]` 与所在节点的输入 schema）由
+/// [`crate::ir::Plan::analyze`] 递归检查。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubPlan {
+    /// 内层计划。
+    pub plan: Plan,
+    /// 求值方式。
+    pub mode: SubMode,
+    /// 内层结果列的类型（`Exists` 模式下无意义）。
+    pub inner: ScalarType,
+    /// 内层的输出列数（`Scalar` / `Quantified` 必须恰好 1）。
+    pub arity: usize,
+    /// 外层 schema 链：`outers[0]` 是直接外层，`outers[1]` 再往外一层……
+    /// 未相关时为空。
+    pub outers: Vec<Vec<Column>>,
+    /// 内层（含嵌套子计划）里出现过 [`Step::Outer`] 吗。
+    ///
+    /// 只是**缓存提示**：相关就不能缓存结果。判断是保守的（出现过就算），
+    /// 保守只会少缓存，不会算错。
+    pub correlated: bool,
+}
+
+/// 子查询的求值方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubMode {
+    /// 标量子查询：内层必须只有一列。0 行 → `NULL`；多于 1 行 → 运行期错误。
+    Scalar,
+    /// `EXISTS (…)`：内层有没有行。
+    Exists,
+    /// `x op ANY (…)` / `x op ALL (…)`。
+    ///
+    /// `IN (子查询)` 就是 `op = Eq, all = false`；空集的语义与 SQL 标准一致
+    /// （`ALL` → 真、`ANY` → 假）。
+    Quantified {
+        /// 要比较的外层表达式；按**当前行**求值。
+        test: Prog,
+        /// 比较运算符。
+        op: BinOp,
+        /// 是 `ALL` 吗（否则 `ANY`）。
+        all: bool,
+    },
+}
+
+/// 求值一个 [`Prog`] 时需要的**环境**。
+///
+/// 只有在程序里出现 [`Step::Outer`] 或 [`Step::Subquery`] 时才用得上——普通的
+/// 程序走 [`Prog::eval`]，那里的环境是 [`NullEnv`]。
+///
+/// 实现见 [`crate::ir::exec`] 的 `ExecCtx`（它持有外层行栈与子查询结果缓存）。
+pub trait Env {
+    /// 取第 `depth` 层外层的第 `index` 列。
+    fn outer(&self, depth: u16, index: usize) -> std::result::Result<Scalar, EvalError>;
+
+    /// 求值一个内层子查询；`row` 是本程序面对的那一行，也就是**内层的外层行**。
+    fn subquery(&self, spec: &SubPlan, row: &[Value]) -> std::result::Result<Scalar, EvalError>;
+}
+
+/// 没有环境的求值：遇到 [`Step::Outer`] / [`Step::Subquery`] 就报错。
+///
+/// [`Prog::eval`] 与 [`Prog::eval_split`] 用它，于是那些"只有普通 step"的程序
+/// （INSERT 的值、连接的键、下推的谓词……）保持原来的签名与行为。
+pub struct NullEnv;
+
+impl Env for NullEnv {
+    fn outer(&self, _depth: u16, _index: usize) -> std::result::Result<Scalar, EvalError> {
+        Err(EvalError::NoEnv {
+            what: "外层引用",
+        })
+    }
+
+    fn subquery(&self, _spec: &SubPlan, _row: &[Value]) -> std::result::Result<Scalar, EvalError> {
+        Err(EvalError::NoEnv { what: "子查询" })
+    }
 }
 
 /// 求值期的失败。
@@ -387,6 +498,28 @@ pub enum EvalError {
         /// 溢出的运算符号。
         op: &'static str,
     },
+    /// 正则表达式不合法（`~` / `~*`）。
+    BadPattern {
+        /// 正则编译器的说法。
+        reason: String,
+    },
+    /// 日期 / 时间戳文本看不懂（`EXTRACT` 取年份）。
+    BadDate {
+        /// 出问题的文本。
+        value: String,
+    },
+    /// 需要求值环境却没给（[`Prog::eval`] 遇到了 [`Step::Outer`] / [`Step::Subquery`]）。
+    NoEnv {
+        /// 需要什么。
+        what: &'static str,
+    },
+    /// 内层子查询失败：**原样**带上它的错误（不走 `IrRuntime` 拍扁）。
+    Nested(Box<DbError>),
+    /// 标量子查询返回了多行——SQL 要求最多一行。
+    ScalarSubqueryRows {
+        /// 实际行数。
+        rows: usize,
+    },
 }
 
 impl EvalError {
@@ -405,16 +538,31 @@ impl EvalError {
             EvalError::NotABool => "期望真值，实际是可存储的值".to_string(),
             EvalError::DivisionByZero => "除以零".to_string(),
             EvalError::Overflow { op } => format!("整数溢出（{}）", op),
+            EvalError::BadPattern { reason } => format!("正则表达式不合法：{}", reason),
+            EvalError::BadDate { value } => {
+                format!("`{}` 不是一个能取年份的日期 / 时间戳文本", value)
+            }
+            EvalError::NoEnv { what } => format!("{} 需要求值环境，而这里没有", what),
+            EvalError::Nested(e) => e.to_string(),
+            EvalError::ScalarSubqueryRows { rows } => {
+                format!("标量子查询返回了 {} 行（SQL 要求最多 1 行）", rows)
+            }
         }
     }
 
     /// 补上节点下标，转成本 crate 的统一错误类型。
     ///
     /// 传 `None` 表示这个程序不属于任何计划节点（例如 `INSERT` 里的值表达式）。
+    ///
+    /// [`EvalError::Nested`] 例外：内层子查询的错误**原样返回**——它已经带着自己的
+    /// 节点号了，包进 `IrRuntime` 只会把它拍扁成一行字。
     pub fn into_db_error(self, node: Option<usize>) -> DbError {
-        DbError::IrRuntime {
-            node,
-            message: self.message(),
+        match self {
+            EvalError::Nested(e) => *e,
+            other => DbError::IrRuntime {
+                node,
+                message: other.message(),
+            },
         }
     }
 }
@@ -502,13 +650,35 @@ impl Prog {
                 Step::Case {
                     dst,
                     cond,
-                    then_value,
-                    else_value,
+                    then_prog,
+                    else_prog,
+                    widen,
                 } => {
                     require(read_reg(&defined, *cond, at)?, ScalarType::Bool, at, "CASE 的条件")?;
-                    let then_ty = read_reg(&defined, *then_value, at)?;
-                    let else_ty = read_reg(&defined, *else_value, at)?;
-                    write_reg(&mut defined, *dst, unify_branches(then_ty, else_ty, at)?, at)?;
+                    // 两个分支各自面对**同一个**输入 schema（它们是自足程序）
+                    let then_ty = then_prog.verify(input)?;
+                    let else_ty = else_prog.verify(input)?;
+                    let unified = unify_branches(then_ty, else_ty, at)?;
+                    // 放大标志必须与类型推导一致：这是降级与校验之间的一条约定，
+                    // 对不上就报错（而不是让 `Int` 悄悄落进 `NUMERIC` 列）
+                    let needs_widen = unified == ScalarType::Value(TypeFamily::Numeric);
+                    if *widen != needs_widen {
+                        return Err(invalid(format!(
+                            "step {}: CASE 的放大标志是 {}，而两个分支的类型 {} / {} 推导出来应该是 {}",
+                            at, widen, then_ty, else_ty, needs_widen
+                        )));
+                    }
+                    write_reg(&mut defined, *dst, unified, at)?;
+                }
+                Step::And { dst, left, right_prog } | Step::Or { dst, left, right_prog } => {
+                    let what = if matches!(step, Step::And { .. }) {
+                        "AND"
+                    } else {
+                        "OR"
+                    };
+                    require(read_reg(&defined, *left, at)?, ScalarType::Bool, at, what)?;
+                    require(right_prog.verify(input)?, ScalarType::Bool, at, what)?;
+                    write_reg(&mut defined, *dst, ScalarType::Bool, at)?;
                 }
                 Step::Call { dst, func, args } => {
                     let mut types = Vec::with_capacity(args.len());
@@ -516,6 +686,25 @@ impl Prog {
                         types.push(read_reg(&defined, *reg, at)?);
                     }
                     write_reg(&mut defined, *dst, call_type(*func, &types, at)?, at)?;
+                }
+                Step::Cast { dst, src, to } => {
+                    let src_ty = read_reg(&defined, *src, at)?;
+                    write_reg(&mut defined, *dst, cast_type(src_ty, *to, at)?, at)?;
+                }
+                Step::Subquery { dst, spec } => {
+                    // `test` 按**当前行**求值（它就是外层表达式），所以用本程序的
+                    // 输入 schema 校验。内层计划本身的校验在 `Plan::analyze` 里做
+                    // （那里才有符号表）。
+                    if let SubMode::Quantified { test, op, .. } = &spec.mode {
+                        let test_ty = test.verify(input)?;
+                        binary_type(*op, test_ty, spec.inner, at)?;
+                    }
+                    let ty = subquery_type(spec);
+                    write_reg(&mut defined, *dst, ty, at)?;
+                }                Step::Outer { dst, ty, .. } => {
+                    // 类型是 step 自己带的；与真正的外层 schema 是否一致由
+                    // `Plan::analyze` 核对（见 `Step::Outer` 的文档）。
+                    write_reg(&mut defined, *dst, *ty, at)?;
                 }
             }
         }
@@ -537,8 +726,11 @@ impl Prog {
     /// 求值。一个 `for` 循环 + 一个寄存器数组，无递归。
     ///
     /// 输入是**一整行**；输入被拆成两半的场合（连接的 `ON`）用 [`Prog::eval_split`]。
+    ///
+    /// 需要环境（`Step::Outer` / `Step::Subquery`）的程序用 [`Prog::eval_with`]；
+    /// 这个入口给的是 [`NullEnv`]，遇到那两个 step 会报 [`EvalError::NoEnv`]。
     pub fn eval(&self, row: &[Value]) -> std::result::Result<Scalar, EvalError> {
-        self.eval_split(row, &[])
+        self.eval_with(row, &[], &NullEnv)
     }
 
     /// 求值，输入可以是**拆开的两半**：`Step::Col { index }` 在
@@ -551,6 +743,20 @@ impl Prog {
         &self,
         left: &[Value],
         right: &[Value],
+    ) -> std::result::Result<Scalar, EvalError> {
+        self.eval_with(left, right, &NullEnv)
+    }
+
+    /// 带环境的求值（[`Prog::eval`] / [`Prog::eval_split`] 的通用版本）。
+    ///
+    /// 输入拆成两半的惰性只在 `Step::Col` 上保持；**只有**遇到 `Step::Subquery`
+    /// 才把两半拼成一行（内层的外层引用要的是一个完整的 schema），连接为每一对
+    /// 候选行拼整行的代价因此一点都没多付。
+    pub fn eval_with(
+        &self,
+        left: &[Value],
+        right: &[Value],
+        env: &dyn Env,
     ) -> std::result::Result<Scalar, EvalError> {
         let mut regs: Vec<Scalar> = vec![Scalar::Value(Value::Int(0)); self.nregs as usize];
 
@@ -584,27 +790,56 @@ impl Prog {
                 Step::Case {
                     dst,
                     cond,
-                    then_value,
-                    else_value,
+                    then_prog,
+                    else_prog,
+                    widen,
                 } => {
                     let take_then = get(&regs, *cond, self.nregs)?
                         .as_truth()
                         .ok_or(EvalError::NotABool)?
                         .is_true();
-                    // 两个分支都已经算好了，另一侧的类型是现成的（放大要用它）
-                    let (picked, other) = if take_then {
-                        (
-                            get(&regs, *then_value, self.nregs)?,
-                            get(&regs, *else_value, self.nregs)?,
-                        )
+                    // **只有被选中的那一支才求值**：死分支里的运行时错误不该冒出来
+                    let picked = if take_then {
+                        then_prog.eval_with(left, right, env)?
                     } else {
-                        (
-                            get(&regs, *else_value, self.nregs)?,
-                            get(&regs, *then_value, self.nregs)?,
-                        )
+                        else_prog.eval_with(left, right, env)?
                     };
-                    let picked = widen_branches(picked, &other);
+                    let picked = if *widen { widen_branches(picked) } else { picked };
                     put(&mut regs, *dst, picked, self.nregs)?;
+                }
+                Step::And {
+                    dst,
+                    left: l,
+                    right_prog,
+                } => {
+                    let t = get(&regs, *l, self.nregs)?
+                        .as_truth()
+                        .ok_or(EvalError::NotABool)?;
+                    // FALSE AND 任何 = FALSE，所以左侧为假时右侧**不求值**
+                    let v = if t == Tri::False {
+                        Tri::False
+                    } else {
+                        let r = right_prog.eval_with(left, right, env)?;
+                        t.and(r.as_truth().ok_or(EvalError::NotABool)?)
+                    };
+                    put(&mut regs, *dst, Scalar::Truth(v), self.nregs)?;
+                }
+                Step::Or {
+                    dst,
+                    left: l,
+                    right_prog,
+                } => {
+                    let t = get(&regs, *l, self.nregs)?
+                        .as_truth()
+                        .ok_or(EvalError::NotABool)?;
+                    // TRUE OR 任何 = TRUE，所以左侧为真时右侧**不求值**
+                    let v = if t == Tri::True {
+                        Tri::True
+                    } else {
+                        let r = right_prog.eval_with(left, right, env)?;
+                        t.or(r.as_truth().ok_or(EvalError::NotABool)?)
+                    };
+                    put(&mut regs, *dst, Scalar::Truth(v), self.nregs)?;
                 }
                 Step::Call { dst, func, args } => {
                     let mut values = Vec::with_capacity(args.len());
@@ -612,6 +847,11 @@ impl Prog {
                         values.push(get(&regs, *reg, self.nregs)?);
                     }
                     let v = apply_call(*func, &values)?;
+                    put(&mut regs, *dst, v, self.nregs)?;
+                }
+                Step::Cast { dst, src, to } => {
+                    let v = get(&regs, *src, self.nregs)?;
+                    let v = cast_value(v, *to)?;
                     put(&mut regs, *dst, v, self.nregs)?;
                 }
                 Step::IsNull { dst, src, negated } => {
@@ -628,6 +868,21 @@ impl Prog {
                         Tri::False
                     };
                     put(&mut regs, *dst, Scalar::Truth(truth), self.nregs)?;
+                }
+                Step::Subquery { dst, spec } => {
+                    // 内层的外层引用面对的是**本程序面对的那一行**，所以这里要把
+                    // 拆开的两半拼起来（只在这一步拼）。
+                    let row: Vec<Value> = if right.is_empty() {
+                        left.to_vec()
+                    } else {
+                        left.iter().chain(right.iter()).cloned().collect()
+                    };
+                    let v = env.subquery(spec, &row)?;
+                    put(&mut regs, *dst, v, self.nregs)?;
+                }
+                Step::Outer { dst, depth, index, .. } => {
+                    let v = env.outer(*depth, *index)?;
+                    put(&mut regs, *dst, v, self.nregs)?;
                 }
             }
         }
@@ -652,49 +907,73 @@ impl Prog {
             .ok_or(EvalError::NotABool)
     }
 
-    /// 这个程序引用到的所有输入列下标。谓词下推分派用它。
+    /// 带环境的"求值成谓词"（见 [`Prog::eval_with`]）。
+    pub fn eval_truth_with(
+        &self,
+        row: &[Value],
+        env: &dyn Env,
+    ) -> std::result::Result<Tri, EvalError> {
+        self.eval_with(row, &[], env)?
+            .as_truth()
+            .ok_or(EvalError::NotABool)
+    }
+
+    /// 这个程序里有子查询 step 吗。
+    ///
+    /// 谓词下推与索引键用它当**闸门**：含子查询的程序面对的行必须是它被降级时
+    /// 那个 schema（`Step::Subquery` 的外层引用按那个 schema 编的），推给单表
+    /// `Scan` 就会换掉那一行——那正是 `outers[0] == program_input` 这条不变量
+    /// 要挡住的事（见 [`crate::ir::plan`]）。
+    pub fn has_subquery(&self) -> bool {
+        self.steps.iter().any(|step| match step {
+            Step::Subquery { .. } => true,
+            _ => subprograms(step).any(Prog::has_subquery),
+        })
+    }
+
+    /// 这个程序引用外层行吗。
+    pub fn has_outer(&self) -> bool {
+        self.steps.iter().any(|step| match step {
+            Step::Outer { .. } => true,
+            _ => subprograms(step).any(Prog::has_outer),
+        })
+    }
+
+    /// 这个程序引用到的所有输入列下标（含子程序里的）。谓词下推分派用它。
     pub fn columns(&self) -> BTreeSet<usize> {
-        self.steps
-            .iter()
-            .filter_map(|s| match s {
-                Step::Col { index, .. } => Some(*index),
-                _ => None,
-            })
-            .collect()
+        let mut out = BTreeSet::new();
+        for step in &self.steps {
+            if let Step::Col { index, .. } = step {
+                out.insert(*index);
+            }
+            for prog in subprograms(step) {
+                out.extend(prog.columns());
+            }
+        }
+        out
     }
 
     /// 把两个程序合成一个 `self AND other`（真值程序）。
     ///
-    /// `other` 的寄存器整体后移 `self.nregs`，末尾追加一条 [`Step::Binary`] 的
-    /// `And`，于是两个程序各自的原样逻辑都不变。**这不是短路求值**：与
-    /// [`Step::Binary`] 一直以来的行为一样，两侧都会被算完（见 §2.2）。
+    /// 末尾追加一条 [`Step::And`]，`other` 原样当**自足子程序**（它有自己的寄存器
+    /// 空间，于是不用整体平移，也不会与 `self` 的寄存器撞上）。**这是短路求值**：
+    /// `self` 为 FALSE 时 `other` 不求值。
     ///
     /// 谓词下推要把同一张表上的几个合取项并进同一个 `Scan.filter`，用的就是它。
     ///
     /// > 寄存器数是 `u16`：合并后越界会报 [`DbError::IrInvalid`]，不静默回绕。
     pub fn and(self, other: Prog) -> Result<Prog> {
-        let shift = self.nregs;
-        let lhs = self.result;
-        let rhs = add_reg(other.result, shift)?;
-
-        let mut steps = self.steps;
-        for step in other.steps {
-            steps.push(shift_step(step, shift)?);
-        }
-
-        let dst = shift.checked_add(other.nregs).ok_or_else(|| {
-            invalid("两个程序合并后的寄存器数超过 u16".to_string())
-        })?;
-        steps.push(Step::Binary {
-            dst,
-            op: BinOp::And,
-            lhs,
-            rhs,
-        });
-
+        let dst = self.nregs;
         let nregs = dst
             .checked_add(1)
             .ok_or_else(|| invalid("合并后的寄存器数超过 u16".to_string()))?;
+
+        let mut steps = self.steps;
+        steps.push(Step::And {
+            dst,
+            left: self.result,
+            right_prog: other,
+        });
         Ok(Prog::new(steps, dst, nregs))
     }
 
@@ -716,6 +995,38 @@ impl Prog {
                     })?;
                     Ok(Step::Col { dst: *dst, index })
                 }
+                // 子程序里的列下标也是按**同一个输入 schema** 编的，要一起平移
+                Step::Case {
+                    dst,
+                    cond,
+                    then_prog,
+                    else_prog,
+                    widen,
+                } => Ok(Step::Case {
+                    dst: *dst,
+                    cond: *cond,
+                    then_prog: then_prog.rebase_columns(offset)?,
+                    else_prog: else_prog.rebase_columns(offset)?,
+                    widen: *widen,
+                }),
+                Step::And {
+                    dst,
+                    left,
+                    right_prog,
+                } => Ok(Step::And {
+                    dst: *dst,
+                    left: *left,
+                    right_prog: right_prog.rebase_columns(offset)?,
+                }),
+                Step::Or {
+                    dst,
+                    left,
+                    right_prog,
+                } => Ok(Step::Or {
+                    dst: *dst,
+                    left: *left,
+                    right_prog: right_prog.rebase_columns(offset)?,
+                }),
                 other => Ok(other.clone()),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -750,18 +1061,50 @@ impl Prog {
                 Step::Case {
                     dst,
                     cond,
-                    then_value,
-                    else_value,
+                    then_prog,
+                    else_prog,
+                    ..
                 } => {
                     let c = at(&texts, *cond);
-                    let t = at(&texts, *then_value);
-                    let e = at(&texts, *else_value);
+                    // 分支是自足程序：各自渲染一遍（寄存器名互不相干）
+                    let t = then_prog.explain(input);
+                    let e = else_prog.explain(input);
                     set(
                         &mut texts,
                         *dst,
                         format!("CASE WHEN {} THEN {} ELSE {} END", c, t, e),
                     );
                     set(&mut compound, *dst, false);
+                }
+                Step::And {
+                    dst,
+                    left,
+                    right_prog,
+                }
+                | Step::Or {
+                    dst,
+                    left,
+                    right_prog,
+                } => {
+                    let op = if matches!(step, Step::And { .. }) {
+                        "AND"
+                    } else {
+                        "OR"
+                    };
+                    let l = if flag(&compound, *left) {
+                        format!("({})", at(&texts, *left))
+                    } else {
+                        at(&texts, *left)
+                    };
+                    // 与 `Step::Binary` 同一套括号规则：右侧是复合表达式就括起来
+                    let rendered = right_prog.explain(input);
+                    let r = if result_is_compound(right_prog) {
+                        format!("({})", rendered)
+                    } else {
+                        rendered
+                    };
+                    set(&mut texts, *dst, format!("{} {} {}", l, op, r));
+                    set(&mut compound, *dst, true);
                 }
                 Step::Call { dst, func, args } => {
                     let rendered: Vec<String> =
@@ -771,6 +1114,19 @@ impl Prog {
                         *dst,
                         format!("{}({})", func.name(), rendered.join(", ")),
                     );
+                    set(&mut compound, *dst, false);
+                }
+                Step::Cast { dst, src, to } => {
+                    let inner = at(&texts, *src);
+                    set(&mut texts, *dst, format!("CAST({} AS {})", inner, to));
+                    set(&mut compound, *dst, false);
+                }
+                Step::Subquery { dst, spec } => {
+                    set(&mut texts, *dst, render_subquery(spec));
+                    set(&mut compound, *dst, false);
+                }
+                Step::Outer { dst, depth, index, .. } => {
+                    set(&mut texts, *dst, format!("outer[{}]#{}", depth, index));
                     set(&mut compound, *dst, false);
                 }
                 Step::IsNull { dst, src, negated } => {
@@ -873,14 +1229,39 @@ impl ProgBuilder {
         dst
     }
 
-    /// `CASE`：条件为 TRUE 取 `then_value`，否则取 `else_value`。
-    pub fn case(&mut self, cond: Reg, then_value: Reg, else_value: Reg) -> Reg {
+    /// `CASE`：条件为 TRUE 求值 `then_prog`，否则求值 `else_prog`。
+    ///
+    /// `widen` 见 [`Step::Case`]：统一后的类型是 `NUMERIC` 时为 `true`。
+    pub fn case(&mut self, cond: Reg, then_prog: Prog, else_prog: Prog, widen: bool) -> Reg {
         let dst = self.fresh();
         self.steps.push(Step::Case {
             dst,
             cond,
-            then_value,
-            else_value,
+            then_prog,
+            else_prog,
+            widen,
+        });
+        dst
+    }
+
+    /// `AND`：左侧不是 FALSE 才求值右侧。
+    pub fn and(&mut self, left: Reg, right_prog: Prog) -> Reg {
+        let dst = self.fresh();
+        self.steps.push(Step::And {
+            dst,
+            left,
+            right_prog,
+        });
+        dst
+    }
+
+    /// `OR`：左侧不是 TRUE 才求值右侧。
+    pub fn or(&mut self, left: Reg, right_prog: Prog) -> Reg {
+        let dst = self.fresh();
+        self.steps.push(Step::Or {
+            dst,
+            left,
+            right_prog,
         });
         dst
     }
@@ -889,6 +1270,35 @@ impl ProgBuilder {
     pub fn call(&mut self, func: ScalarFunc, args: Vec<Reg>) -> Reg {
         let dst = self.fresh();
         self.steps.push(Step::Call { dst, func, args });
+        dst
+    }
+
+    /// 类型转换（`x::numeric`）。
+    pub fn cast(&mut self, src: Reg, to: DataType) -> Reg {
+        let dst = self.fresh();
+        self.steps.push(Step::Cast { dst, src, to });
+        dst
+    }
+
+    /// 求值一个子查询。
+    pub fn subquery(&mut self, spec: SubPlan) -> Reg {
+        let dst = self.fresh();
+        self.steps.push(Step::Subquery {
+            dst,
+            spec: Box::new(spec),
+        });
+        dst
+    }
+
+    /// 读外层查询的某一列（相关子查询用）。
+    pub fn outer(&mut self, depth: u16, index: usize, ty: ScalarType) -> Reg {
+        let dst = self.fresh();
+        self.steps.push(Step::Outer {
+            dst,
+            depth,
+            index,
+            ty,
+        });
         dst
     }
 
@@ -916,61 +1326,79 @@ fn invalid(message: String) -> DbError {
     }
 }
 
-/// 寄存器号加一个偏移，越界即报错（`u16` 不静默回绕）。
-fn add_reg(reg: Reg, delta: Reg) -> Result<Reg> {
-    reg.checked_add(delta)
-        .ok_or_else(|| invalid(format!("寄存器 {} 后移 {} 后越界", reg, delta)))
+/// 这条指令写的寄存器。
+fn step_dst(step: &Step) -> Option<Reg> {
+    match step {
+        Step::Col { dst, .. }
+        | Step::Const { dst, .. }
+        | Step::Unary { dst, .. }
+        | Step::Binary { dst, .. }
+        | Step::Case { dst, .. }
+        | Step::And { dst, .. }
+        | Step::Or { dst, .. }
+        | Step::Call { dst, .. }
+        | Step::Cast { dst, .. }
+        | Step::Subquery { dst, .. }
+        | Step::Outer { dst, .. }
+        | Step::IsNull { dst, .. } => Some(*dst),
+    }
 }
 
-/// 把一条指令里**所有**寄存器后移 `delta`（[`Prog::and`] 用）。
+/// 一个子程序的渲染结果是"复合表达式"吗（渲染时要不要加括号）。
 ///
-/// 这是穷尽 match：将来加 [`Step`] 变体会在这里编译报错，不会漏改。
-fn shift_step(step: Step, delta: Reg) -> Result<Step> {
-    Ok(match step {
-        Step::Col { dst, index } => Step::Col {
-            dst: add_reg(dst, delta)?,
-            index,
-        },
-        Step::Const { dst, value } => Step::Const {
-            dst: add_reg(dst, delta)?,
-            value,
-        },
-        Step::Unary { dst, op, src } => Step::Unary {
-            dst: add_reg(dst, delta)?,
-            op,
-            src: add_reg(src, delta)?,
-        },
-        Step::Binary { dst, op, lhs, rhs } => Step::Binary {
-            dst: add_reg(dst, delta)?,
-            op,
-            lhs: add_reg(lhs, delta)?,
-            rhs: add_reg(rhs, delta)?,
-        },
+/// [`Prog::explain`] 用的是"每个寄存器一个 compound 标志"那套；子程序是独立渲染的，
+/// 所以这里只看**写结果的那一条指令**——与 `Binary` / `And` / `Or` 渲染时置
+/// `compound = true` 的口径一致。
+fn result_is_compound(prog: &Prog) -> bool {
+    let dst = prog.result();
+    prog.steps()
+        .iter()
+        .rev()
+        .find(|step| step_dst(step) == Some(dst))
+        .is_some_and(|step| matches!(step, Step::Binary { .. } | Step::And { .. } | Step::Or { .. }))
+}
+
+/// 一条指令里的**子程序**（`CASE` 的两个分支、`AND`/`OR` 的右侧）。
+///
+/// 它们与外层程序面对同一个输入行，但有**自己的寄存器空间**——所以遍历一个
+/// 程序时（校验、求值、渲染、收集列下标）必须走进它们，寄存器平移却不必。
+fn subprograms(step: &Step) -> impl Iterator<Item = &Prog> {
+    let mut branches: Vec<&Prog> = Vec::new();
+    match step {
         Step::Case {
-            dst,
-            cond,
-            then_value,
-            else_value,
-        } => Step::Case {
-            dst: add_reg(dst, delta)?,
-            cond: add_reg(cond, delta)?,
-            then_value: add_reg(then_value, delta)?,
-            else_value: add_reg(else_value, delta)?,
-        },
-        Step::Call { dst, func, args } => Step::Call {
-            dst: add_reg(dst, delta)?,
-            func,
-            args: args
-                .into_iter()
-                .map(|reg| add_reg(reg, delta))
-                .collect::<Result<Vec<_>>>()?,
-        },
-        Step::IsNull { dst, src, negated } => Step::IsNull {
-            dst: add_reg(dst, delta)?,
-            src: add_reg(src, delta)?,
-            negated,
-        },
-    })
+            then_prog,
+            else_prog,
+            ..
+        } => {
+            branches.push(then_prog);
+            branches.push(else_prog);
+        }
+        Step::And { right_prog, .. } | Step::Or { right_prog, .. } => {
+            branches.push(right_prog);
+        }
+        _ => {}
+    }
+    branches.into_iter()
+}
+
+/// 一个子查询 step 的结果类型。
+fn subquery_type(spec: &SubPlan) -> ScalarType {
+    match spec.mode {
+        SubMode::Scalar => spec.inner,
+        SubMode::Exists | SubMode::Quantified { .. } => ScalarType::Bool,
+    }
+}
+
+/// [`Prog::explain`] 里子查询的渲染。
+fn render_subquery(spec: &SubPlan) -> String {
+    let kind = match &spec.mode {
+        SubMode::Scalar => "scalar".to_string(),
+        SubMode::Exists => "exists".to_string(),
+        SubMode::Quantified { op, all, .. } => {
+            format!("{} {}", op.symbol(), if *all { "ALL" } else { "ANY" })
+        }
+    };
+    format!("<sublink:{}{}>", kind, if spec.correlated { ", correlated" } else { "" })
 }
 
 fn write_reg(
@@ -1026,6 +1454,9 @@ fn binary_type(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<Sca
         require(r, ScalarType::Bool, at, op.symbol())?;
         return Ok(ScalarType::Bool);
     }
+    if op.is_pattern() {
+        return pattern_type(op, l, r, at);
+    }
     if op.is_comparison() {
         // NULL 与任何可存储的大类都相容：`x = NULL` 是合法写法，结果是 UNKNOWN。
         // 另外 INT 与 NUMERIC 可以直接比——见 [`numeric_pair`]。
@@ -1055,6 +1486,25 @@ fn binary_type(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<Sca
     })
 }
 
+/// `LIKE` / `ILIKE` / `~` / `~*` 的类型规则：两侧都必须是 **TEXT**（或 NULL），
+/// 结果是布尔。别的家族（`timestamp LIKE …`、`int ~* …`）在这里就被拒绝——
+/// 与比较运算一样，宁可拒绝也不要安静地按大类排名去比。
+fn pattern_type(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<ScalarType> {
+    let is_text = |ty: ScalarType| {
+        matches!(ty, ScalarType::Value(TypeFamily::Text) | ScalarType::Null)
+    };
+    if !is_text(l) || !is_text(r) {
+        return Err(invalid(format!(
+            "step {}: {} 的两侧必须是 TEXT，实际是 {} 与 {}",
+            at,
+            op.symbol(),
+            l,
+            r
+        )));
+    }
+    Ok(ScalarType::Bool)
+}
+
 /// 算术操作数只能是 INT 或 NUMERIC，返回它的大类。
 fn arithmetic_family(ty: ScalarType, at: usize, op: BinOp) -> Result<TypeFamily> {
     match ty {
@@ -1069,7 +1519,29 @@ fn arithmetic_family(ty: ScalarType, at: usize, op: BinOp) -> Result<TypeFamily>
     }
 }
 
-fn apply(op: BinOp, l: Scalar, r: Scalar) -> std::result::Result<Scalar, EvalError> {
+pub(crate) fn apply(op: BinOp, l: Scalar, r: Scalar) -> std::result::Result<Scalar, EvalError> {
+    if op.is_pattern() {
+        // NULL 传播：任一侧是 NULL → UNKNOWN（与比较运算同一条规矩）
+        if l.is_null() || r.is_null() {
+            return Ok(Scalar::Truth(Tri::Unknown));
+        }
+        let (value, pattern) = match (&l, &r) {
+            (Scalar::Value(a), Scalar::Value(b)) => (a.to_string(), b.to_string()),
+            _ => return Err(EvalError::NotABool),
+        };
+        let matched = if op.is_like() {
+            like_match(&value, &pattern, op.case_insensitive())
+        } else {
+            regex_match(&value, &pattern, op.case_insensitive())?
+        };
+        let truth = if matched != op.negated() {
+            Tri::True
+        } else {
+            Tri::False
+        };
+        return Ok(Scalar::Truth(truth));
+    }
+
     if op.is_arithmetic() {
         // NULL 传播：任何一侧是 NULL，结果就是 NULL
         if l.is_null() || r.is_null() {
@@ -1156,9 +1628,151 @@ fn compare(l: Scalar, r: Scalar) -> std::result::Result<Ordering, EvalError> {
     }
 }
 
+/// `LIKE` / `ILIKE` 的匹配器：`%` 任意长、`_` 任意一个字符、`\` 是转义。
+///
+/// 自己写而不把模式翻成正则：`LIKE` 的语义小到可以直说，也免得为每一行都编译
+/// 一次正则。按**字符**匹配（与 `VARCHAR` 的长度检查口径一致），用的是带回溯的
+/// 线性扫描（`star` 记住最近一个 `%`）——不是那条会指数爆炸的递归写法。
+fn like_match(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let text: Vec<char> = value.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    // 最近一个 `%`：`(pattern 下标, 当时吞到的文本位置)`
+    let mut star: Option<(usize, usize)> = None;
+
+    loop {
+        if ti == text.len() {
+            // 文本看完了：剩下的模式必须全是 `%`（`\%` 是字面反斜杠，不算）
+            if pat[pi..].iter().all(|c| *c == '%') {
+                return true;
+            }
+            match star {
+                Some((sp, si)) if si < text.len() => {
+                    pi = sp + 1;
+                    ti = si + 1;
+                    star = Some((sp, si + 1));
+                    continue;
+                }
+                _ => return false,
+            }
+        }
+
+        // `%` 先不吞字符（吞 0 个），让后面的模式先试；试不动了再回溯多吞一个
+        let mut consumed = true;
+        let matched = match pat.get(pi) {
+            Some('%') => {
+                star = Some((pi, ti));
+                pi += 1;
+                consumed = false;
+                true
+            }
+            Some('_') => {
+                pi += 1;
+                true
+            }
+            Some('\\') => {
+                let (literal, step) = match pat.get(pi + 1) {
+                    Some(next) => (*next, 2),
+                    // 模式以 `\` 结尾：按字面 `\` 比
+                    None => ('\\', 1),
+                };
+                if char_eq(literal, text[ti], case_insensitive) {
+                    pi += step;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(ch) => {
+                if char_eq(*ch, text[ti], case_insensitive) {
+                    pi += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+
+        if matched {
+            if consumed {
+                ti += 1;
+            }
+            continue;
+        }
+
+        match star {
+            Some((sp, si)) if si < text.len() => {
+                pi = sp + 1;
+                ti = si + 1;
+                star = Some((sp, si + 1));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// 两个字符在（可能的）忽略大小写意义下相等。
+fn char_eq(a: char, b: char, case_insensitive: bool) -> bool {
+    if !case_insensitive {
+        return a == b;
+    }
+    // `to_lowercase` 可能给出多个字符（例如 `İ`），所以比迭代器而不是比字符
+    a == b || a.to_lowercase().eq(b.to_lowercase())
+}
+
+/// `~` / `~*` 的正则匹配。
+///
+/// 用的是 Rust 的 `regex`（本 crate 已有的依赖），**不是 POSIX ERE**：两边差在
+/// 少数转义上，见 [`translate_pattern`]。每一行都编译一次模式——模式通常是常量，
+/// 但本版没有模式缓存，这在长表上是个已知的开销。
+fn regex_match(
+    value: &str,
+    pattern: &str,
+    case_insensitive: bool,
+) -> std::result::Result<bool, EvalError> {
+    let translated = translate_pattern(pattern);
+    let re = regex::RegexBuilder::new(&translated)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| EvalError::BadPattern {
+            reason: e.to_string(),
+        })?;
+    Ok(re.is_match(value))
+}
+
+/// 把 PostgreSQL 正则里与 Rust `regex` 不同的那几个转义翻译过来。
+///
+/// 只翻**词边界**这一组（`~* '\mman\M'` 这种写法要用）：`\m` / `\M` / `\y` 都是
+/// 词边界、`\Y` 是非词边界。其余转义（`\d`、`\w`、`\s`、`\.`…）两边一致，原样
+/// 交给 `regex`；不认识的一律原样送过去，让 `regex` 自己报错。
+fn translate_pattern(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('m') | Some('M') | Some('y') => out.push_str("\\b"),
+            Some('Y') => out.push_str("\\B"),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
 /// 「整数」这个类型，写起来短一点。
-fn int_type() -> ScalarType {
-    ScalarType::Value(TypeFamily::Int)
+fn int_type() -> ScalarType {    ScalarType::Value(TypeFamily::Int)
 }
 
 /// 「一侧 INT、另一侧 NUMERIC」吗。
@@ -1220,33 +1834,62 @@ fn unify_branches(a: ScalarType, b: ScalarType, at: usize) -> Result<ScalarType>
     )))
 }
 
-/// `CASE` 取到的那一侧要按另一侧的类型**真的转换**。
+/// 两个分支统一后的类型；统一不了就是 `None`。
+///
+/// 与 [`unify_branches`] 是同一条规则，只是不提错误、不需要 step 下标——
+/// 降级阶段算 [`Step::Case::widen`] 的类型探针用它。
+pub(crate) fn unified_branch_type(then_ty: ScalarType, else_ty: ScalarType) -> Option<ScalarType> {
+    unify_branches(then_ty, else_ty, 0).ok()
+}
+
+/// `CASE` 取到的那一侧要按**统一后的类型**真的转换（`INT` → `NUMERIC`）。
 ///
 /// 只改 [`unify_branches`]（类型检查）是不够的：`CASE WHEN true THEN 1 ELSE 1.5 END`
 /// 的列类型成了 `NUMERIC`，而取到的值还是 `Value::Int`，物化时会以 `TypeMismatch`
 /// 报错。这与比较侧的 [`widen_numeric`] 是同一条规矩——类型放行之后，运行时也得真转。
 ///
-/// 两个分支都已经算好了（见 [`Step::Case`] 的已知差异），所以另一侧的类型是现成的。
-fn widen_branches(picked: Scalar, other: &Scalar) -> Scalar {
-    match (&picked, other) {
-        (Scalar::Value(Value::Int(i)), Scalar::Value(Value::Numeric(_))) => {
-            Scalar::Value(Value::Numeric(i.to_string()))
-        }
-        _ => picked,
+/// 是否需要转由 [`Step::Case::widen`] 决定（那是降级时按两个分支的类型算出来的），
+/// 这里只做转换本身。
+fn widen_branches(picked: Scalar) -> Scalar {
+    match picked {
+        Scalar::Value(Value::Int(i)) => Scalar::Value(Value::Numeric(i.to_string())),
+        other => other,
     }
 }
 
 /// 标量函数的参数与返回类型。
 fn call_type(func: ScalarFunc, args: &[ScalarType], at: usize) -> Result<ScalarType> {
-    if args.len() != func.arity() {
+    if let Some(arity) = func.arity() {
+        if args.len() != arity {
+            return Err(invalid(format!(
+                "step {}: {} 需要 {} 个参数，实际给了 {} 个",
+                at,
+                func.name(),
+                arity,
+                args.len()
+            )));
+        }
+    } else if args.is_empty() {
         return Err(invalid(format!(
-            "step {}: {} 需要 {} 个参数，实际给了 {} 个",
+            "step {}: {} 至少需要 1 个参数",
             at,
-            func.name(),
-            func.arity(),
-            args.len()
+            func.name()
         )));
     }
+
+    // 「这一位要么是文本、要么是 NULL」——文本函数共同的参数规则
+    let text_arg = |index: usize, what: &str| -> Result<()> {
+        match args[index] {
+            ScalarType::Value(TypeFamily::Text) | ScalarType::Null => Ok(()),
+            other => Err(invalid(format!(
+                "step {}: {} 的{}必须是 TEXT，实际是 {}",
+                at,
+                func.name(),
+                what,
+                other
+            ))),
+        }
+    };
 
     match func {
         ScalarFunc::Round => {
@@ -1274,6 +1917,60 @@ fn call_type(func: ScalarFunc, args: &[ScalarType], at: usize) -> Result<ScalarT
             // 与 PostgreSQL 一致：round(numeric, int) 返回 numeric
             Ok(ScalarType::Value(TypeFamily::Numeric))
         }
+
+        ScalarFunc::Upper => {
+            text_arg(0, "参数")?;
+            Ok(ScalarType::Value(TypeFamily::Text))
+        }
+
+        ScalarFunc::Left => {
+            text_arg(0, "第一个参数")?;
+            match args[1] {
+                ScalarType::Value(TypeFamily::Int) | ScalarType::Null => {}
+                other => {
+                    return Err(invalid(format!(
+                        "step {}: LEFT 的第二个参数必须是 INT，实际是 {}",
+                        at, other
+                    )))
+                }
+            }
+            Ok(ScalarType::Value(TypeFamily::Text))
+        }
+
+        ScalarFunc::ConcatWs => {
+            // 分隔符必须是文本（NULL 也放行：结果是 NULL）
+            text_arg(0, "分隔符")?;
+            // 其余参数**可以是任何可存储类型**（PostgreSQL 会把它们转成文本），
+            // 只有真值不行——那是 IR 私有的、进不了结果列。
+            if let Some(other) = args.iter().find(|ty| matches!(ty, ScalarType::Bool)) {
+                return Err(invalid(format!(
+                    "step {}: CONCAT_WS 的参数不能是 {}",
+                    at, other
+                )));
+            }
+            Ok(ScalarType::Value(TypeFamily::Text))
+        }
+
+        ScalarFunc::Length => {
+            text_arg(0, "参数")?;
+            Ok(int_type())
+        }
+
+        ScalarFunc::ExtractYear => {
+            match args[0] {
+                ScalarType::Value(TypeFamily::Text)
+                | ScalarType::Value(TypeFamily::Timestamp)
+                | ScalarType::Value(TypeFamily::Date)
+                | ScalarType::Null => {}
+                other => {
+                    return Err(invalid(format!(
+                        "step {}: EXTRACT 的参数必须是 TIMESTAMP / DATE 或日期文本，实际是 {}",
+                        at, other
+                    )))
+                }
+            }
+            Ok(int_type())
+        }
     }
 }
 
@@ -1295,7 +1992,126 @@ fn apply_call(func: ScalarFunc, args: &[Scalar]) -> std::result::Result<Scalar, 
                 .map_err(|reason| EvalError::Decimal { reason })?;
             Ok(Scalar::Value(rounded))
         }
+
+        ScalarFunc::Upper => {
+            let text = scalar_text(&args[0])?;
+            Ok(match text {
+                Some(text) => Scalar::Value(Value::Text(text.to_uppercase())),
+                None => Scalar::Value(Value::Null),
+            })
+        }
+
+        ScalarFunc::Left => {
+            let text = scalar_text(&args[0])?;
+            let digits = args[1].as_int();
+            match (text, digits) {
+                (None, _) | (_, None) => Ok(Scalar::Value(Value::Null)),
+                (Some(text), Some(n)) => {
+                    let chars: Vec<char> = text.chars().collect();
+                    // PostgreSQL：`n` 为负时去掉右边 `|n|` 个字符
+                    let keep = if n >= 0 {
+                        (n as usize).min(chars.len())
+                    } else {
+                        chars.len().saturating_sub(n.unsigned_abs() as usize)
+                    };
+                    Ok(Scalar::Value(Value::Text(chars[..keep].iter().collect())))
+                }
+            }
+        }
+
+        ScalarFunc::ConcatWs => {
+            // 分隔符为 NULL → NULL（PostgreSQL 就是这么定的）
+            if args[0].is_null() {
+                return Ok(Scalar::Value(Value::Null));
+            }
+            let separator = scalar_text(&args[0])?.unwrap_or_default();
+            let mut parts = Vec::with_capacity(args.len());
+            for arg in &args[1..] {
+                // NULL 参数**跳过**，不算一个空串
+                if let Some(text) = scalar_text(arg)? {
+                    parts.push(text);
+                }
+            }
+            Ok(Scalar::Value(Value::Text(parts.join(&separator))))
+        }
+
+        ScalarFunc::Length => {
+            let text = scalar_text(&args[0])?;
+            match text {
+                None => Ok(Scalar::Value(Value::Null)),
+                Some(text) => {
+                    let count = i32::try_from(text.chars().count())
+                        .map_err(|_| EvalError::Overflow { op: "LENGTH" })?;
+                    Ok(Scalar::Value(Value::Int(count)))
+                }
+            }
+        }
+
+        ScalarFunc::ExtractYear => {
+            let text = scalar_text(&args[0])?;
+            match text {
+                None => Ok(Scalar::Value(Value::Null)),
+                Some(text) => {
+                    let year = text
+                        .chars()
+                        .take(4)
+                        .collect::<String>()
+                        .parse::<i32>()
+                        .map_err(|_| EvalError::BadDate { value: text.clone() })?;
+                    if text.chars().count() < 4 {
+                        return Err(EvalError::BadDate { value: text });
+                    }
+                    Ok(Scalar::Value(Value::Int(year)))
+                }
+            }
+        }
     }
+}
+
+/// 一个标量当文本用；NULL 给 `None`，真值给错误。
+fn scalar_text(value: &Scalar) -> std::result::Result<Option<String>, EvalError> {
+    match value {
+        Scalar::Value(Value::Null) => Ok(None),
+        Scalar::Value(v) => Ok(Some(v.to_string())),
+        Scalar::Truth(_) => Err(EvalError::NotABool),
+    }
+}
+
+/// `x::to` 的类型规则。
+///
+/// 只管**值模型里真有意义**的几组：同族恒等（`x::int`、`name::varchar(3)`）、
+/// `INT → NUMERIC`、`NULL → 任意`。别的组合（`int::text`、`timestamp::int`）
+/// 在这里就报 `IrInvalid`——宁可拒绝，也不要给一个安静的错误答案。
+fn cast_type(from: ScalarType, to: DataType, at: usize) -> Result<ScalarType> {
+    let target = ScalarType::Value(to.family());
+    if matches!(from, ScalarType::Null) {
+        return Ok(target);
+    }
+    match from {
+        ScalarType::Value(family) if family == to.family() => Ok(target),
+        ScalarType::Value(TypeFamily::Int) if to.family() == TypeFamily::Numeric => Ok(target),
+        other => Err(invalid(format!(
+            "step {}: 不能把 {} 转成 {}",
+            at, other, to
+        ))),
+    }
+}
+
+/// `x::to` 的求值：类型规则放行之后，这里必须**真的转**（同 [`widen_numeric`]）。
+fn cast_value(value: Scalar, to: DataType) -> std::result::Result<Scalar, EvalError> {
+    let value = match value {
+        Scalar::Value(v) => v,
+        Scalar::Truth(_) => return Err(EvalError::NotABool),
+    };
+
+    let converted = match (&value, to.family()) {
+        (Value::Null, _) => Value::Null,
+        (Value::Int(i), TypeFamily::Numeric) => Value::Numeric(i.to_string()),
+        // 同族恒等（含 INT → INT，以及 typmod 的收窄只发生在 INSERT 时）
+        (other, _) => other.clone(),
+    };
+
+    Ok(Scalar::Value(converted))
 }
 
 /// 从**分裂的输入**里取第 `index` 列。

@@ -112,25 +112,32 @@ impl Table for PhysTab {
         Ok(self.rows.len() - 1)
     }
 
+    /// 改一格。**先组成候选整行、过 `validate`，再落库**——`validate` 是
+    /// typmod 与 `NOT NULL` 的唯一入口，不能在这里另写一套检查（两套迟早分叉：
+    /// 只看大同类的老写法会把合法的 `VARCHAR(30)` 值判成类型不符）。
     fn update(&mut self, r: usize, c: usize, value: Value) -> Result<()> {
+        let nrows = self.rows.len();
+        let mut row = self
+            .row(r)
+            .ok_or(DbError::RowOutOfBounds { index: r, nrows })?;
         let arity = self.arity();
         if c >= arity {
             return Err(DbError::ColumnOutOfBounds { index: c, arity });
         }
-        let (expected, got) = (self.columns()[c].ty, value.data_type());
-        if expected != got {
-            return Err(DbError::TypeMismatch {
-                column: self.columns()[c].name.clone(),
-                expected,
-                got,
-            });
-        }
-        let nrows = self.rows.len();
-        let row = self
-            .rows
-            .get_mut(r)
-            .ok_or(DbError::RowOutOfBounds { index: r, nrows })?;
         row[c] = value;
+        self.validate(&row)?;
+        self.rows[r] = row;
+        Ok(())
+    }
+
+    /// 用一整行替换第 `r` 行（`UPDATE` 的落库口）。同样先 `validate` 再落库。
+    fn update_row(&mut self, r: usize, row: Row) -> Result<()> {
+        let nrows = self.rows.len();
+        if r >= nrows {
+            return Err(DbError::RowOutOfBounds { index: r, nrows });
+        }
+        self.validate(&row)?;
+        self.rows[r] = row;
         Ok(())
     }
 

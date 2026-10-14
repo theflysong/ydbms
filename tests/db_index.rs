@@ -8,8 +8,9 @@
 //! 搬去，「内侧不必物化」这条收益就不成立了。
 
 use std::cell::Cell;
+use std::rc::Rc;
 
-use ydbms::db::index::{Index, IndexSource};
+use ydbms::db::index::{Index, IndexSlot, IndexSource};
 use ydbms::db::source::RowSource;
 use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Table, TabShape, Value};
 use ydbms::db::PhysTab;
@@ -175,7 +176,8 @@ fn an_index_source_is_a_row_source_over_one_key() {
     let table = CountingTable::new(&[1, 2, 1, 3, 1]);
 
     // 建索引是**惰性**的：光造游标一行都不读（`LIMIT 0` 之下连索引都不建）
-    let mut source = IndexSource::new(&table, 0, Value::Int(1));
+    let slot = Rc::new(IndexSlot::new(0));
+    let mut source = IndexSource::new(&table, slot, Value::Int(1));
     assert_eq!(table.cells_read(), 0);
     assert_eq!(table.rows_read(), 0);
 
@@ -198,7 +200,8 @@ fn an_index_source_is_a_row_source_over_one_key() {
 #[test]
 fn an_index_source_for_a_missing_key_yields_nothing() {
     let table = CountingTable::new(&[1, 2]);
-    let mut source = IndexSource::new(&table, 0, Value::Int(99));
+    let slot = Rc::new(IndexSlot::new(0));
+    let mut source = IndexSource::new(&table, slot, Value::Int(99));
 
     assert_eq!(source.next(), None);
     assert!(source.error().is_none(), "查不到键不是错误");

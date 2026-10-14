@@ -507,10 +507,37 @@ fn window_functions_are_rejected() {
 }
 
 #[test]
-fn an_aggregate_filter_clause_is_rejected() {
+fn an_aggregate_filter_clause_keeps_only_the_matching_rows() {
     let mut db = db(FIXTURE);
-    let err = failure(&mut db, "SELECT SUM(v) FILTER (WHERE v > 1) AS s FROM t");
-    assert!(err.to_string().contains("FILTER"), "{err}");
+    // 手算：`v > 1` 命中 2、3、10、20 → COUNT 4 / SUM 35；
+    // 而 `COUNT(*)`（没有 FILTER）是 5 行
+    let out = q(
+        &mut db,
+        "SELECT COUNT(*) FILTER (WHERE v > 1) AS n, SUM(v) FILTER (WHERE v > 1) AS s,
+                COUNT(*) AS all_rows
+         FROM t",
+    );
+
+    assert_eq!(out.value(0, 0), Some(Value::Int(4)));
+    assert_eq!(out.value(0, 1), Some(Value::Int(35)));
+    assert_eq!(out.value(0, 2), Some(Value::Int(5)));
+}
+
+#[test]
+fn an_aggregate_filter_with_a_group_by_filters_per_group() {
+    let mut db = db(FIXTURE);
+    // a 组：1,2,3 里 > 1 的是 2、3 → 2 行；b 组：10,20 全中 → 2 行
+    let out = q(
+        &mut db,
+        "SELECT g, COUNT(*) FILTER (WHERE v > 1) AS n
+         FROM t
+         GROUP BY g
+         ORDER BY g",
+    );
+
+    assert_eq!(out.value(0, 0), Some(Value::Text("a".to_string())));
+    assert_eq!(out.value(0, 1), Some(Value::Int(2)));
+    assert_eq!(out.value(1, 1), Some(Value::Int(2)));
 }
 
 #[test]
@@ -521,17 +548,19 @@ fn grouping_sets_are_rejected() {
 }
 
 #[test]
-fn distinct_is_still_rejected() {
+fn distinct_on_is_still_rejected() {
     let mut db = db(FIXTURE);
-    let err = failure(&mut db, "SELECT DISTINCT g FROM t");
-    assert!(err.to_string().contains("DISTINCT"), "{err}");
+    // 裸 `DISTINCT` 已经实现（见 `ir_features.rs`）；`DISTINCT ON` 仍然拒绝
+    let err = failure(&mut db, "SELECT DISTINCT ON (g) g FROM t");
+    assert!(err.to_string().contains("DISTINCT ON"), "{err}");
 }
 
 #[test]
 fn unknown_functions_are_rejected_by_name() {
     let mut db = SymbolTable::new();
-    let err = failure(&mut db, "SELECT UPPER('x') AS x");
-    assert!(err.to_string().contains("upper"), "{err}");
+    // `UPPER` / `LEFT` / `CONCAT_WS` / `ROUND` 都已经实现了，挑一个真没有的
+    let err = failure(&mut db, "SELECT LOWER('x') AS x");
+    assert!(err.to_string().contains("lower"), "{err}");
 }
 
 #[test]

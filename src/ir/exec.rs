@@ -28,22 +28,38 @@
 //!
 //! 计划是 DAG：一个节点可以被多个父节点引用。可重扫的游标做不到「拉到一半给别人再从头」，
 //! 所以这类节点会被**物化一次**，每个消费者各拿一个 `SharedCursor`。
+//!
+//! # 子查询：表达式层的一层求值环境
+//!
+//! 内层计划是一份**自足**的 `Plan`，装在 `Step::Subquery` 里；相关引用是
+//! `Step::Outer`。所以这里只需要一个 `ExecCtx`：
+//!
+//! * 求值 `Step::Subquery` 时把"本程序面对的那一行"压进**外层行栈**
+//!   （`Step::Outer` 从这里取），然后**再调一次 `build_pipeline`** 造一份内层源；
+//! * 未相关（`SubPlan::correlated == false`）的内层**结果行**只算一次、缓存起来；
+//!   相关的每行重开一份。注意缓存的是**行**，不是最终标量——`x IN (SELECT …)`
+//!   的左半边逐行不同，缓存真值会安静地给错答案。
+//!
+//! 每个 `RowSource` 因此都带着 `Rc<ExecCtx>`，程序一律走 [`Prog::eval_with`]；
+//! 只有"键不读列"的索引路径还用它自己的无环境求值。
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::db::index::{Index, IndexSource};
+use crate::db::index::{IndexSlot, IndexSource};
 use crate::db::phys::PhysTab;
 use crate::db::source::{self, RowSource, TableCursor};
 use crate::db::table::{
     Column, ColumnsShape, DbError, DecimalOp, Result, Row, Table, TabShape, Value,
 };
 
-use super::expr::{Prog, Scalar};
+use super::expr::{apply, Env, EvalError, Prog, SubMode, SubPlan};
+use super::value::{Scalar, Tri};
 use super::plan::{
-    passthrough_column, AggFunc, AggSpec, EqKey, IndexPath, JoinKind, JoinStrategy, NodeId, Op,
-    Plan, SortKey,
+    passthrough_column, AggFunc, AggSpec, Analysis, EqKey, IndexPath, JoinKind, JoinStrategy,
+    NodeId, Op, Plan, SortKey,
 };
 use super::symbol::SymbolTable;
 
@@ -60,7 +76,26 @@ pub fn execute_source<'a>(
     symbols: &'a SymbolTable,
 ) -> Result<Box<dyn RowSource + 'a>> {
     let analysis = plan.analyze(symbols)?;
+    let ctx = Rc::new(ExecCtx::new(symbols));
+    build_pipeline(plan, &analysis, &ctx)
+}
 
+/// 造管道的本体。
+///
+/// 子查询也走它：内层计划是一份**自足**的 `Plan`，所以"为外层每一行重开一份内层源"
+/// 就是带着同一个 [`ExecCtx`] 再调一次这里——这正是拉取式执行让相关子查询变成自然事
+/// 的地方。
+///
+/// `'p` 是计划的生命周期（返回的源借用它），`'s` 是符号表的——两者互不相干，
+/// 于是内层计划（借用自 `Step::Subquery`）与执行环境可以各用各的。
+fn build_pipeline<'p, 's>(
+    plan: &'p Plan,
+    analysis: &Analysis,
+    ctx: &Rc<ExecCtx<'s>>,
+) -> Result<Box<dyn RowSource + 'p>>
+where
+    's: 'p,
+{
     // 只从 root 出发：走不到的节点不建源、不执行。
     let reachable = reachable_from(plan);
 
@@ -74,7 +109,7 @@ pub fn execute_source<'a>(
         }
     }
 
-    let mut done: Vec<Option<Slot<'a>>> = (0..plan.nodes.len()).map(|_| None).collect();
+    let mut done: Vec<Option<Slot<'p>>> = (0..plan.nodes.len()).map(|_| None).collect();
 
     for (id, node) in plan.nodes.iter().enumerate() {
         if !reachable[id] {
@@ -84,7 +119,7 @@ pub fn execute_source<'a>(
         // schema 由 `Plan::analyze` 统一推导（透传列保留原类型），这里不再自己猜
         let schema = ColumnsShape::new(analysis.schemas[id].to_vec());
 
-        let source: Box<dyn RowSource + 'a> = match &node.op {
+        let source: Box<dyn RowSource + 'p> = match &node.op {
             Op::SingleRow => Box::new(SingleRowSource::new()),
 
             Op::Scan {
@@ -94,26 +129,33 @@ pub fn execute_source<'a>(
             } => {
                 // `analyze` 已经查过这个名字，这里只是把表取出来
                 let relation =
-                    symbols
+                    ctx.symbols
                         .relation(table)
                         .ok_or_else(|| DbError::UnknownSymbol {
                             name: table.clone(),
                         })?;
                 // 访问路径：索引（按键取行号）或顺序扫描
-                let base: Box<dyn RowSource + 'a> = match index {
-                    Some(path) => Box::new(IndexSource::new(
-                        relation,
-                        path.column,
-                        index_key(path, id)?,
-                    )),
+                let base: Box<dyn RowSource + 'p> = match index {
+                    Some(path) => {
+                        // 目录里有这一列的索引（`CREATE INDEX` 建的那一份）就用它——
+                        // 反复查询共用同一份，不重建。没有就临时建一个本地槽位：
+                        // 手写计划、或者降级之后索引被删掉时会走到这里。**只是慢，
+                        // 不会算错**——谓词照旧逐行复核。
+                        let slot = ctx
+                            .symbols
+                            .index_of(table, path.column)
+                            .unwrap_or_else(|| Rc::new(IndexSlot::new(path.column)));
+                        Box::new(IndexSource::new(relation, slot, index_key(path, id)?))
+                    }
                     None => Box::new(TableCursor::new(relation)),
                 };
-                Box::new(ScanSource::new(base, filter.as_ref(), id))
+                Box::new(ScanSource::new(base, filter.as_ref(), ctx.clone(), id))
             }
 
             Op::Filter { predicate } => Box::new(FilterSource::new(
                 input(&mut done, node.inputs[0])?,
                 predicate,
+                ctx.clone(),
                 id,
             )),
 
@@ -121,6 +163,7 @@ pub fn execute_source<'a>(
                 input(&mut done, node.inputs[0])?,
                 progs,
                 schema,
+                ctx.clone(),
                 id,
             )),
 
@@ -138,6 +181,7 @@ pub fn execute_source<'a>(
                         *kind,
                         on.as_ref(),
                         schema,
+                        ctx.clone(),
                         id,
                     )),
 
@@ -148,6 +192,7 @@ pub fn execute_source<'a>(
                         on.as_ref(),
                         keys,
                         schema,
+                        ctx.clone(),
                         id,
                     )),
 
@@ -163,7 +208,7 @@ pub fn execute_source<'a>(
                                 ))
                             }
                         };
-                        let relation = symbols.relation(table).ok_or_else(|| {
+                        let relation = ctx.symbols.relation(table).ok_or_else(|| {
                             DbError::UnknownSymbol {
                                 name: table.clone(),
                             }
@@ -172,15 +217,20 @@ pub fn execute_source<'a>(
                             runtime(id, "索引嵌套循环的内侧键不是裸列".to_string())
                         })?;
 
+                        let slot = ctx
+                            .symbols
+                            .index_of(table, column)
+                            .unwrap_or_else(|| Rc::new(IndexSlot::new(column)));
                         Box::new(IndexJoinSource::new(
                             left,
                             relation,
-                            column,
+                            slot,
                             filter,
                             key,
                             *kind,
                             on.as_ref(),
                             schema,
+                            ctx.clone(),
                             id,
                         ))
                     }
@@ -194,6 +244,7 @@ pub fn execute_source<'a>(
                 group_by,
                 aggs,
                 schema,
+                ctx.clone(),
                 id,
             )),
 
@@ -201,6 +252,7 @@ pub fn execute_source<'a>(
                 input(&mut done, node.inputs[0])?,
                 keys,
                 schema,
+                ctx.clone(),
                 id,
             )),
 
@@ -208,6 +260,15 @@ pub fn execute_source<'a>(
                 input(&mut done, node.inputs[0])?,
                 *limit,
                 *offset,
+            )),
+
+            Op::Distinct => Box::new(DistinctSource::new(input(&mut done, node.inputs[0])?)),
+
+            Op::Union { all } => Box::new(UnionSource::new(
+                input(&mut done, node.inputs[0])?,
+                input(&mut done, node.inputs[1])?,
+                *all,
+                schema,
             )),
         };
 
@@ -224,6 +285,228 @@ pub fn execute_source<'a>(
         Some(Slot::Source(source)) => Ok(source),
         Some(Slot::Shared(table)) => Ok(Box::new(SharedCursor::new(table))),
         None => Err(runtime(plan.root, "root 没有产出结果".to_string())),
+    }
+}
+
+// ---------------------------------------------------------- 求值环境（子查询）
+
+/// 一次执行共享的求值环境。
+///
+/// 两件事：
+///
+/// * **外层行栈**：相关子查询的 [`Step::Outer`] 从这里取。压一行的时机就是
+///   [`Step::Subquery`] 求值的那一刻（压进去的是"本程序面对的那一行"，也就是
+///   内层的外层行），内层跑完就弹回来；
+/// * **内层的缓存**：内层计划的 [`Analysis`] 总是只算一次（分析是纯的，查询期间
+///   符号表不动）；**未相关**子查询的内层**结果行**也只算一次——它与外层哪一行
+///   无关。相关的必须每行重开一份源。
+///
+/// 缓存按 `SubPlan` 的地址认：计划在一次执行里是稳定的，指针也就稳定。
+///
+/// > 注意缓存的是**内层的行**，不是最终标量。`x IN (SELECT …)` 的左半边是外层
+/// > 表达式，逐行不同；把最终真值缓存下来会安静地给出错答案（这是实测踩过的坑）。
+struct ExecState {
+    /// 外层行栈：`[0]` 是最外层，`last()` 是最近一层。
+    outers: RefCell<Vec<Row>>,
+    /// 未相关子查询的内层结果行。
+    rows_cache: RefCell<HashMap<*const SubPlan, Rc<Vec<Row>>>>,
+    /// 子查询内层计划的 `Analysis`（`Rc` 是为了给多个源共享）。
+    analysis_cache: RefCell<HashMap<*const SubPlan, Rc<Analysis>>>,
+}
+
+/// 求值环境本体：符号表 + 共享状态。
+struct ExecCtx<'s> {
+    symbols: &'s SymbolTable,
+    state: Rc<ExecState>,
+}
+
+impl<'s> ExecCtx<'s> {
+    fn new(symbols: &'s SymbolTable) -> Self {
+        ExecCtx {
+            symbols,
+            state: Rc::new(ExecState {
+                outers: RefCell::new(Vec::new()),
+                rows_cache: RefCell::new(HashMap::new()),
+                analysis_cache: RefCell::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// 子查询内层计划的 `Analysis`（算过一次就留着）。
+    ///
+    /// 用**浅层**分析：内层计划的深层校验（外层链对不对）在外层 `analyze` 里做过，
+    /// 那里才知道它压着哪几层行。
+    fn analysis_of(&self, spec: &SubPlan) -> Result<Rc<Analysis>> {
+        let key = spec as *const SubPlan;
+        if let Some(analysis) = self.state.analysis_cache.borrow().get(&key) {
+            return Ok(analysis.clone());
+        }
+        let analysis = Rc::new(spec.plan.analyze_shallow(self.symbols)?);
+        self.state
+            .analysis_cache
+            .borrow_mut()
+            .insert(key, analysis.clone());
+        Ok(analysis)
+    }
+
+    /// 求值一个内层子查询：压一行外层行 → 求值 → 弹回来。
+    fn run_subquery(
+        &self,
+        spec: &SubPlan,
+        row: &[Value],
+    ) -> std::result::Result<Scalar, EvalError> {
+        self.state.outers.borrow_mut().push(row.to_vec());
+        let outcome = self.evaluate(spec, row);
+        self.state.outers.borrow_mut().pop();
+        outcome
+    }
+
+    /// 按模式把内层结果收成一个标量。
+    fn evaluate(
+        &self,
+        spec: &SubPlan,
+        row: &[Value],
+    ) -> std::result::Result<Scalar, EvalError> {
+        // `IN` / `= ANY` / `= ALL` 的左半边是**外层**表达式，按当前行求值
+        let test = match &spec.mode {
+            SubMode::Quantified { test, .. } => Some(test.eval_with(row, &[], self)?),
+            _ => None,
+        };
+
+        let analysis = self
+            .analysis_of(spec)
+            .map_err(|e| EvalError::Nested(Box::new(e)))?;
+
+        // 未相关：内层的行与外面哪一行无关，算一次、缓存起来
+        if !spec.correlated {
+            let key = spec as *const SubPlan;
+            let cached = self.state.rows_cache.borrow().get(&key).cloned();
+            let rows = match cached {
+                Some(rows) => rows,
+                None => {
+                    let rows = Rc::new(self.drain(&spec.plan, &analysis)?);
+                    self.state.rows_cache.borrow_mut().insert(key, rows.clone());
+                    rows
+                }
+            };
+            return combine_subquery(&spec.mode, test, &mut rows.iter().cloned());
+        }
+
+        // 相关：内层每行重开一份源（拉取式之下只是多调一次构建）
+        let inner_ctx = Rc::new(ExecCtx {
+            symbols: self.symbols,
+            state: self.state.clone(),
+        });
+        let mut source = build_pipeline(&spec.plan, &analysis, &inner_ctx)
+            .map_err(|e| EvalError::Nested(Box::new(e)))?;
+
+        let value = {
+            let mut rows = std::iter::from_fn(|| source.next());
+            combine_subquery(&spec.mode, test, &mut rows)?
+        };
+
+        // 拉完（或提前收手）之后再看一眼：`None` 也可能是出错
+        match source.error() {
+            Some(e) => Err(EvalError::Nested(Box::new(e.clone()))),
+            None => Ok(value),
+        }
+    }
+
+    /// 抽干一个内层计划，返回它的所有行。
+    fn drain(&self, plan: &Plan, analysis: &Analysis) -> std::result::Result<Vec<Row>, EvalError> {
+        let inner_ctx = Rc::new(ExecCtx {
+            symbols: self.symbols,
+            state: self.state.clone(),
+        });
+        let mut source = build_pipeline(plan, analysis, &inner_ctx)
+            .map_err(|e| EvalError::Nested(Box::new(e)))?;
+
+        let mut rows = Vec::new();
+        while let Some(row) = source.next() {
+            rows.push(row);
+        }
+        match source.error() {
+            Some(e) => Err(EvalError::Nested(Box::new(e.clone()))),
+            None => Ok(rows),
+        }
+    }
+}
+
+/// 按 [`SubMode`] 把内层的结果行收成一个标量。
+///
+/// 空集的语义与 SQL 标准一致：标量 → NULL、`EXISTS` → 假、`ALL` → **真**、
+/// `ANY` → **假**。`EXISTS` 与量化比较**见到能定胜负的行就停**（不在这一层拉干内层）。
+fn combine_subquery(
+    mode: &SubMode,
+    test: Option<Scalar>,
+    rows: &mut dyn Iterator<Item = Row>,
+) -> std::result::Result<Scalar, EvalError> {
+    match mode {
+        SubMode::Scalar => {
+            let first = rows.next();
+            // 多于一行 → 运行期错误（SQL 要求标量子查询最多给一行）
+            if first.is_some() && rows.next().is_some() {
+                return Err(EvalError::ScalarSubqueryRows { rows: 2 });
+            }
+            Ok(first
+                .and_then(|row| row.into_iter().next())
+                .map(Scalar::Value)
+                .unwrap_or(Scalar::Value(Value::Null)))
+        }
+
+        SubMode::Exists => Ok(Scalar::Truth(if rows.next().is_some() {
+            Tri::True
+        } else {
+            Tri::False
+        })),
+
+        SubMode::Quantified { op, all, .. } => {
+            let test = test.unwrap_or(Scalar::Value(Value::Null));
+            let mut truth = if *all { Tri::True } else { Tri::False };
+
+            for row in rows {
+                let value = row
+                    .into_iter()
+                    .next()
+                    .map(Scalar::Value)
+                    .unwrap_or(Scalar::Value(Value::Null));
+                let step = apply(*op, test.clone(), value)?
+                    .as_truth()
+                    .ok_or(EvalError::NotABool)?;
+                truth = if *all { truth.and(step) } else { truth.or(step) };
+
+                // 定胜负就收工（`ALL` 见到假、`ANY` 见到真）
+                if (*all && truth == Tri::False) || (!*all && truth == Tri::True) {
+                    break;
+                }
+            }
+
+            Ok(Scalar::Truth(truth))
+        }
+    }
+}
+
+impl Env for ExecCtx<'_> {
+    fn outer(&self, depth: u16, index: usize) -> std::result::Result<Scalar, EvalError> {
+        let stack = self.state.outers.borrow();
+        let at = depth
+            .checked_sub(1)
+            .and_then(|d| stack.len().checked_sub(d as usize + 1))
+            .ok_or(EvalError::NoEnv {
+                what: "这个深度的外层行",
+            })?;
+        let row = &stack[at];
+        row.get(index)
+            .cloned()
+            .map(Scalar::Value)
+            .ok_or(EvalError::ColumnOutOfRange {
+                index,
+                arity: row.len(),
+            })
+    }
+
+    fn subquery(&self, spec: &SubPlan, row: &[Value]) -> std::result::Result<Scalar, EvalError> {
+        self.run_subquery(spec, row)
     }
 }
 
@@ -347,16 +630,24 @@ struct ScanSource<'a> {
     /// 访问路径：[`TableCursor`]（顺序）或 [`IndexSource`]（索引）。
     base: Box<dyn RowSource + 'a>,
     filter: Option<&'a Prog>,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
 }
 
 impl<'a> ScanSource<'a> {
     /// `base` 给出的是**这张表自己的行**。
-    fn new(base: Box<dyn RowSource + 'a>, filter: Option<&'a Prog>, node: NodeId) -> Self {
+    fn new(
+        base: Box<dyn RowSource + 'a>,
+        filter: Option<&'a Prog>,
+        ctx: Rc<ExecCtx<'a>>,
+        node: NodeId,
+    ) -> Self {
         ScanSource {
             base,
             filter,
+            ctx,
             node,
             error: None,
         }
@@ -380,7 +671,7 @@ impl RowSource for ScanSource<'_> {
         loop {
             let row = self.base.next()?;
             let keep = match self.filter {
-                Some(prog) => match prog.eval_truth(&row) {
+                Some(prog) => match truth_of(prog, &row, &[], &self.ctx) {
                     Ok(truth) => truth.is_true(),
                     Err(e) => {
                         self.error = Some(e.into_db_error(Some(self.node)));
@@ -405,15 +696,23 @@ impl RowSource for ScanSource<'_> {
 struct FilterSource<'a> {
     input: Box<dyn RowSource + 'a>,
     predicate: &'a Prog,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
 }
 
 impl<'a> FilterSource<'a> {
-    fn new(input: Box<dyn RowSource + 'a>, predicate: &'a Prog, node: NodeId) -> Self {
+    fn new(
+        input: Box<dyn RowSource + 'a>,
+        predicate: &'a Prog,
+        ctx: Rc<ExecCtx<'a>>,
+        node: NodeId,
+    ) -> Self {
         FilterSource {
             input,
             predicate,
+            ctx,
             node,
             error: None,
         }
@@ -437,7 +736,7 @@ impl RowSource for FilterSource<'_> {
 
         loop {
             let row = self.input.next()?;
-            match self.predicate.eval_truth(&row) {
+            match truth_of(self.predicate, &row, &[], &self.ctx) {
                 // 只有确定的真才留：UNKNOWN 与 FALSE 一样被丢掉
                 Ok(truth) if truth.is_true() => return Some(row),
                 Ok(_) => {}
@@ -459,6 +758,8 @@ struct ProjectSource<'a> {
     input: Box<dyn RowSource + 'a>,
     progs: &'a [Prog],
     shape: ColumnsShape,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
 }
@@ -468,12 +769,14 @@ impl<'a> ProjectSource<'a> {
         input: Box<dyn RowSource + 'a>,
         progs: &'a [Prog],
         shape: ColumnsShape,
+        ctx: Rc<ExecCtx<'a>>,
         node: NodeId,
     ) -> Self {
         ProjectSource {
             input,
             progs,
             shape,
+            ctx,
             node,
             error: None,
         }
@@ -498,7 +801,7 @@ impl RowSource for ProjectSource<'_> {
         let mut out = Row::with_capacity(self.progs.len());
 
         for prog in self.progs {
-            let scalar = match prog.eval(&row) {
+            let scalar = match prog.eval_with(&row, &[], &*self.ctx) {
                 Ok(scalar) => scalar,
                 Err(e) => {
                     self.error = Some(e.into_db_error(Some(self.node)));
@@ -542,6 +845,8 @@ struct JoinSource<'a> {
     kind: JoinKind,
     on: Option<&'a Prog>,
     shape: ColumnsShape,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
     /// 物化好的内侧；`None` 表示还没物化。
@@ -563,6 +868,7 @@ impl<'a> JoinSource<'a> {
         kind: JoinKind,
         on: Option<&'a Prog>,
         shape: ColumnsShape,
+        ctx: Rc<ExecCtx<'a>>,
         node: NodeId,
     ) -> Self {
         JoinSource {
@@ -571,6 +877,7 @@ impl<'a> JoinSource<'a> {
             kind,
             on,
             shape,
+            ctx,
             node,
             error: None,
             inner: None,
@@ -644,7 +951,7 @@ impl RowSource for JoinSource<'_> {
                 };
 
                 let left_row = self.current.as_ref().expect("上面刚填过");
-                match on_matches(self.on, left_row, &right_row, self.node) {
+                match on_matches(self.on, left_row, &right_row, &self.ctx, self.node) {
                     Err(e) => {
                         self.error = Some(e);
                         return None;
@@ -696,35 +1003,51 @@ fn pad_right(left: Row, right_arity: usize) -> Row {
 ///
 /// 程序里的列下标按 **左 ++ 右** 编，用 [`Prog::eval_truth_split`] 直接在两半上求值，
 /// 不为每一对候选行拼整行。
-fn on_matches(
+fn on_matches<'s>(
     on: Option<&Prog>,
     left: &[Value],
     right: &[Value],
+    ctx: &ExecCtx<'s>,
     node: NodeId,
 ) -> Result<bool> {
     match on {
-        Some(prog) => prog
-            .eval_truth_split(left, right)
+        Some(prog) => truth_of(prog, left, right, ctx)
             .map(|truth| truth.is_true())
             .map_err(|e| e.into_db_error(Some(node))),
         None => Ok(true),
     }
 }
 
+/// 把一个程序求值成三值真值。
+///
+/// 所有"程序面对一整行 / 面对左右两半"的地方都走它，于是 [`crate::ir::exec`] 里
+/// 只有一处知道怎么把 [`ExecCtx`] 交给 [`Prog::eval_with`]。
+fn truth_of<'s>(
+    prog: &Prog,
+    left: &[Value],
+    right: &[Value],
+    ctx: &ExecCtx<'s>,
+) -> std::result::Result<Tri, EvalError> {
+    prog.eval_with(left, right, ctx)?
+        .as_truth()
+        .ok_or(EvalError::NotABool)
+}
+
 /// 用 `keys` 里的一侧程序，在**那一支自己的行**上算出键值。
 ///
 /// `pick` 决定取哪一半（`outer` 还是 `inner`）——两个程序各自面对自己那一支的
 /// schema，所以直接 `eval`，不必知道对方的宽度。
-fn key_of<'k>(
+fn key_of<'k, 's>(
     keys: &'k [EqKey],
     pick: impl Fn(&'k EqKey) -> &'k Prog,
     row: &[Value],
+    ctx: &ExecCtx<'s>,
     node: NodeId,
 ) -> Result<Vec<Value>> {
     let mut values = Vec::with_capacity(keys.len());
     for key in keys {
         let value = pick(key)
-            .eval(row)
+            .eval_with(row, &[], ctx)
             .map_err(|e| e.into_db_error(Some(node)))?
             .to_value()
             .ok_or_else(|| runtime(node, "连接键不能是真值".to_string()))?;
@@ -735,6 +1058,7 @@ fn key_of<'k>(
 
 /// 索引路径的键：在**没有输入行**的前提下求值（`analyze` 保证它不读列）。
 fn index_key(path: &IndexPath, node: NodeId) -> Result<Value> {
+    // 索引键不读列，也就用不上外层行 / 子查询（`analyze` 保证键不引用列）
     path.key
         .eval(&[])
         .map_err(|e| e.into_db_error(Some(node)))?
@@ -760,6 +1084,8 @@ struct HashJoinSource<'a> {
     on: Option<&'a Prog>,
     keys: &'a [EqKey],
     shape: ColumnsShape,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
     /// 建好的哈希表；`None` 表示还没建。
@@ -784,6 +1110,7 @@ impl<'a> HashJoinSource<'a> {
         on: Option<&'a Prog>,
         keys: &'a [EqKey],
         shape: ColumnsShape,
+        ctx: Rc<ExecCtx<'a>>,
         node: NodeId,
     ) -> Self {
         HashJoinSource {
@@ -793,6 +1120,7 @@ impl<'a> HashJoinSource<'a> {
             on,
             keys,
             shape,
+            ctx,
             node,
             error: None,
             table: None,
@@ -815,7 +1143,7 @@ impl<'a> HashJoinSource<'a> {
         let mut table: HashMap<Vec<Value>, Vec<Row>> = HashMap::new();
 
         while let Some(row) = right.next() {
-            let key = key_of(self.keys, |k| &k.inner, &row, self.node)?;
+            let key = key_of(self.keys, |k| &k.inner, &row, &self.ctx, self.node)?;
             table.entry(key).or_default().push(row);
         }
         if let Some(e) = right.error() {
@@ -853,7 +1181,7 @@ impl RowSource for HashJoinSource<'_> {
             if self.current.is_none() {
                 let row = self.left.next()?;
 
-                let key = match key_of(self.keys, |k| &k.outer, &row, self.node) {
+                let key = match key_of(self.keys, |k| &k.outer, &row, &self.ctx, self.node) {
                     Ok(key) => key,
                     Err(e) => {
                         self.error = Some(e);
@@ -883,7 +1211,7 @@ impl RowSource for HashJoinSource<'_> {
                 self.at += 1;
 
                 let left_row = self.current.as_ref().expect("上面刚填过");
-                match on_matches(self.on, left_row, &right_row, self.node) {
+                match on_matches(self.on, left_row, &right_row, &self.ctx, self.node) {
                     Err(e) => {
                         self.error = Some(e);
                         return None;
@@ -927,8 +1255,8 @@ struct IndexJoinSource<'a> {
     left: Box<dyn RowSource + 'a>,
     /// 内侧的基表。
     table: &'a dyn Table,
-    /// 索引建在哪一列。
-    column: usize,
+    /// 内侧那一列上的索引槽位（目录里的，或者执行器临时建的一个）。
+    slot: Rc<IndexSlot>,
     /// 内侧 `Scan` 下推的谓词（取到行之后复核）。
     filter: Option<&'a Prog>,
     /// 等值键；只用它的 `outer`（内侧那一半就是上面那一列）。
@@ -936,10 +1264,10 @@ struct IndexJoinSource<'a> {
     kind: JoinKind,
     on: Option<&'a Prog>,
     shape: ColumnsShape,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
-    /// 建好的索引；`None` 表示还没建。
-    index: Option<Index>,
     /// 内侧的列数（左外连接补 NULL 要用）。
     right_arity: usize,
     /// 正在配对的左行。
@@ -956,26 +1284,27 @@ impl<'a> IndexJoinSource<'a> {
     fn new(
         left: Box<dyn RowSource + 'a>,
         table: &'a dyn Table,
-        column: usize,
+        slot: Rc<IndexSlot>,
         filter: Option<&'a Prog>,
         key: &'a EqKey,
         kind: JoinKind,
         on: Option<&'a Prog>,
         shape: ColumnsShape,
+        ctx: Rc<ExecCtx<'a>>,
         node: NodeId,
     ) -> Self {
         IndexJoinSource {
             left,
             table,
-            column,
+            slot,
             filter,
             key,
             kind,
             on,
             shape,
+            ctx,
             node,
             error: None,
-            index: None,
             // 内侧就是这张表的 `Scan`，所以它的列数就是表的元数
             right_arity: table.arity(),
             current: None,
@@ -985,18 +1314,15 @@ impl<'a> IndexJoinSource<'a> {
         }
     }
 
-    /// 建索引。失败记进 `self.error`。
-    fn fill(&mut self) -> Result<()> {
-        self.index = Some(Index::build(self.table, self.column)?);
-        Ok(())
-    }
-
     /// 当前左行在内侧命中的行号。
+    ///
+    /// 索引由槽位按需建（第一次查找时建一份，之后复用）；`UPDATE` 之后它会失效，
+    /// 于是这里重建一次，仍然只重建一次。
     fn lookup(&self, left_row: &[Value]) -> Result<Vec<usize>> {
         let key = self
             .key
             .outer
-            .eval(left_row)
+            .eval_with(left_row, &[], &*self.ctx)
             .map_err(|e| e.into_db_error(Some(self.node)))?
             .to_value()
             .ok_or_else(|| runtime(self.node, "索引嵌套循环的键不能是真值".to_string()))?;
@@ -1006,8 +1332,7 @@ impl<'a> IndexJoinSource<'a> {
             return Ok(Vec::new());
         }
 
-        let index = self.index.as_ref().expect("上面刚建过");
-        Ok(index.lookup(&key).to_vec())
+        self.slot.lookup(self.table, &key)
     }
 }
 
@@ -1023,13 +1348,6 @@ impl RowSource for IndexJoinSource<'_> {
     fn next(&mut self) -> Option<Row> {
         if self.error.is_some() {
             return None;
-        }
-
-        if self.index.is_none() {
-            if let Err(e) = self.fill() {
-                self.error = Some(e);
-                return None;
-            }
         }
 
         loop {
@@ -1064,7 +1382,7 @@ impl RowSource for IndexJoinSource<'_> {
 
                 // 内侧 Scan 自己的谓词照旧要过
                 if let Some(filter) = self.filter {
-                    match filter.eval_truth(&right_row) {
+                    match truth_of(filter, &right_row, &[], &self.ctx) {
                         Ok(truth) if truth.is_true() => {}
                         Ok(_) => continue,
                         Err(e) => {
@@ -1075,7 +1393,7 @@ impl RowSource for IndexJoinSource<'_> {
                 }
 
                 let left_row = self.current.as_ref().expect("上面刚填过");
-                match on_matches(self.on, left_row, &right_row, self.node) {
+                match on_matches(self.on, left_row, &right_row, &self.ctx, self.node) {
                     Err(e) => {
                         self.error = Some(e);
                         return None;
@@ -1228,6 +1546,8 @@ struct AggregateSource<'a> {
     group_by: &'a [Prog],
     aggs: &'a [AggSpec],
     shape: ColumnsShape,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
     /// 攒好的输出行；`None` 表示还没算过。
@@ -1241,6 +1561,7 @@ impl<'a> AggregateSource<'a> {
         group_by: &'a [Prog],
         aggs: &'a [AggSpec],
         shape: ColumnsShape,
+        ctx: Rc<ExecCtx<'a>>,
         node: NodeId,
     ) -> Self {
         AggregateSource {
@@ -1248,6 +1569,7 @@ impl<'a> AggregateSource<'a> {
             group_by,
             aggs,
             shape,
+            ctx,
             node,
             error: None,
             spool: None,
@@ -1269,7 +1591,7 @@ impl<'a> AggregateSource<'a> {
         while let Some(row) = self.input.next() {
             let mut key = Vec::with_capacity(self.group_by.len());
             for prog in self.group_by {
-                let scalar = prog.eval(&row).map_err(|e| e.into_db_error(Some(self.node)))?;
+                let scalar = prog.eval_with(&row, &[], &*self.ctx).map_err(|e| e.into_db_error(Some(self.node)))?;
                 key.push(
                     scalar
                         .to_value()
@@ -1291,11 +1613,20 @@ impl<'a> AggregateSource<'a> {
             };
 
             for (slot, spec) in self.aggs.iter().enumerate() {
+                // `FILTER (WHERE …)`：只有确定真的行才进累加器
+                if let Some(filter) = &spec.filter {
+                    let keep = truth_of(filter, &row, &[], &self.ctx)
+                        .map_err(|e| e.into_db_error(Some(self.node)))?;
+                    if !keep.is_true() {
+                        continue;
+                    }
+                }
+
                 let value = match &spec.arg {
                     // COUNT(*)：不看值，来一行算一个
                     None => None,
                     Some(prog) => Some(
-                        prog.eval(&row)
+                        prog.eval_with(&row, &[], &*self.ctx)
                             .map_err(|e| e.into_db_error(Some(self.node)))?
                             .to_value()
                             .ok_or_else(|| {
@@ -1403,6 +1734,8 @@ struct SortSource<'a> {
     input: Box<dyn RowSource + 'a>,
     keys: &'a [SortKey],
     shape: ColumnsShape,
+    /// 求值环境（外层行栈 + 子查询缓存）。
+    ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
     error: Option<DbError>,
     /// 排好序的行；`None` 表示还没算过。
@@ -1415,12 +1748,14 @@ impl<'a> SortSource<'a> {
         input: Box<dyn RowSource + 'a>,
         keys: &'a [SortKey],
         shape: ColumnsShape,
+        ctx: Rc<ExecCtx<'a>>,
         node: NodeId,
     ) -> Self {
         SortSource {
             input,
             keys,
             shape,
+            ctx,
             node,
             error: None,
             spool: None,
@@ -1437,7 +1772,7 @@ impl<'a> SortSource<'a> {
             for key in self.keys {
                 values.push(
                     key.prog
-                        .eval(&row)
+                        .eval_with(&row, &[], &*self.ctx)
                         .map_err(|e| e.into_db_error(Some(self.node)))?,
                 );
             }
@@ -1562,9 +1897,140 @@ impl RowSource for LimitSource<'_> {
     }
 }
 
+/// 去重：流式的 `SELECT DISTINCT`。
+///
+/// 一个哈希集合记住见过的行，来一行放一行——**既不用先 `Sort`，也不用物化**。
+/// 行是 `Vec<Value>`，而 `Value` 的 `Hash` 与 `Eq` 一致（见 `db::table`），
+/// 所以直接拿整行当键。
+struct DistinctSource<'a> {
+    input: Box<dyn RowSource + 'a>,
+    seen: HashSet<Row>,
+}
+
+impl<'a> DistinctSource<'a> {
+    fn new(input: Box<dyn RowSource + 'a>) -> Self {
+        DistinctSource {
+            input,
+            seen: HashSet::new(),
+        }
+    }
+}
+
+impl RowSource for DistinctSource<'_> {
+    fn name(&self) -> &str {
+        "<distinct>"
+    }
+
+    fn columns(&self) -> &[Column] {
+        // 去重不改变 schema
+        self.input.columns()
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        loop {
+            let row = self.input.next()?;
+            if self.seen.insert(row.clone()) {
+                return Some(row);
+            }
+        }
+    }
+
+    fn error(&self) -> Option<&DbError> {
+        self.input.error()
+    }
+}
+
 fn runtime(node: NodeId, message: String) -> DbError {
     DbError::IrRuntime {
         node: Some(node),
         message,
+    }
+}
+
+/// `UNION [ALL]`：先左边、再右边。
+///
+/// `UNION ALL` 就是两条流的接续；`UNION`（没写 `ALL`）多一个集合，而且是**两支合起来**
+/// 去重——与 PostgreSQL 一样，重复行要跨两支看。输出列名与类型取左支（`analyze` 保证
+/// 两支逐列同族）。
+struct UnionSource<'a> {
+    left: Box<dyn RowSource + 'a>,
+    right: Box<dyn RowSource + 'a>,
+    /// 去重集合；`UNION ALL` 是 `None`（不去重）。
+    seen: Option<HashSet<Row>>,
+    /// 左支拉完了吗。
+    on_right: bool,
+    shape: ColumnsShape,
+    error: Option<DbError>,
+}
+
+impl<'a> UnionSource<'a> {
+    fn new(
+        left: Box<dyn RowSource + 'a>,
+        right: Box<dyn RowSource + 'a>,
+        all: bool,
+        shape: ColumnsShape,
+    ) -> Self {
+        UnionSource {
+            left,
+            right,
+            seen: if all { None } else { Some(HashSet::new()) },
+            on_right: false,
+            shape,
+            error: None,
+        }
+    }
+}
+
+impl RowSource for UnionSource<'_> {
+    fn name(&self) -> &str {
+        "<union>"
+    }
+
+    fn columns(&self) -> &[Column] {
+        self.shape.columns()
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        if self.error.is_some() {
+            return None;
+        }
+
+        loop {
+            let side = if self.on_right {
+                &mut self.right
+            } else {
+                &mut self.left
+            };
+
+            match side.next() {
+                Some(row) => {
+                    let fresh = match self.seen.as_mut() {
+                        Some(seen) => seen.insert(row.clone()),
+                        None => true,
+                    };
+                    if fresh {
+                        return Some(row);
+                    }
+                }
+                None => {
+                    if let Some(e) = side.error().cloned() {
+                        self.error = Some(e);
+                        return None;
+                    }
+                    if self.on_right {
+                        return None;
+                    }
+                    // 左支走完，接着拉右支
+                    self.on_right = true;
+                }
+            }
+        }
+    }
+
+    fn error(&self) -> Option<&DbError> {
+        self.error
+            .as_ref()
+            .or_else(|| self.left.error())
+            .or_else(|| self.right.error())
     }
 }

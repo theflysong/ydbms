@@ -31,7 +31,8 @@ const KEYWORDS: &[&str] = &[
     "INNER", "LEFT", "OUTER", "ON", "AS", "AND", "OR", "NOT", "NULL", "IS", "CASE", "WHEN",
     "THEN", "ELSE", "END", "CREATE", "TABLE", "IF", "EXISTS", "INSERT", "INTO", "VALUES", "ASC",
     "DESC", "NULLS", "FIRST", "LAST", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND",
-    "TRUE", "FALSE", "INT", "INTEGER", "TEXT", "VARCHAR", "CHAR", "TIMESTAMP", "NUMERIC",
+    "TRUE", "FALSE", "INT", "INTEGER", "TEXT", "VARCHAR", "CHAR", "TIMESTAMP", "DATE",
+    "NUMERIC", "LENGTH", "UPDATE", "SET", "CHECK", "DEFAULT",
 ];
 
 /// `on` / `off` 这类开关字的候选。

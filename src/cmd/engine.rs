@@ -428,20 +428,37 @@ impl Session {
                 let rendered = render_table(table);
                 self.query(&rendered);
             }
-            Ok(Outcome::Created { name, unenforced }) => {
+            Ok(Outcome::Created {
+                name,
+                unenforced,
+                checks,
+            }) => {
+                // 强制了什么、没强制什么都要如实说：`CHECK` 是真的在写行时求值的，
+                // 而 `unenforced` 里的那些**只是记下来**
+                let enforced = match checks {
+                    0 => String::new(),
+                    n => format!("（{} 条 CHECK 已强制）", n),
+                };
                 if unenforced.is_empty() {
-                    self.msg(&format!("{}  → 建表成功：{}\n", head, name));
+                    self.msg(&format!("{}  → 建表成功：{}{}\n", head, name, enforced));
                 } else {
                     self.msg(&format!(
-                        "{}  → 建表成功：{}（{}：已接受但**未强制**）\n",
+                        "{}  → 建表成功：{}{}（{}：已接受但**未强制**）\n",
                         head,
                         name,
+                        enforced,
                         unenforced.join("、")
                     ));
                 }
             }
             Ok(Outcome::Inserted { table, rows }) => {
                 self.msg(&format!("{}  → 插入 {} 行到 {}\n", head, rows, table));
+            }
+            Ok(Outcome::Updated { table, rows }) => {
+                self.msg(&format!("{}  → 更新 {} 行到 {}\n", head, rows, table));
+            }
+            Ok(Outcome::NoOp { message }) => {
+                self.msg(&format!("{}  → {}\n", head, message));
             }
             Err(e) => self.msg(&format!("{}  → 错误：{}\n", head, e)),
         }
@@ -705,6 +722,22 @@ impl Session {
         self.msg(&format!("表 {}\n", name));
         for (column, ty) in columns {
             self.msg(&format!("  {:<24}{}\n", column, ty));
+        }
+
+        // 索引是**目录对象**（TODO 3.6）：`CREATE INDEX` 建的那几条也一起报出来，
+        // 否则用户没有任何办法知道"这条查询为什么走了索引"
+        let indexes = self.symbols.indexes_of(name);
+        if !indexes.is_empty() {
+            self.msg("索引\n");
+            for (index, at) in indexes {
+                let column = self
+                    .symbols
+                    .columns(name)
+                    .and_then(|columns| columns.get(at))
+                    .map(|column| column.name.clone())
+                    .unwrap_or_else(|| at.to_string());
+                self.msg(&format!("  {:<24}({})\n", index, column));
+            }
         }
         Flow::Continue
     }

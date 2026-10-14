@@ -1,4 +1,5 @@
-//! 五种新数据类型的 testbench：`TEXT` / `CHAR(N)` / `VARCHAR(N)` / `TIMESTAMP(N)` / `NUMERIC(N,M)`。
+//! 六种数据类型的 testbench：`TEXT` / `CHAR(N)` / `VARCHAR(N)` / `TIMESTAMP(N)` /
+//! `DATE` / `NUMERIC(N,M)`。
 //!
 //! 重点在三处：
 //!
@@ -66,9 +67,10 @@ fn ty_of(db: &SymbolTable, table: &str, column: &str) -> DataType {
 // ------------------------------------------------------------ 建表与 typmod
 
 #[test]
-fn create_table_accepts_all_five_types() {
+fn create_table_accepts_all_six_types() {
     let db = db_with(
-        "CREATE TABLE m (a TEXT, b CHAR(4), c VARCHAR(30), d TIMESTAMP(3), e NUMERIC(10,2))",
+        "CREATE TABLE m (a TEXT, b CHAR(4), c VARCHAR(30), d TIMESTAMP(3), e NUMERIC(10,2), \
+         f DATE, g date)",
     );
 
     assert_eq!(ty_of(&db, "m", "a"), DataType::Text);
@@ -76,6 +78,95 @@ fn create_table_accepts_all_five_types() {
     assert_eq!(ty_of(&db, "m", "c"), DataType::VarChar(30));
     assert_eq!(ty_of(&db, "m", "d"), DataType::Timestamp(3));
     assert_eq!(ty_of(&db, "m", "e"), DataType::Numeric(10, 2));
+    assert_eq!(ty_of(&db, "m", "f"), DataType::Date);
+    assert_eq!(ty_of(&db, "m", "g"), DataType::Date);
+}
+
+// ---------------------------------------------------------------------- DATE
+
+#[test]
+fn date_is_canonicalised_and_orders_as_text() {
+    let mut db = db_with("CREATE TABLE m (d DATE)");
+    ok(&mut db, "INSERT INTO m VALUES ('2017-3-8'), ('2017-01-31'), (NULL)");
+
+    // 规范成定宽文本（补零），于是字典序就是时间序
+    assert_eq!(
+        col(&query(&mut db, "SELECT d FROM m ORDER BY d"), 0),
+        vec!["2017-01-31".to_string(), "2017-03-08".to_string(), "NULL".to_string()]
+    );
+}
+
+#[test]
+fn date_rejects_impossible_values() {
+    let mut db = db_with("CREATE TABLE m (d DATE)");
+
+    for bad in ["2017-13-01", "2017-01-32", "不是日期", "2017/03/08", "10000-01-01"] {
+        let err = failure(&mut db, &format!("INSERT INTO m VALUES ('{bad}')"));
+        assert!(matches!(err, DbError::BadValue { .. }), "{bad}: {err:?}");
+    }
+}
+
+#[test]
+fn a_date_typed_literal_fits_a_date_column() {
+    let mut db = db_with("CREATE TABLE m (d DATE)");
+    ok(&mut db, "INSERT INTO m VALUES (DATE '2017-03-08')");
+
+    let out = query(&mut db, "SELECT d FROM m");
+    assert_eq!(out.value(0, 0), Some(Value::Date("2017-03-08".to_string())));
+}
+
+#[test]
+fn date_and_timestamp_are_different_families() {
+    let mut db = db_with("CREATE TABLE m (d DATE, ts TIMESTAMP)");
+    ok(&mut db, "INSERT INTO m VALUES ('2017-03-08', '2017-03-08 00:00:00')");
+
+    // 两个大类互不比较：`date = timestamp` 必须继续拒绝（PG 有隐式转换，本版没有）
+    let err = failure(&mut db, "SELECT * FROM m WHERE d = ts");
+    assert!(err.to_string().contains("两侧类型不同"), "{err}");
+}
+
+#[test]
+fn extract_year_reads_a_date_too() {
+    let mut db = db_with("CREATE TABLE m (d DATE)");
+    ok(&mut db, "INSERT INTO m VALUES ('1949-05-06'), ('2015-12-31')");
+
+    let out = query(&mut db, "SELECT EXTRACT(YEAR FROM d) AS y FROM m ORDER BY d");
+    assert_eq!(out.value(0, 0), Some(Value::Int(1949)));
+    assert_eq!(out.value(1, 0), Some(Value::Int(2015)));
+}
+
+// -------------------------------------------------------------------- LENGTH
+
+#[test]
+fn length_counts_characters_not_bytes() {
+    let mut db = db_with("CREATE TABLE m (t TEXT)");
+    let out = query(
+        &mut db,
+        "SELECT LENGTH('中文') AS a, LENGTH('') AS b, LENGTH(NULL) AS c, LENGTH('abc') AS d",
+    );
+
+    assert_eq!(out.value(0, 0), Some(Value::Int(2)));
+    assert_eq!(out.value(0, 1), Some(Value::Int(0)));
+    assert_eq!(out.value(0, 2), Some(Value::Null));
+    assert_eq!(out.value(0, 3), Some(Value::Int(3)));
+}
+
+#[test]
+fn length_only_takes_text() {
+    let mut db = db_with("CREATE TABLE m (n INT)");
+    let err = failure(&mut db, "SELECT LENGTH(n) FROM m");
+    assert!(err.to_string().contains("TEXT"), "{err}");
+}
+
+#[test]
+fn length_works_on_a_typed_column() {
+    let mut db = db_with("CREATE TABLE m (t VARCHAR(10), n INT)");
+    ok(&mut db, "INSERT INTO m VALUES ('中文', 3)");
+
+    let out = query(&mut db, "SELECT t FROM m WHERE LENGTH(t) = 2");
+    assert_eq!(out.nrows(), 1);
+    let out = query(&mut db, "SELECT t FROM m WHERE LENGTH(t) = n");
+    assert_eq!(out.nrows(), 0);
 }
 
 #[test]
@@ -559,6 +650,7 @@ fn csv_round_trips_every_new_type() {
         Column::new("v", DataType::VarChar(8)),
         Column::new("ts", DataType::Timestamp(6)),
         Column::new("n", DataType::Numeric(10, 2)),
+        Column::new("d", DataType::Date),
     ]);
     let mut saved = PhysTab::new("m", &shape);
     saved
@@ -568,6 +660,7 @@ fn csv_round_trips_every_new_type() {
             Value::Text("中文".to_string()),
             Value::Timestamp("2024-01-05 08:30:00.000000".to_string()),
             Value::Numeric("-12.34".to_string()),
+            Value::Date("2017-03-08".to_string()),
         ])
         .expect("插入");
 

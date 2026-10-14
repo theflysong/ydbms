@@ -20,10 +20,25 @@
 //!
 //! `nodes` 里存在从 `root` 走不到的节点是**合法**的：将来的重写会把旧节点
 //! 孤立在数组里。`analyze` / `execute` / `explain` 都只从 `root` 出发。
+//!
+//! # 子查询的校验分两处
+//!
+//! [`Prog::verify`] 只看 step 自己的类型（它连符号表都没有），所以
+//! [`Plan::analyze`] 在正向扫完节点之后还会走一遍私有的 `check_subqueries`：
+//! 内层计划自己也要过浅层校验，`SubPlan::outers` 还要与"执行时压着的那几层外层行"
+//! 逐层对上，`Step::Outer` 的下标与类型也在这里核对。绑定器算错外层下标只有这一关
+//! 抓得住——见 `crate::ir::exec` 的 `ExecCtx`。
+//!
+//! # 派生表怎么进来
+//!
+//! [`PlanBuilder::splice`] 把一个计划（派生表）的节点整体接进另一个数组，只改
+//! `inputs` 的偏移——**没有"派生表"这个算子**，它在外层看来就是一段子计划。
+//! `UNION [ALL]` 则有自己的 [`Op::Union`]；`SELECT DISTINCT` 是 [`Op::Distinct`]。
 
 use crate::db::table::{Column, DataType, DbError, Result, TypeFamily};
 
-use super::expr::{Prog, ScalarType, Step};
+use super::expr::{Prog, Step, SubMode};
+use super::value::ScalarType;
 use super::symbol::SymbolTable;
 
 /// 节点号，同时是它在 [`Plan::nodes`] 里的下标。
@@ -64,7 +79,7 @@ pub struct EqKey {
     pub inner: Prog,
 }
 
-/// 连接的执行策略（由绑定器挑，见 [`crate::ir::lower`]）。
+/// 连接的执行策略（由绑定器挑，见 [`crate::ir::irgen`]）。
 ///
 /// 三者对**输出**完全一致（行序都等于「外侧顺序 × 内侧顺序」），换的只是
 /// 「内侧怎么找」。
@@ -77,10 +92,14 @@ pub enum JoinStrategy {
         /// 等值键（至少一个）。
         keys: Vec<EqKey>,
     },
-    /// 索引嵌套循环：内侧是**基表 [`Op::Scan`]**，给它建一次索引，
+    /// 索引嵌套循环：内侧是**基表 [`Op::Scan`]**，在它的连接列上查目录里的索引，
     /// 外侧每行按键查一次——内侧的行**不必物化**。
     ///
-    /// 内侧 `Scan` 自己的 `index` 槽位这时用不上（连接建的是**连接列**上的索引），
+    /// 索引是**目录对象**（[`crate::ir::SymbolTable::index_of`]）：只有 `CREATE INDEX`
+    /// 建过的列才挑得出这条策略（见 `ir::opt`）。索引还没建时，
+    /// [`crate::db::index::IndexSlot`] 会在第一次查找时按需建一份。
+    ///
+    /// 内侧 `Scan` 自己的 `index` 槽位这时用不上（连接用的是**连接列**上的索引），
     /// 它的 `filter` 仍要由执行器逐行复核。
     IndexNestedLoop {
         /// 等值键；`inner` 必须是**裸列**（索引只能建在一列上）。
@@ -151,7 +170,7 @@ impl AggFunc {
     }
 }
 
-/// 一个聚合：函数 + 参数（**按输入行**求值的程序）+ 是否 DISTINCT。
+/// 一个聚合：函数 + 参数（**按输入行**求值的程序）+ 是否 DISTINCT + `FILTER`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggSpec {
     /// 用哪个聚合函数。
@@ -160,6 +179,11 @@ pub struct AggSpec {
     pub arg: Option<Prog>,
     /// 是不是 `COUNT(DISTINCT x)`。
     pub distinct: bool,
+    /// `FILTER (WHERE …)`：只有它为 `TRUE` 的行才进累加器。
+    ///
+    /// 谓词按**输入行**求值（与 [`AggSpec::arg`] 同一个 schema），三值逻辑里
+    /// `Unknown` 与 `FALSE` 一样被丢掉。
+    pub filter: Option<Prog>,
 }
 
 /// 一个排序键。
@@ -230,6 +254,19 @@ pub enum Op {
         /// 排序键。
         keys: Vec<SortKey>,
     },
+    /// 去重（`SELECT DISTINCT`）：流式过滤，见过的行不再往下放。
+    ///
+    /// 输出 schema 与输入**完全一样**——它只丢行，不改行。
+    Distinct,
+    /// 集合运算 `UNION [ALL]`。
+    ///
+    /// 两个输入，输出 schema 就是**左支**的（列名也取左支的）。`all == false` 时
+    /// 去重——`UNION` 的语义，`UNION ALL` 保留重复。两支逐列必须同族，否则报
+    /// `IrInvalid`（跨大类的值放在同一列里只会给出安静的错答案）。
+    Union {
+        /// 是 `UNION ALL` 吗（否则去重）。
+        all: bool,
+    },
     /// 截断。
     Limit {
         /// 最多取多少行；`None` 表示不限制。
@@ -250,8 +287,9 @@ impl Op {
             | Op::Project { .. }
             | Op::Sort { .. }
             | Op::Limit { .. }
+            | Op::Distinct
             | Op::Aggregate { .. } => 1,
-            Op::Join { .. } => 2,
+            Op::Join { .. } | Op::Union { .. } => 2,
         }
     }
 
@@ -264,6 +302,8 @@ impl Op {
             Op::Aggregate { .. } => "Aggregate",
             Op::Join { .. } => "Join",
             Op::Sort { .. } => "Sort",
+            Op::Distinct => "Distinct",
+            Op::Union { .. } => "Union",
             Op::Limit { .. } => "Limit",
             Op::SingleRow => "SingleRow",
         }
@@ -319,7 +359,21 @@ impl Plan {
     /// * 每个程序 [`Prog::verify`]（寄存器先定义后使用、列下标不越界、类型正确）；
     /// * 谓词必须是 `BOOL`、排序键与结果列必须是 `INT`；
     /// * 推导出每个节点的输出 schema。
+    ///
+    /// 之后还会走一遍**子查询校验**（`check_subqueries`）：内层计划自己也要过这一关，
+    /// 而且 `SubPlan::outers` 必须与"执行时压着的那些外层行"逐层对上——绑定期算错外层
+    /// 下标是这里唯一抓得住它的地方（[`Prog::verify`] 拿不到符号表）。
     pub fn analyze(&self, symbols: &SymbolTable) -> Result<Analysis> {
+        let analysis = self.analyze_shallow(symbols)?;
+        check_subqueries(self, &analysis, symbols, &[])?;
+        Ok(analysis)
+    }
+
+    /// 只做"正向扫一遍"的那一半（不递归进子计划）。
+    ///
+    /// 绑定器要"问一个（还没接进任何计划的）计划的 schema"时用它：那时候它还没
+    /// 有外层链，深一层的校验也还做不了。
+    pub(crate) fn analyze_shallow(&self, symbols: &SymbolTable) -> Result<Analysis> {
         if self.nodes.is_empty() {
             return Err(DbError::IrInvalid {
                 node: None,
@@ -432,6 +486,11 @@ impl Plan {
                             Some(prog) => Some(prog.verify(&input).map_err(|e| at(id, e))?),
                             None => None,
                         };
+                        // `FILTER (WHERE …)` 是个按输入行求值的谓词
+                        if let Some(filter) = &spec.filter {
+                            let ty = filter.verify(&input).map_err(|e| at(id, e))?;
+                            expect(ty, ScalarType::Bool, id, "Aggregate 的 FILTER")?;
+                        }
                         let ty = spec.func.result_type(arg);
                         columns.push(Column::new(
                             name.clone(),
@@ -492,7 +551,36 @@ impl Plan {
                 }
 
                 Op::Limit { .. } => (schemas[node.inputs[0]].clone(), None),
-            };
+
+                // 去重不改 schema：它只丢行
+                Op::Distinct => (schemas[node.inputs[0]].clone(), None),
+
+                Op::Union { .. } => {
+                    let left = schemas[node.inputs[0]].clone();
+                    let right = schemas[node.inputs[1]].clone();
+
+                    if left.len() != right.len() {
+                        return Err(invalid(id, format!(
+                            "UNION 两支的列数不同（{} 与 {}）",
+                            left.len(),
+                            right.len()
+                        )));
+                    }
+                    for (l, r) in left.iter().zip(right.iter()) {
+                        // 同族才敢放在同一列里：`Value::Int(1)` 与
+                        // `Value::Numeric("1")` 在值层面不是同一个东西
+                        if l.ty.family() != r.ty.family() {
+                            return Err(invalid(id, format!(
+                                "UNION 的第 {} 列两支类型不同（{} 与 {}）",
+                                l.name,
+                                l.ty,
+                                r.ty
+                            )));
+                        }
+                    }
+
+                    (left, None)
+                }            };
 
             schemas.push(schema);
             program_inputs.push(program_input);
@@ -686,6 +774,47 @@ impl PlanBuilder {
         self.push(Op::Sort { keys }, vec![input])
     }
 
+    /// `UNION [ALL]`。
+    pub fn union(&mut self, left: NodeId, right: NodeId, all: bool) -> Result<NodeId> {
+        self.push(Op::Union { all }, vec![left, right])
+    }
+
+    /// 把另一个计划（派生表）的节点**接进来**，返回它的 root 在新计划里的下标。
+    ///
+    /// 派生表就用它：不新增算子，只把内层计划的节点整体搬过来。两点必须对：
+    ///
+    /// * `inputs` 整体加偏移——它们指向的是**同一个**数组里的更早节点；
+    /// * 不变量 I1 仍然成立（偏移后仍然严格小于新下标）。
+    ///
+    /// 程序里的**列**下标不用动：内层程序面对的一直是它自己的 schema。
+    pub fn splice(&mut self, plan: Plan) -> Result<NodeId> {
+        if plan.nodes.is_empty() {
+            return Err(DbError::IrInvalid {
+                node: None,
+                message: "要接进来的计划没有节点".to_string(),
+            });
+        }
+
+        let base = self.nodes.len();
+        let root = base + plan.root;
+
+        for mut node in plan.nodes {
+            node.inputs = node
+                .inputs
+                .into_iter()
+                .map(|input| input + base)
+                .collect::<Vec<_>>();
+            self.nodes.push(node);
+        }
+
+        Ok(root)
+    }
+
+    /// 去重。
+    pub fn distinct(&mut self, input: NodeId) -> Result<NodeId> {
+        self.push(Op::Distinct, vec![input])
+    }
+
     /// 截断。
     pub fn limit(&mut self, input: NodeId, limit: Option<u64>, offset: u64) -> Result<NodeId> {
         self.push(Op::Limit { limit, offset }, vec![input])
@@ -771,6 +900,248 @@ fn at(node: NodeId, e: DbError) -> DbError {
         },
         other => other,
     }
+}
+
+// ------------------------------------------------------------ 子查询的校验
+
+/// 把一个 [`Op`] 里**所有** [`Prog`] 交给 `visit`。
+///
+/// 穷尽 match：加新算子时会编译报错，不会漏掉某个程序的子查询校验。
+fn for_each_program(op: &Op, visit: &mut dyn FnMut(&Prog)) {
+    match op {
+        Op::SingleRow | Op::Distinct | Op::Union { .. } => {}
+        Op::Scan { filter, index, .. } => {
+            if let Some(prog) = filter {
+                visit(prog);
+            }
+            if let Some(path) = index {
+                visit(&path.key);
+            }
+        }
+        Op::Filter { predicate } => visit(predicate),
+        Op::Project { progs, .. } => progs.iter().for_each(&mut *visit),
+        Op::Join { on, strategy, .. } => {
+            if let Some(prog) = on {
+                visit(prog);
+            }
+            match strategy {
+                JoinStrategy::NestedLoop => {}
+                JoinStrategy::Hash { keys } => keys.iter().for_each(|key| {
+                    visit(&key.outer);
+                    visit(&key.inner);
+                }),
+                JoinStrategy::IndexNestedLoop { key } => {
+                    visit(&key.outer);
+                    visit(&key.inner);
+                }
+            }
+        }
+        Op::Aggregate { group_by, aggs, .. } => {
+            group_by.iter().for_each(&mut *visit);
+            for spec in aggs {
+                if let Some(arg) = &spec.arg {
+                    visit(arg);
+                }
+                if let Some(filter) = &spec.filter {
+                    visit(filter);
+                }
+            }
+        }
+        Op::Sort { keys } => keys.iter().for_each(|key| visit(&key.prog)),
+        Op::Limit { .. } => {}
+    }
+}
+
+/// 这个计划里（含嵌套子计划）出现过外层引用吗。
+///
+/// 绑定器用它填 `SubPlan::correlated`。判断是**保守**的：只要哪里有
+/// `Step::Outer` 就算相关——保守只会少缓存，不会算错。
+pub(crate) fn plan_has_outer(plan: &Plan) -> bool {
+    plan.nodes.iter().any(|node| {
+        let mut found = false;
+        for_each_program(&node.op, &mut |prog| {
+            if !found {
+                found = program_has_outer(prog);
+            }
+        });
+        found
+    })
+}
+
+/// 一个程序（含它的子程序）里出现过外层引用吗。
+fn program_has_outer(prog: &Prog) -> bool {
+    prog.steps().iter().any(|step| match step {
+        Step::Outer { .. } => true,
+        Step::Subquery { spec, .. } => plan_has_outer(&spec.plan),
+        Step::Case {
+            then_prog,
+            else_prog,
+            ..
+        } => program_has_outer(then_prog) || program_has_outer(else_prog),
+        Step::And { right_prog, .. } | Step::Or { right_prog, .. } => program_has_outer(right_prog),
+        _ => false,
+    })
+}
+
+/// 校验一个计划里所有程序的子查询与外层引用。
+///
+/// `chain` 是这个计划的节点**执行时压着的那些外层行**的 schema（`chain[0]` 是最贴近
+/// 的一层）；最外层传空。
+///
+/// 两条规矩：
+///
+/// * `Step::Outer { depth, index }` 要能在 `chain[depth - 1]` 上取到那一列，且类型与
+///   step 上记的一致——取不到就说明外层链对不上，直接报 `IrInvalid`；
+/// * `SubPlan::outers` 必须等于 `[所在节点程序面对的那一行] ++ chain`（**绑定期**算
+///   出来的链与**执行期**压着的帧必须一样）。子查询没有记录外层链（`outers` 为空，
+///   例如分组查询里的子查询，见 `lower`）时，内层就不能有任何外层引用——递归下去时
+///   `chain` 为空，`Step::Outer` 自然会报错。
+fn check_subqueries(
+    plan: &Plan,
+    analysis: &Analysis,
+    symbols: &SymbolTable,
+    chain: &[Vec<Column>],
+) -> Result<()> {
+    for (id, node) in plan.nodes.iter().enumerate() {
+        let input = match analysis.program_inputs.get(id).and_then(|i| i.as_deref()) {
+            Some(input) => input,
+            None => continue,
+        };
+
+        let mut failure: Option<DbError> = None;
+        for_each_program(&node.op, &mut |prog| {
+            if failure.is_some() {
+                return;
+            }
+            if let Err(e) = check_program(prog, symbols, input, chain, id) {
+                failure = Some(e);
+            }
+        });
+
+        if let Some(e) = failure {
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+/// 校验一个程序里的子查询 step 与外层引用（见 `check_subqueries`）。
+///
+/// 子程序（`CASE` 的分支、`AND`/`OR` 的右侧）与外层面对**同一行**，所以递归下去时
+/// `input` 与 `chain` 原样传——但**必须递归**：子查询与外层引用一样可能藏在里面。
+fn check_program(
+    prog: &Prog,
+    symbols: &SymbolTable,
+    input: &[Column],
+    chain: &[Vec<Column>],
+    id: NodeId,
+) -> Result<()> {
+    for step in prog.steps() {
+        match step {
+            Step::Subquery { spec, .. } => {
+                // 内层计划自己也要过一遍浅层校验，然后带着**它自己的外层链**
+                // 递归下去（`spec.outers` 就是内层执行时压着的那些帧）。
+                let inner = spec.plan.analyze_shallow(symbols).map_err(|e| at(id, e))?;
+                let root = &inner.schemas[spec.plan.root];
+
+                if spec.arity != root.len() {
+                    return Err(invalid(
+                        id,
+                        format!(
+                            "子查询记了 {} 个输出列，内层实际有 {} 列",
+                            spec.arity,
+                            root.len()
+                        ),
+                    ));
+                }
+                if matches!(spec.mode, SubMode::Scalar | SubMode::Quantified { .. }) {
+                    if root.len() != 1 {
+                        return Err(invalid(
+                            id,
+                            format!("这个子查询必须只输出一列，实际有 {} 列", root.len()),
+                        ));
+                    }
+                    let actual = ScalarType::Value(root[0].ty.family());
+                    if actual != spec.inner {
+                        return Err(invalid(
+                            id,
+                            format!(
+                                "子查询的结果类型记成了 {}，内层实际是 {}",
+                                spec.inner, actual
+                            ),
+                        ));
+                    }
+                }
+
+                if !spec.outers.is_empty() {
+                    let expected: Vec<Vec<Column>> = std::iter::once(input.to_vec())
+                        .chain(chain.iter().cloned())
+                        .collect();
+                    if spec.outers != expected {
+                        return Err(invalid(
+                            id,
+                            "子查询记录的外层 schema 链与它执行时压着的那些行对不上\
+                             （绑定器算错了外层下标）"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                check_subqueries(&spec.plan, &inner, symbols, &spec.outers).map_err(|e| at(id, e))?;
+            }
+            Step::Outer {
+                depth, index, ty, ..
+            } => {
+                let Some(level) = depth.checked_sub(1).and_then(|d| chain.get(d as usize)) else {
+                    return Err(invalid(
+                        id,
+                        format!(
+                            "外层引用 depth={} 越界：这里只压着 {} 层外层行",
+                            depth,
+                            chain.len()
+                        ),
+                    ));
+                };
+                let column = level.get(*index).ok_or_else(|| {
+                    invalid(
+                        id,
+                        format!(
+                            "外层引用 {}.{} 越界（那一层只有 {} 列）",
+                            depth,
+                            index,
+                            level.len()
+                        ),
+                    )
+                })?;
+                let actual = ScalarType::Value(column.ty.family());
+                if actual != *ty {
+                    return Err(invalid(
+                        id,
+                        format!(
+                            "外层引用 {}.{} 记的类型是 {}，实际那一列是 {}",
+                            depth, index, ty, column.ty
+                        ),
+                    ));
+                }
+            }
+            // 子程序面对同一个输入行，所以 `input` 与 `chain` 原样传下去
+            Step::Case {
+                then_prog,
+                else_prog,
+                ..
+            } => {
+                check_program(then_prog, symbols, input, chain, id)?;
+                check_program(else_prog, symbols, input, chain, id)?;
+            }
+            Step::And { right_prog, .. } | Step::Or { right_prog, .. } => {
+                check_program(right_prog, symbols, input, chain, id)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// 校验一条索引访问路径。
@@ -1004,13 +1375,21 @@ fn render(id: NodeId, node: &Node, analysis: &Analysis) -> String {
             let groups: Vec<String> = group_by.iter().map(|p| p.explain(input)).collect();
             let list: Vec<String> = aggs
                 .iter()
-                .map(|spec| match (&spec.arg, spec.distinct) {
-                    (None, _) => format!("{}(*)", spec.func.name()),
-                    (Some(prog), true) => {
-                        format!("{}(DISTINCT {})", spec.func.name(), prog.explain(input))
-                    }
-                    (Some(prog), false) => {
-                        format!("{}({})", spec.func.name(), prog.explain(input))
+                .map(|spec| {
+                    let base = match (&spec.arg, spec.distinct) {
+                        (None, _) => format!("{}(*)", spec.func.name()),
+                        (Some(prog), true) => {
+                            format!("{}(DISTINCT {})", spec.func.name(), prog.explain(input))
+                        }
+                        (Some(prog), false) => {
+                            format!("{}({})", spec.func.name(), prog.explain(input))
+                        }
+                    };
+                    match &spec.filter {
+                        Some(filter) => {
+                            format!("{} FILTER (WHERE {})", base, filter.explain(input))
+                        }
+                        None => base,
                     }
                 })
                 .collect();
@@ -1038,5 +1417,7 @@ fn render(id: NodeId, node: &Node, analysis: &Analysis) -> String {
             Some(limit) => format!("Limit(limit={}, offset={})", limit, offset),
             None => format!("Limit(limit=none, offset={})", offset),
         },
+        Op::Distinct => "Distinct".to_string(),
+        Op::Union { all } => format!("Union(all={})", all),
     }
 }

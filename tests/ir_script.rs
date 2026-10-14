@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use ydbms::db::table::{DataType, DbError, Table};
+use ydbms::db::table::{DataType, DbError, TabShape, Table, Value};
 use ydbms::db::PhysTab;
 use ydbms::ir::{run_script, Outcome, StmtResult, SymbolTable};
 
@@ -312,24 +312,85 @@ fn integer_aliases_map_to_int() {
 
 #[test]
 fn unsupported_type_is_rejected_with_its_name() {
-    // `TEXT` 现在是合法类型了，换一个真的不支持的。
+    // `DATE` 现在是合法类型了（TODO 1.3），换一个真的不支持的。
     let mut db = SymbolTable::new();
-    let err = one(&mut db, "CREATE TABLE p (a DATE)").unwrap_err();
+    let err = one(&mut db, "CREATE TABLE p (a BOOLEAN)").unwrap_err();
 
     match err {
         DbError::Unsupported { ref feature } => {
-            // 报出来的必须是 date，而不是 pg_catalog
-            assert!(feature.contains("date"), "{feature}");
+            // 报出来的必须是 bool，而不是 pg_catalog
+            assert!(feature.contains("bool"), "{feature}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
 }
 
 #[test]
-fn default_constraint_is_rejected() {
+fn date_is_a_supported_column_type_now() {
     let mut db = SymbolTable::new();
-    let err = one(&mut db, "CREATE TABLE p (a INT DEFAULT 1)").unwrap_err();
+    run_ok(&mut db, "CREATE TABLE p (a DATE)");
+    assert_eq!(db.columns("p").unwrap()[0].ty, DataType::Date);
+}
 
+#[test]
+fn default_fills_an_omitted_column() {
+    let mut db = SymbolTable::new();
+    run_ok(
+        &mut db,
+        "CREATE TABLE p (a INT, b INT DEFAULT 7, c TEXT DEFAULT 'x', d DATE DEFAULT '2017-03-08')",
+    );
+    run_ok(&mut db, "INSERT INTO p (a) VALUES (1)");
+
+    let rows = run_ok(&mut db, "SELECT a, b, c, d FROM p");
+    let table = rows_of(&rows[0]);
+    assert_eq!(col_i32(table, 0), vec![1]);
+    assert_eq!(col_i32(table, 1), vec![7]);
+    assert_eq!(table.value(0, 2), Some(Value::Text("x".to_string())));
+    assert_eq!(table.value(0, 3), Some(Value::Date("2017-03-08".to_string())));
+}
+
+#[test]
+fn an_omitted_column_without_a_default_becomes_null() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (a INT, b INT)");
+    run_ok(&mut db, "INSERT INTO p (a) VALUES (1)");
+
+    let rows = run_ok(&mut db, "SELECT b FROM p");
+    assert_eq!(rows_of(&rows[0]).value(0, 0), Some(Value::Null));
+}
+
+#[test]
+fn an_omitted_not_null_column_without_a_default_is_rejected() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (a INT, b INT NOT NULL)");
+    let err = one(&mut db, "INSERT INTO p (a) VALUES (1)").unwrap_err();
+
+    assert!(matches!(err, DbError::BadValue { .. }), "got {err:?}");
+    assert_eq!(db.relation("p").unwrap().nrows(), 0, "不该插进去半行");
+}
+
+#[test]
+fn default_null_is_a_null_default() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (a INT DEFAULT NULL)");
+    run_ok(&mut db, "INSERT INTO p DEFAULT VALUES".replace("DEFAULT VALUES", "(a) VALUES (1)").as_str());
+
+    let rows = run_ok(&mut db, "SELECT a FROM p");
+    assert_eq!(rows_of(&rows[0]).value(0, 0), Some(Value::Int(1)));
+}
+
+#[test]
+fn a_default_that_does_not_fit_the_column_is_rejected_at_create_time() {
+    let mut db = SymbolTable::new();
+    // typmod 与类型在**建表**时就强制：不然要到插数据时才炸
+    let err = one(&mut db, "CREATE TABLE p (a VARCHAR(2) DEFAULT '中文中')").unwrap_err();
+    assert!(matches!(err, DbError::BadValue { .. }), "got {err:?}");
+
+    let err = one(&mut db, "CREATE TABLE q (a INT DEFAULT 'x')").unwrap_err();
+    assert!(matches!(err, DbError::BadValue { .. }), "got {err:?}");
+
+    // 表达式形式的 DEFAULT 本版不支持（宁可拒绝，也不猜一个固定值）
+    let err = one(&mut db, "CREATE TABLE r (a INT DEFAULT (1 + 1))").unwrap_err();
     match err {
         DbError::Unsupported { ref feature } => assert!(feature.contains("DEFAULT"), "{feature}"),
         other => panic!("expected Unsupported, got {other:?}"),
@@ -337,10 +398,63 @@ fn default_constraint_is_rejected() {
 }
 
 #[test]
-fn check_constraint_is_rejected() {
+fn check_is_really_enforced() {
     let mut db = SymbolTable::new();
-    let err = one(&mut db, "CREATE TABLE p (a INT CHECK (a > 0))").unwrap_err();
+    let created = one(&mut db, "CREATE TABLE p (a INT CHECK (a > 0))").unwrap();
+    match created {
+        Outcome::Created { checks, .. } => assert_eq!(checks, 1, "1 条 CHECK 已强制"),
+        other => panic!("expected Created, got {other:?}"),
+    }
 
+    run_ok(&mut db, "INSERT INTO p VALUES (1)");
+    let err = one(&mut db, "INSERT INTO p VALUES (0)").unwrap_err();
+    match err {
+        DbError::CheckViolation {
+            ref table,
+            ref constraint,
+        } => {
+            assert_eq!(table, "p");
+            assert_eq!(constraint, "p_a_check", "没写约束名时按 PostgreSQL 合成");
+        }
+        other => panic!("expected CheckViolation, got {other:?}"),
+    }
+    assert_eq!(db.relation("p").unwrap().nrows(), 1, "违规的行不该插进去");
+
+    // 三值逻辑：`NULL > 0` 是 UNKNOWN，**不是假**，所以放行
+    run_ok(&mut db, "INSERT INTO p VALUES (NULL)");
+    assert_eq!(db.relation("p").unwrap().nrows(), 2);
+}
+
+#[test]
+fn a_named_check_reports_its_name() {
+    let mut db = SymbolTable::new();
+    run_ok(
+        &mut db,
+        "CREATE TABLE p (a TEXT CONSTRAINT \"名字够短\" CHECK (LENGTH(a) <= 3))",
+    );
+    run_ok(&mut db, "INSERT INTO p VALUES ('中文')");
+
+    let err = one(&mut db, "INSERT INTO p VALUES ('太长了啊')").unwrap_err();
+    match err {
+        DbError::CheckViolation { ref constraint, .. } => assert_eq!(constraint, "名字够短"),
+        other => panic!("expected CheckViolation, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_table_level_check_can_see_several_columns() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (lo INT, hi INT, CHECK (lo <= hi))");
+    run_ok(&mut db, "INSERT INTO p VALUES (1, 2)");
+
+    let err = one(&mut db, "INSERT INTO p VALUES (3, 2)").unwrap_err();
+    assert!(matches!(err, DbError::CheckViolation { .. }), "got {err:?}");
+}
+
+#[test]
+fn check_rejects_a_subquery() {
+    let mut db = SymbolTable::new();
+    let err = one(&mut db, "CREATE TABLE p (a INT CHECK (a > (SELECT 1)))").unwrap_err();
     match err {
         DbError::Unsupported { ref feature } => assert!(feature.contains("CHECK"), "{feature}"),
         other => panic!("expected Unsupported, got {other:?}"),
@@ -348,13 +462,50 @@ fn check_constraint_is_rejected() {
 }
 
 #[test]
-fn table_level_constraint_is_rejected() {
+fn table_level_constraints_are_accepted_and_recorded() {
     let mut db = SymbolTable::new();
-    let err = one(&mut db, "CREATE TABLE p (a INT, PRIMARY KEY (a))").unwrap_err();
+    let created = one(
+        &mut db,
+        "CREATE TABLE p (a INT, b CHAR(2), PRIMARY KEY (a, b), UNIQUE (b), \
+         FOREIGN KEY (a) REFERENCES other(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
 
-    match err {
-        DbError::Unsupported { ref feature } => assert!(feature.contains("表级约束"), "{feature}"),
-        other => panic!("expected Unsupported, got {other:?}"),
+    match created {
+        Outcome::Created {
+            ref unenforced,
+            checks,
+            ..
+        } => {
+            assert_eq!(checks, 0, "没有 CHECK");
+            assert_eq!(unenforced.len(), 3, "{unenforced:?}");
+            assert_eq!(unenforced[0], "PRIMARY KEY (a, b)", "{unenforced:?}");
+            assert_eq!(unenforced[1], "UNIQUE (b)", "{unenforced:?}");
+            assert!(
+                unenforced[2].contains("FOREIGN KEY (a) REFERENCES other(id)")
+                    && unenforced[2].contains("ON DELETE CASCADE"),
+                "{unenforced:?}"
+            );
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+
+    // 「未强制」是真的没强制：重复主键照样插得进去（只是看得出来）
+    run_ok(&mut db, "INSERT INTO p VALUES (1, 'ab')");
+    run_ok(&mut db, "INSERT INTO p VALUES (1, 'ab')");
+    assert_eq!(db.relation("p").unwrap().nrows(), 2);
+}
+
+#[test]
+fn deferrable_constraints_are_still_rejected() {
+    let mut db = SymbolTable::new();
+    for sql in [
+        "CREATE TABLE p (a INT UNIQUE DEFERRABLE)",
+        "CREATE TABLE q (a INT UNIQUE INITIALLY DEFERRED)",
+        "CREATE TABLE r (a INT, CONSTRAINT c CHECK (a > 0) NOT VALID)",
+    ] {
+        let err = one(&mut db, sql).unwrap_err();
+        assert!(matches!(err, DbError::Unsupported { .. }), "{sql}: {err:?}");
     }
 }
 
@@ -448,18 +599,6 @@ fn insert_unknown_column_is_rejected() {
 }
 
 #[test]
-fn insert_omitting_a_column_is_rejected() {
-    let mut db = SymbolTable::new();
-    run_ok(&mut db, "CREATE TABLE p (a INT, b INT)");
-    let err = one(&mut db, "INSERT INTO p (a) VALUES (1)").unwrap_err();
-
-    match err {
-        DbError::Unsupported { ref feature } => assert!(feature.contains("省略"), "{feature}"),
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
-}
-
-#[test]
 fn insert_into_unknown_table_is_rejected() {
     let mut db = SymbolTable::new();
     let err = one(&mut db, "INSERT INTO nope VALUES (1)").unwrap_err();
@@ -470,6 +609,163 @@ fn insert_into_unknown_table_is_rejected() {
             name: "nope".to_string()
         }
     );
+}
+
+// ---------------------------------------------------------------------- UPDATE
+
+/// 建一张两列的表并填三行，供下面的 UPDATE 用。
+fn update_fixture() -> SymbolTable {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE t (a INT, b INT)");
+    run_ok(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    db
+}
+
+fn col(table: &PhysTab, c: usize) -> Vec<String> {
+    (0..table.nrows())
+        .map(|r| table.value(r, c).expect("格子").to_string())
+        .collect()
+}
+
+fn select(db: &mut SymbolTable, sql: &str) -> PhysTab {
+    let outcomes = run_ok(db, sql);
+    match outcomes.into_iter().next().expect("一条查询") {
+        Outcome::Rows(table) => table,
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn update_changes_only_the_matching_rows() {
+    let mut db = update_fixture();
+    let outcome = one(&mut db, "UPDATE t SET b = 99 WHERE a = 2").unwrap();
+    match outcome {
+        Outcome::Updated { ref table, rows } => {
+            assert_eq!(table, "t");
+            assert_eq!(rows, 1);
+        }
+        other => panic!("expected Updated, got {other:?}"),
+    }
+
+    let out = select(&mut db, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(col(&out, 1), vec!["10", "99", "30"]);
+}
+
+#[test]
+fn update_without_a_where_clause_touches_every_row() {
+    let mut db = update_fixture();
+    let outcome = one(&mut db, "UPDATE t SET b = b + 1").unwrap();
+    match outcome {
+        Outcome::Updated { rows, .. } => assert_eq!(rows, 3),
+        other => panic!("expected Updated, got {other:?}"),
+    }
+
+    let out = select(&mut db, "SELECT b FROM t ORDER BY a");
+    assert_eq!(col(&out, 0), vec!["11", "21", "31"]);
+}
+
+#[test]
+fn every_set_expression_sees_the_old_row() {
+    let mut db = update_fixture();
+    run_ok(&mut db, "UPDATE t SET a = b, b = a WHERE a = 1");
+
+    // 交换：两个表达式读到的都是改之前那一行——(1,10) 变成 (10,1)
+    let out = select(&mut db, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(col(&out, 0), vec!["2", "3", "10"]);
+    assert_eq!(col(&out, 1), vec!["20", "30", "1"]);
+}
+
+#[test]
+fn update_enforces_not_null_and_typmod() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (a INT NOT NULL, b VARCHAR(2))");
+    run_ok(&mut db, "INSERT INTO p VALUES (1, 'ab')");
+
+    let err = one(&mut db, "UPDATE p SET a = NULL").unwrap_err();
+    assert!(matches!(err, DbError::BadValue { .. }), "got {err:?}");
+
+    let err = one(&mut db, "UPDATE p SET b = '中文中'").unwrap_err();
+    assert!(matches!(err, DbError::BadValue { .. }), "got {err:?}");
+
+    // 失败的那两条都不该改到数据
+    let out = select(&mut db, "SELECT a, b FROM p");
+    assert_eq!(col(&out, 0), vec!["1"]);
+    assert_eq!(col(&out, 1), vec!["ab"]);
+}
+
+#[test]
+fn update_enforces_check_constraints() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (a INT, b INT, CHECK (a <= b))");
+    run_ok(&mut db, "INSERT INTO p VALUES (1, 2)");
+
+    let err = one(&mut db, "UPDATE p SET a = 5").unwrap_err();
+    match err {
+        DbError::CheckViolation { ref constraint, .. } => assert_eq!(constraint, "p_check"),
+        other => panic!("expected CheckViolation, got {other:?}"),
+    }
+    assert_eq!(select(&mut db, "SELECT a FROM p").nrows(), 1);
+    assert_eq!(col(&select(&mut db, "SELECT a FROM p"), 0), vec!["1"]);
+
+    run_ok(&mut db, "UPDATE p SET a = 2");
+    assert_eq!(col(&select(&mut db, "SELECT a FROM p"), 0), vec!["2"]);
+}
+
+#[test]
+fn update_widens_an_int_into_a_numeric_column() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (n NUMERIC(10,2), i INT)");
+    run_ok(&mut db, "INSERT INTO p VALUES (1.50, 7)");
+
+    // `i` 是 INT 列：写进 NUMERIC 列要真的放大（与 INSERT 的字面量定型同一口径）
+    run_ok(&mut db, "UPDATE p SET n = i");
+    let out = select(&mut db, "SELECT n FROM p");
+    assert_eq!(out.value(0, 0), Some(Value::Numeric("7".to_string())));
+    assert_eq!(out.columns()[0].ty, DataType::Numeric(10, 2));
+}
+
+#[test]
+fn update_where_only_keeps_definite_truth() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE p (a INT, b INT)");
+    run_ok(&mut db, "INSERT INTO p VALUES (1, NULL), (2, 5)");
+
+    // `b = NULL` 是 UNKNOWN：一行都不该被改
+    let outcome = one(&mut db, "UPDATE p SET a = 9 WHERE b = NULL").unwrap();
+    match outcome {
+        Outcome::Updated { rows, .. } => assert_eq!(rows, 0),
+        other => panic!("expected Updated, got {other:?}"),
+    }
+    assert_eq!(col(&select(&mut db, "SELECT a FROM p ORDER BY a"), 0), vec!["1", "2"]);
+}
+
+#[test]
+fn update_rejects_what_it_cannot_do() {
+    let mut db = update_fixture();
+
+    for (sql, needle) in [
+        ("UPDATE t SET a = 1 RETURNING a", "RETURNING"),
+        ("UPDATE t SET a = 1 FROM t AS u WHERE u.a = 1", "FROM"),
+        ("UPDATE t SET a = 1, a = 2", "两次"),
+        ("UPDATE t SET a = 1 WHERE (SELECT 1) = 1", "子查询"),
+        ("UPDATE t SET a = (SELECT 1)", "子查询"),
+        ("UPDATE t SET a = DEFAULT", "DEFAULT"),
+        ("UPDATE nope SET a = 1", "nope"),
+    ] {
+        let err = one(&mut db, sql).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(needle), "{sql}: {text}");
+    }
+
+    // 未知列走的是 UnknownColumn（名字与可用列都报出来）
+    let err = one(&mut db, "UPDATE t SET zzz = 1").unwrap_err();
+    match err {
+        DbError::UnknownColumn { ref name, ref available } => {
+            assert_eq!(name, "zzz");
+            assert_eq!(available, &["a", "b"]);
+        }
+        other => panic!("expected UnknownColumn, got {other:?}"),
+    }
 }
 
 // ------------------------------------------------------------------ 脚本语义
@@ -506,4 +802,166 @@ fn an_empty_script_is_not_an_error() {
     let mut db = SymbolTable::new();
     assert!(run(&mut db, "   \n  ").is_empty());
     assert!(run(&mut db, "-- 只有注释\n").is_empty());
+}
+
+// ------------------------------------------------- 事务 / schema / search_path
+
+#[test]
+fn begin_and_commit_are_accepted_as_no_ops() {
+    let mut db = SymbolTable::new();
+    let outcomes = run_ok(&mut db, "BEGIN; CREATE TABLE p (a INT); COMMIT;");
+
+    // 三件事：`BEGIN` / 建表 / `COMMIT`——事务语句只是**记一行状态**
+    match &outcomes[0] {
+        Outcome::NoOp { message } => assert!(message.contains("BEGIN"), "{message}"),
+        other => panic!("expected NoOp, got {other:?}"),
+    }
+    match &outcomes[2] {
+        Outcome::NoOp { message } => assert!(message.contains("COMMIT"), "{message}"),
+        other => panic!("expected NoOp, got {other:?}"),
+    }
+    // 建表真的生效了（没有事务，但也没假装有）
+    assert_eq!(db.relation("p").unwrap().nrows(), 0);
+}
+
+#[test]
+fn rollback_is_rejected_instead_of_faked() {
+    let mut db = SymbolTable::new();
+    let err = one(&mut db, "ROLLBACK");
+
+    match err {
+        Err(DbError::Unsupported { ref feature }) => {
+            assert!(feature.contains("ROLLBACK"), "{feature}");
+            assert!(feature.contains("事务"), "{feature}");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+
+    // SAVEPOINT 之类同样不行
+    let err = one(&mut db, "SAVEPOINT s1");
+    assert!(matches!(err, Err(DbError::Unsupported { .. })), "got {err:?}");
+}
+
+#[test]
+fn search_path_makes_unqualified_names_land_in_the_schema() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE SCHEMA study; SET search_path TO study, public;");
+    run_ok(&mut db, "CREATE TABLE movies (movieid INT, title TEXT)");
+    run_ok(&mut db, "INSERT INTO movies VALUES (1, 'A')");
+
+    // 建出来的名字带前缀（存的就是 `study.movies`）……
+    assert_eq!(db.names(), vec!["study.movies"]);
+
+    // ……而限定名与（按 search_path）非限定名都能查到同一张表
+    assert_eq!(db.relation("study.movies").unwrap().nrows(), 1);
+    assert_eq!(db.relation("movies").unwrap().nrows(), 1);
+    assert_eq!(db.columns("movies").unwrap().len(), 2);
+
+    let selected = run_ok(&mut db, "SELECT movieid FROM study.movies");
+    let rows = rows_of(&selected[0]);
+    assert_eq!(col_i32(rows, 0), vec![1]);
+}
+
+#[test]
+fn without_a_search_path_nothing_is_prefixed() {
+    // 默认路径是空的：行为与过去**完全一样**
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE t (a INT)");
+
+    assert!(db.lookup("t").is_some());
+    assert_eq!(db.search_path().len(), 0);
+}
+
+#[test]
+fn create_schema_respects_if_not_exists() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE SCHEMA study");
+
+    let err = one(&mut db, "CREATE SCHEMA study");
+    assert!(matches!(err, Err(DbError::DuplicateSymbol { .. })), "got {err:?}");
+
+    // `IF NOT EXISTS` 就是"已经在了也算满足要求"
+    run_ok(&mut db, "CREATE SCHEMA IF NOT EXISTS study");
+}
+
+#[test]
+fn drop_schema_cascade_removes_the_tables_under_that_schema() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE SCHEMA study; SET search_path TO study;");
+    run_ok(&mut db, "CREATE TABLE movies (movieid INT)");
+    run_ok(&mut db, "INSERT INTO movies VALUES (1)");
+
+    run_ok(&mut db, "DROP SCHEMA study CASCADE");
+    assert!(db.lookup("study.movies").is_none(), "{:?}", db.names());
+    assert!(db.schemas().is_empty());
+}
+
+#[test]
+fn drop_schema_without_cascade_refuses_to_drop_objects() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE SCHEMA study; SET search_path TO study; CREATE TABLE movies (movieid INT)");
+
+    let err = one(&mut db, "DROP SCHEMA study");
+    match err {
+        Err(DbError::Unsupported { ref feature }) => assert!(feature.contains("CASCADE"), "{feature}"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    // 拒绝之后什么都没掉
+    assert!(db.lookup("study.movies").is_some());
+}
+
+#[test]
+fn drop_schema_if_exists_is_idempotent_but_plain_drop_is_not() {
+    let mut db = SymbolTable::new();
+    // 什么都没建也能"删"（`IF EXISTS`）
+    run_ok(&mut db, "DROP SCHEMA IF EXISTS study CASCADE");
+    run_ok(&mut db, "DROP SCHEMA IF EXISTS study CASCADE");
+
+    let err = one(&mut db, "DROP SCHEMA study");
+    assert!(matches!(err, Err(DbError::UnknownSymbol { .. })), "got {err:?}");
+}
+
+#[test]
+fn an_init_script_like_the_projects_runs_twice() {
+    // `ydbms-test/init.sql` 的形状：DROP → CREATE → SET search_path → 建表 → 装数据
+    const INIT: &str = "
+        BEGIN;
+        DROP SCHEMA IF EXISTS study CASCADE;
+        CREATE SCHEMA study;
+        SET search_path TO study, public;
+        CREATE TABLE movies (movieid INT, title TEXT);
+        INSERT INTO movies VALUES (1, 'A');
+        COMMIT;
+    ";
+
+    let mut db = SymbolTable::new();
+    for round in 1..=2 {
+        let results = run(&mut db, INIT);
+        for result in &results {
+            assert!(
+                result.outcome.is_ok(),
+                "第 {round} 轮的第 {} 条失败了：{:?}",
+                result.index,
+                result.outcome
+            );
+        }
+        // 第二轮是**重建**，所以只有一行（不是累加到两行）
+        assert_eq!(db.relation("study.movies").unwrap().nrows(), 1, "第 {round} 轮");
+    }
+}
+
+#[test]
+fn other_set_variables_are_rejected() {
+    let mut db = SymbolTable::new();
+    for sql in ["SET work_mem = '64MB'", "SET search_path = DEFAULT"] {
+        let err = one(&mut db, sql);
+        assert!(matches!(err, Err(DbError::Unsupported { .. })), "{sql}: {err:?}");
+    }
+}
+
+#[test]
+fn drop_table_is_still_rejected() {
+    let mut db = SymbolTable::new();
+    let err = one(&mut db, "DROP TABLE t");
+    assert!(matches!(err, Err(DbError::Unsupported { .. })), "got {err:?}");
 }

@@ -10,8 +10,8 @@
 - `phys.rs` —— 物化表 [`PhysTab`](phys.rs)。
 - `source.rs` —— 拉取式的中间结果 [`RowSource`](source.rs) / 基表游标
   [`TableCursor`](source.rs) / 物化 [`materialize`](source.rs) 与抽干 [`drain`](source.rs)。
-- `index.rs` —— 一列上的「键 → 行号」索引 [`Index`](index.rs)，以及把行号读成行的
-  [`IndexSource`](index.rs)。
+- `index.rs` —— 一列上的「键 → 行号」索引 [`Index`](index.rs)、**可失效可重建**的
+  [`IndexSlot`](index.rs)，以及把行号读成行的 [`IndexSource`](index.rs)。
 
 **上游**：`pers/` 通过 `&dyn Table` 落盘；`ir/` 把 `Value` 当标量用、把 `RowSource`
 当执行管道的每一节。这一层**被依赖，不依赖别人**，请保持这个方向。
@@ -32,6 +32,21 @@
 
 `next()` 返回 `None` 有两个可能：**正常结束**与**出错**，后者必须能通过 `error()`
 问到。一旦结束或出错，后续 `next()` 要继续返回 `None`（幂等）。
+
+### 谁强制什么：两层
+
+- **`db` 这一层**：`DataType::parse`（typmod 的唯一解析入口）与 `Table::validate`
+  （typmod 与 `NOT NULL` 的唯一强制入口，`insert`/`update`/`update_row` 都走它）。
+  老写法只比"大类相不相等"，`VARCHAR(30)` 会被误判——**别再把校验写一遍**。
+- **`ir` 那一层**：`CHECK`（`ir/checks.rs` 的 `CheckedTable` 装饰器）与 `DEFAULT`
+  （`ir/irgen.rs` 在 INSERT 缺列时补）。它们要 `Prog`，而 `db` 不认识 IR。
+
+### 索引（`IndexSlot`）
+
+索引是**会话级的目录对象**（名字在 `ir/symbol.rs`）：`CREATE INDEX` 建一份、
+`INSERT` 追加、`UPDATE` 作废、下次用到时重建。三条要注意：`RefCell` 是**必需**的
+（目录是 `&` 借出去的，而失效/重建/追加都要改它）；`IndexSource` 仍然是**惰性**的
+（第一次 `next()` 才建，`LIMIT 0` 之下连索引都不建）；索引攒的是**行号**而不是行。
 
 ### 不变式
 

@@ -8,7 +8,8 @@
 //! 这件事污染进整条查询链路和所有算子。
 //!
 //! 表达式仍然复用线性 IR：`INSERT` 里的值就是 [`Prog`]，白拿 `Prog::verify`
-//! 与 `Prog::eval`。
+//! 与 `Prog::eval`。`CHECK` 也是——它挂在一层 [`CheckedTable`] 装饰器上，
+//! 于是写路径不必各自记得校验。
 //!
 //! # 为什么必须逐条「降级 → 执行」
 //!
@@ -30,12 +31,14 @@
 use pg_query::protobuf::RawStmt;
 
 use crate::db::phys::PhysTab;
-use crate::db::table::{Column, ColumnsShape, DbError, Result, Row};
+use crate::db::table::{Column, ColumnsShape, DataType, DbError, Result, Row, TypeFamily, Value};
+
+use super::checks::{Check, CheckedTable};
 
 use super::expr::Prog;
 use super::plan::Plan;
 use super::symbol::SymbolTable;
-use super::{exec, lower};
+use super::{exec, irgen};
 
 /// 一条语句。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +57,13 @@ pub enum Stmt {
         /// **接受但没有强制**的约束，例如 `"PRIMARY KEY (prime_id)"`。
         ///
         /// 这个字段存在的意义就是"不许偷偷不强制"：调用方要把它显示出来。
-        /// `NOT NULL` 不在其中——它是**真的强制**的（`Column::not_null`，
-        /// 由 `Table::validate` 在 INSERT 时拦住）。
+        /// `NOT NULL`、`DEFAULT` 不在其中——它们与 `CHECK` 一样是**真的强制**的
+        /// （前两个由 `Table::validate` 与 INSERT 的补值管，`CHECK` 见
+        /// [`Check`]）。
         unenforced: Vec<String>,
+        /// **真的强制**的 `CHECK` 约束：建表时把它们包进
+        /// [`CheckedTable`]，于是所有写路径都过约束。
+        checks: Vec<Check>,
     },
 
     /// `INSERT ... VALUES`：往表里加行。
@@ -69,6 +76,92 @@ pub enum Stmt {
         /// 没有输入行，作用域为空，出现列引用会被 `Prog::verify` 挡下。
         rows: Vec<Vec<Prog>>,
     },
+
+    /// `CREATE INDEX [IF NOT EXISTS] name ON table (column)`。
+    ///
+    /// 索引是**目录对象**（见 [`crate::db::index`]）：这里只把名字、表、列记下来，
+    /// 真正建索引与后续的维护/失效都在 [`SymbolTable`] 与执行器里。
+    CreateIndex {
+        /// 索引名（可能带 schema 前缀）。
+        name: String,
+        /// 表名。
+        table: String,
+        /// 建在**这张表**的第几列上。
+        column: usize,
+        /// 语句里写了 `IF NOT EXISTS`。
+        if_not_exists: bool,
+    },
+
+    /// `DROP INDEX [IF EXISTS] name`。
+    DropIndex {
+        /// 索引名。
+        name: String,
+        /// 语句里写了 `IF EXISTS`。
+        if_exists: bool,
+    },
+
+    /// `UPDATE ... SET ... [WHERE ...]`：改表里已有的行。
+    ///
+    /// 本版**没有事务**，所以一条 `UPDATE` 中途出错会留下前面已经改过的行
+    /// （与 `INSERT` 是同一条口径）。
+    Update {
+        /// 表名（生效名）。
+        table: String,
+        /// `(列下标, 值程序)`。值程序面对**整张表**的扁平 schema，并且在**旧行**
+        /// 上求值（与 PostgreSQL 一致：所有 `SET` 表达式看到的都是改之前那一行）。
+        sets: Vec<(usize, Prog)>,
+        /// `WHERE` 谓词；`None` 表示所有行都改。同样面对整张表的扁平 schema。
+        filter: Option<Prog>,
+    },
+
+    /// 事务控制：`BEGIN`（`begin = true`）与 `COMMIT`（`false`）。
+    ///
+    /// **本版没有事务**：没有 WAL、没有回滚，所以这两条只是被接受、记一行状态。
+    /// `ROLLBACK` 在降级时就被拒绝——不能假装回滚成功（见 [`crate::ir::irgen`]）。
+    Transaction {
+        /// 是 `BEGIN` 吗（否则是 `COMMIT`）。
+        begin: bool,
+    },
+
+    /// `CREATE SCHEMA name`：在符号表里记下这个名字。
+    ///
+    /// 本版没有完整的 schema 系统——限定名本来就是不透明标识符拼出来的——记下它
+    /// 只为了 [`SymbolTable::drop_schema`] 能判断"这个 schema 存不存在"。
+    CreateSchema {
+        /// schema 名。
+        name: String,
+        /// 语句里写了 `IF NOT EXISTS`。
+        if_not_exists: bool,
+    },
+
+    /// `DROP SCHEMA [IF EXISTS] name [CASCADE]`：删掉该前缀下的所有符号。
+    DropSchema {
+        /// schema 名。
+        name: String,
+        /// 语句里写了 `IF EXISTS`。
+        if_exists: bool,
+        /// 语句里写了 `CASCADE`。
+        cascade: bool,
+    },
+
+    /// `SET search_path TO …`。
+    SetSearchPath {
+        /// 新的搜索路径。
+        path: Vec<String>,
+    },
+}
+
+/// 把一个值按目标列的类型**真的转一下**。
+///
+/// 只有一条规则：`INT` → `NUMERIC`（PostgreSQL 里唯一的隐式放大）。`INSERT` 那边
+/// 靠"按目标列类型定型字面量"达到同样效果；`UPDATE` 的值可以是任意表达式
+/// （`SET n = i`，`i` 是 INT 列），所以在这里收口。别的组合原样交给
+/// [`Table::update_row`](crate::db::table::Table::update_row) 的类型校验去拒绝。
+fn coerce_to_column(value: Value, ty: &DataType) -> Value {
+    match (&value, ty.family()) {
+        (Value::Int(i), TypeFamily::Numeric) => Value::Numeric(i.to_string()),
+        _ => value,
+    }
 }
 
 /// 一条语句执行完的结果。
@@ -82,6 +175,8 @@ pub enum Outcome {
         name: String,
         /// 见 [`Stmt::CreateTable::unenforced`]。
         unenforced: Vec<String>,
+        /// **真的强制**的 `CHECK` 条数（见 [`Stmt::CreateTable::checks`]）。
+        checks: usize,
     },
     /// 插入完成。
     Inserted {
@@ -89,6 +184,22 @@ pub enum Outcome {
         table: String,
         /// 实际插入的行数。
         rows: usize,
+    },
+    /// 更新完成。
+    Updated {
+        /// 表名。
+        table: String,
+        /// 实际改动的行数。
+        rows: usize,
+    },
+    /// 没有结果集、也不改表内容的语句：事务控制、schema、`SET`。
+    ///
+    /// `message` 是给用户看的一行状态（psql 风格，例如 `BEGIN`）。这些语句都是
+    /// "接受但如实记录"：本版没有真事务、没有完整的 schema 系统，`message` 说的
+    /// 就是实际发生了什么。
+    NoOp {
+        /// 一行状态。
+        message: String,
     },
 }
 
@@ -105,8 +216,10 @@ pub struct StmtResult {
 
 /// 在符号表上执行一条语句。
 ///
-/// 只有 [`Stmt::CreateTable`] 与 [`Stmt::Insert`] 会改东西：前者往符号表里加表，
-/// 后者改表内容。语句自己的失败不会留下半拉状态——建表是"要么登记要么报错"，
+/// 会改东西的只有三种：[`Stmt::CreateTable`]（往符号表里加表）、[`Stmt::Insert`]
+/// （改表内容）与几条 schema / `SET` 语句（改的是**名字空间**，不是数据）。
+/// [`Stmt::Transaction`] 什么都不改——本版没有事务，见它的文档。
+/// 语句自己的失败不会留下半拉状态——建表是"要么登记要么报错"，
 /// 插入是逐行过 [`Table::insert`](crate::db::table::Table::insert) 的校验。
 pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
     match stmt {
@@ -117,54 +230,217 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
             columns,
             if_not_exists,
             unenforced,
+            checks,
         } => {
-            if symbols.lookup(name).is_some() {
+            // 真实的名字由符号表定（`search_path` 决定要不要加前缀），报告的、
+            // 判重的都是**它**——不然 `CREATE TABLE movies` 会说成 `movies`，
+            // 而表其实叫 `study.movies`。
+            let name = symbols.effective_name(name);
+
+            if symbols.lookup(&name).is_some() {
                 if *if_not_exists {
                     // `IF NOT EXISTS` 且已经有了：视为满足要求，不报错。
                     return Ok(Outcome::Created {
-                        name: name.clone(),
+                        name,
                         unenforced: unenforced.clone(),
+                        checks: checks.len(),
                     });
                 }
-                return Err(DbError::DuplicateSymbol { name: name.clone() });
+                return Err(DbError::DuplicateSymbol { name });
             }
 
             let shape = ColumnsShape::new(columns.clone());
-            symbols.define(name.clone(), PhysTab::new(name.clone(), &shape))?;
+            let table = PhysTab::new(&name, &shape);
+            // 有 CHECK 就包一层：所有写路径（INSERT / UPDATE）都过约束
+            if checks.is_empty() {
+                symbols.define(name.clone(), table)?;
+            } else {
+                symbols.define(name.clone(), CheckedTable::new(table, checks.clone()))?;
+            }
 
             Ok(Outcome::Created {
-                name: name.clone(),
+                name,
                 unenforced: unenforced.clone(),
+                checks: checks.len(),
             })
         }
 
         Stmt::Insert { table, rows } => {
-            let target = symbols
-                .relation_mut(table)
-                .ok_or_else(|| DbError::UnknownSymbol {
-                    name: table.clone(),
-                })?;
-
-            let mut inserted = 0usize;
+            // 先把每一行算出来（值表达式没有输入行），再逐行落库：
+            // 索引要的键必须在行搬进表**之前**取出来，所以不能一边借表一边算。
+            let mut values: Vec<Row> = Vec::with_capacity(rows.len());
             for programs in rows {
                 let mut row = Row::with_capacity(programs.len());
                 for prog in programs {
-                    // 值表达式没有输入行。
                     let scalar = prog.eval(&[]).map_err(|e| e.into_db_error(None))?;
                     let value = scalar.to_value().ok_or_else(|| DbError::IrRuntime {
                         node: None,
-                        message: format!("要插入的值必须是 INT，实际是 {}", scalar),
+                        message: format!("要插入的值必须是可存储的值，实际是 {}", scalar),
                     })?;
                     row.push(value);
                 }
+                values.push(row);
+            }
+
+            let mut inserted = 0usize;
+            for row in values {
+                // 索引要的键先取出来（行马上要搬进表里了）
+                let keys = symbols.index_keys_of(table, &row);
                 // 走 Table::insert，于是元数与类型校验都被复用。
-                target.insert(row)?;
+                let rid = symbols
+                    .relation_mut(table)
+                    .ok_or_else(|| DbError::UnknownSymbol {
+                        name: table.clone(),
+                    })?
+                    .insert(row)?;
+                symbols.maintain_indexes(keys, rid);
                 inserted += 1;
             }
 
             Ok(Outcome::Inserted {
                 table: table.clone(),
                 rows: inserted,
+            })
+        }
+
+        Stmt::Update {
+            table,
+            sets,
+            filter,
+        } => {
+            let nrows = symbols
+                .relation(table)
+                .ok_or_else(|| DbError::UnknownSymbol {
+                    name: table.clone(),
+                })?
+                .nrows();
+            let columns: Vec<Column> = symbols
+                .columns(table)
+                .ok_or_else(|| DbError::UnknownSymbol {
+                    name: table.clone(),
+                })?
+                .to_vec();
+
+            // **先**让这张表上的索引全部失效：万一中途出错（约束、短读），
+            // 已经改过的行也不会留下一份错的索引——宁可下次重建一遍
+            symbols.invalidate_indexes(table);
+
+            let mut updated = 0usize;
+            for r in 0..nrows {
+                // 读旧行：所有 `SET` 表达式都在它上面求值
+                let row = symbols
+                    .relation(table)
+                    .and_then(|t| t.row(r))
+                    .ok_or_else(|| DbError::IrRuntime {
+                        node: None,
+                        message: format!("读不到 `{}` 的第 {} 行", table, r),
+                    })?;
+
+                if let Some(prog) = filter {
+                    // 只有确定的真才改：UNKNOWN 与 FALSE 一样跳过
+                    let truth = prog.eval_truth(&row).map_err(|e| e.into_db_error(None))?;
+                    if !truth.is_true() {
+                        continue;
+                    }
+                }
+
+                let mut new_row = row.clone();
+                for (index, prog) in sets {
+                    let value = prog
+                        .eval(&row)
+                        .map_err(|e| e.into_db_error(None))?
+                        .to_value()
+                        .ok_or_else(|| DbError::IrRuntime {
+                            node: None,
+                            message: "要写进列的值必须是可存储的值，不能是真值".to_string(),
+                        })?;
+                    new_row[*index] = coerce_to_column(value, &columns[*index].ty);
+                }
+
+                // 整行一次落库：`Table::update_row` 管 typmod / NOT NULL，
+                // `CheckedTable` 管 CHECK —— 约束看到的是**最终**那一行
+                symbols
+                    .relation_mut(table)
+                    .ok_or_else(|| DbError::UnknownSymbol {
+                        name: table.clone(),
+                    })?
+                    .update_row(r, new_row)?;
+                updated += 1;
+            }
+
+            Ok(Outcome::Updated {
+                table: table.clone(),
+                rows: updated,
+            })
+        }
+
+        Stmt::CreateIndex {
+            name,
+            table,
+            column,
+            if_not_exists,
+        } => {
+            symbols.create_index(name, table, *column, *if_not_exists)?;
+
+            // 报告里写清"建在哪张表的哪一列、多少个键"——索引是个真东西，不是记号
+            let column_name = symbols
+                .columns(table)
+                .and_then(|columns| columns.get(*column))
+                .map(|column| column.name.clone())
+                .unwrap_or_else(|| column.to_string());
+            let keys = symbols
+                .index_of(table, *column)
+                .and_then(|slot| slot.nkeys())
+                .unwrap_or(0);
+
+            Ok(Outcome::NoOp {
+                message: format!(
+                    "索引已建于 {}({})（{} 个不同的键）",
+                    symbols.effective_name(table),
+                    column_name,
+                    keys
+                ),
+            })
+        }
+
+        Stmt::DropIndex { name, if_exists } => {
+            let dropped = symbols.drop_index(name, *if_exists)?;
+            Ok(Outcome::NoOp {
+                message: format!("索引 {} 已删除", dropped),
+            })
+        }
+
+        // 事务控制：**接受，但不假装**。没有 WAL、没有回滚，所以这里什么都不做，
+        // 只回一行状态（`BEGIN` / `COMMIT`）。
+        Stmt::Transaction { begin } => Ok(Outcome::NoOp {
+            message: if *begin { "BEGIN" } else { "COMMIT" }.to_string(),
+        }),
+
+        Stmt::CreateSchema {
+            name,
+            if_not_exists,
+        } => {
+            symbols.create_schema(name, *if_not_exists)?;
+            Ok(Outcome::NoOp {
+                message: format!("schema {} 已登记（限定名本来就能用，这一步只是记名）", name),
+            })
+        }
+
+        Stmt::DropSchema {
+            name,
+            if_exists,
+            cascade,
+        } => {
+            let dropped = symbols.drop_schema(name, *if_exists, *cascade)?;
+            Ok(Outcome::NoOp {
+                message: format!("schema {} 已删除（清掉 {} 张表）", name, dropped),
+            })
+        }
+
+        Stmt::SetSearchPath { path } => {
+            symbols.set_search_path(path.clone());
+            Ok(Outcome::NoOp {
+                message: format!("search_path = {}", path.join(", ")),
             })
         }
     }
@@ -243,7 +519,7 @@ impl Script {
 
         // 逐条来：后面的语句依赖前面建出来的表，不能先全降级。
         let outcome = match raw.stmt.as_deref() {
-            Some(node) => match lower::lower_statement(node, symbols) {
+            Some(node) => match irgen::lower_statement(node, symbols) {
                 Ok(stmt) => execute_stmt(&stmt, symbols),
                 Err(e) => Err(e),
             },

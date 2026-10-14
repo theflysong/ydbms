@@ -32,7 +32,7 @@
 //! [`TableCursor`](crate::db::source::TableCursor) 把前者当后者用。
 //!
 //! 支持的类型见 [`DataType`]：`INT` / `TEXT` / `CHAR(N)` / `VARCHAR(N)` /
-//! `TIMESTAMP(N)` / `NUMERIC(N,M)`。
+//! `TIMESTAMP(N)` / `DATE` / `NUMERIC(N,M)`。
 
 use std::fmt;
 
@@ -52,6 +52,11 @@ pub enum TypeFamily {
     Text,
     /// 时间戳。
     Timestamp,
+    /// 日期：定宽的 `YYYY-MM-DD` 规范文本。
+    ///
+    /// 与 `Timestamp` **是两个大类**（互不比较、互不放行）：本版没有
+    /// `date ↔ timestamp` 的隐式转换，PostgreSQL 有——这是记录在案的偏差。
+    Date,
     /// 十进制数。
     Numeric,
 }
@@ -81,6 +86,7 @@ impl fmt::Display for TypeFamily {
             TypeFamily::Int => f.write_str("INT"),
             TypeFamily::Text => f.write_str("TEXT"),
             TypeFamily::Timestamp => f.write_str("TIMESTAMP"),
+            TypeFamily::Date => f.write_str("DATE"),
             TypeFamily::Numeric => f.write_str("NUMERIC"),
         }
     }
@@ -93,6 +99,7 @@ impl TypeFamily {
             TypeFamily::Int => DataType::Int,
             TypeFamily::Text => DataType::Text,
             TypeFamily::Timestamp => DataType::Timestamp(DEFAULT_TIMESTAMP_PRECISION),
+            TypeFamily::Date => DataType::Date,
             // 计算结果不限精度与标度（与 PostgreSQL 的 `numeric` 一致）
             TypeFamily::Numeric => DataType::NumericAny,
         }
@@ -105,6 +112,7 @@ impl TypeFamily {
             TypeFamily::Numeric => 1,
             TypeFamily::Text => 2,
             TypeFamily::Timestamp => 3,
+            TypeFamily::Date => 4,
         }
     }
 }
@@ -127,6 +135,11 @@ pub enum DataType {
     VarChar(u32),
     /// `TIMESTAMP(N)`，N 是小数秒位数。
     Timestamp(u32),
+    /// `DATE`：定宽的 `YYYY-MM-DD` 规范文本。
+    ///
+    /// 没有参数：PostgreSQL 的 `date` 也不带 typmod。日期与时间戳分开存，
+    /// 于是**字典序就是时间序**，不需要任何日期运算。
+    Date,
     /// `NUMERIC(N, M)`：N 是总位数，M 是小数位。
     Numeric(u32, u32),
     /// 裸 `NUMERIC`：**精度与标度都不限**（任意精度十进制）。
@@ -145,6 +158,7 @@ impl DataType {
             DataType::Int => TypeFamily::Int,
             DataType::Text | DataType::Char(_) | DataType::VarChar(_) => TypeFamily::Text,
             DataType::Timestamp(_) => TypeFamily::Timestamp,
+            DataType::Date => TypeFamily::Date,
             DataType::Numeric(_, _) | DataType::NumericAny => TypeFamily::Numeric,
         }
     }
@@ -185,6 +199,12 @@ impl DataType {
                     ));
                 }
                 Ok(Value::Timestamp(canonical))
+            }
+
+            DataType::Date => {
+                let canonical = canonical_date(text, "日期")
+                    .map_err(|reason| self.bad_value(text, reason))?;
+                Ok(Value::Date(canonical))
             }
 
             DataType::NumericAny => {
@@ -260,6 +280,7 @@ impl DataType {
             // 上面已经为 NULL 提前返回了
             Value::Null => true,
             Value::Int(_) => true,
+            Value::Date(_) => true,
             Value::Timestamp(text) => {
                 let (_, _, frac) = split_decimal(text);
                 frac.len() <= timestamp_precision_of(self) as usize
@@ -330,6 +351,7 @@ impl fmt::Display for DataType {
             DataType::Char(n) => write!(f, "CHAR({})", n),
             DataType::VarChar(n) => write!(f, "VARCHAR({})", n),
             DataType::Timestamp(n) => write!(f, "TIMESTAMP({})", n),
+            DataType::Date => f.write_str("DATE"),
             DataType::Numeric(p, s) => write!(f, "NUMERIC({},{})", p, s),
             DataType::NumericAny => f.write_str("NUMERIC"),
         }
@@ -366,6 +388,8 @@ pub enum Value {
     Text(String),
     /// 时间戳，规范化的定宽文本。
     Timestamp(String),
+    /// 日期，规范化的定宽文本（`YYYY-MM-DD`）。
+    Date(String),
     /// 十进制数，规范化的十进制文本。
     Numeric(String),
 }
@@ -383,6 +407,7 @@ impl Value {
             Value::Int(_) => TypeFamily::Int,
             Value::Text(_) => TypeFamily::Text,
             Value::Timestamp(_) => TypeFamily::Timestamp,
+            Value::Date(_) => TypeFamily::Date,
             Value::Numeric(_) => TypeFamily::Numeric,
         })
     }
@@ -411,6 +436,11 @@ impl Value {
     /// 安全地构造一个 `TIMESTAMP`。
     pub fn timestamp(text: &str) -> Result<Value> {
         DataType::Timestamp(DEFAULT_TIMESTAMP_PRECISION).parse(text)
+    }
+
+    /// 安全地构造一个 `DATE`。
+    pub fn date(text: &str) -> Result<Value> {
+        DataType::Date.parse(text)
     }
 
     /// 写成 CSV 字段。
@@ -452,7 +482,9 @@ impl fmt::Display for Value {
         match self {
             Value::Null => f.write_str("NULL"),
             Value::Int(v) => write!(f, "{}", v),
-            Value::Text(v) | Value::Timestamp(v) | Value::Numeric(v) => f.write_str(v),
+            Value::Text(v) | Value::Timestamp(v) | Value::Date(v) | Value::Numeric(v) => {
+                f.write_str(v)
+            }
         }
     }
 }
@@ -469,6 +501,7 @@ impl Ord for Value {
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             // 定宽，所以字典序 == 时间序
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+            (Value::Date(a), Value::Date(b)) => a.cmp(b),
             // 字典序**是错的**（"10" < "9"），必须按十进制定点比
             (Value::Numeric(a), Value::Numeric(b)) => compare_decimal(a, b),
             // 跨大类：同一列内不会发生，给个稳定次序而已
@@ -735,26 +768,19 @@ fn fraction_digits(text: &str) -> usize {
     }
 }
 
-/// 把时间戳文本规范化成定宽（16 + 7 = 23 字符）的
-/// `YYYY-MM-DD HH:MM:SS.ffffff`。
+/// 把日期文本规范化成定宽（10 字符）的 `YYYY-MM-DD`。
 ///
-/// 定宽是关键：有了它，字典序就等于时间序，**完全不需要日期算术**。
+/// `what` 只出现在错误消息里（`DATE` 与 `TIMESTAMP` 共用本函数）。
 ///
 /// 已知不做的事：不校验月长与闰年（`2024-02-30` 会被接受）——那需要真正的日历
 /// 计算，而本版没有任何日期运算要支持。
-fn canonical_timestamp(text: &str) -> std::result::Result<String, String> {
+fn canonical_date(text: &str, what: &str) -> std::result::Result<String, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err("空的时间戳".to_string());
+        return Err(format!("空的{}", what));
     }
 
-    // 日期与时间之间允许 'T' 或空格
-    let (date_part, time_part) = match trimmed.split_once(['T', 't', ' ']) {
-        Some((d, t)) => (d, t.trim()),
-        None => (trimmed, ""),
-    };
-
-    let date: Vec<&str> = date_part.split('-').collect();
+    let date: Vec<&str> = trimmed.split('-').collect();
     if date.len() != 3 {
         return Err(format!("`{}` 不是 YYYY-MM-DD 形式", text));
     }
@@ -775,6 +801,28 @@ fn canonical_timestamp(text: &str) -> std::result::Result<String, String> {
             year
         ));
     }
+
+    Ok(format!("{:04}-{:02}-{:02}", year, month, day))
+}
+
+/// 把时间戳文本规范化成定宽（16 + 7 = 23 字符）的
+/// `YYYY-MM-DD HH:MM:SS.ffffff`。
+///
+/// 定宽是关键：有了它，字典序就等于时间序，**完全不需要日期算术**。日期那半段
+/// 复用 [`canonical_date`]，于是 `DATE` 与 `TIMESTAMP` 的日期部分口径只有一个。
+fn canonical_timestamp(text: &str) -> std::result::Result<String, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("空的时间戳".to_string());
+    }
+
+    // 日期与时间之间允许 'T' 或空格
+    let (date_part, time_part) = match trimmed.split_once(['T', 't', ' ']) {
+        Some((d, t)) => (d, t.trim()),
+        None => (trimmed, ""),
+    };
+
+    let date = canonical_date(date_part, "时间戳")?;
 
     let (hour, minute, second, frac) = if time_part.is_empty() {
         (0u32, 0u32, 0u32, String::new())
@@ -816,10 +864,8 @@ fn canonical_timestamp(text: &str) -> std::result::Result<String, String> {
     }
 
     Ok(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:0<width$}",
-        year,
-        month,
-        day,
+        "{} {:02}:{:02}:{:02}.{:0<width$}",
+        date,
         hour,
         minute,
         second,
@@ -856,15 +902,26 @@ pub struct Column {
     /// 老模式文件里没有这个键，`#[serde(default)]` 会读成 `false`。
     #[serde(default)]
     pub not_null: bool,
+    /// 列声明的 `DEFAULT`，存成 **CSV 字段形式**（[`Value::to_csv_field`]）。
+    ///
+    /// 存文本而不是 [`Value`]，是为了不引入 `Value` 的 serde。用 CSV 字段形式而不是
+    /// `Display`：`DEFAULT NULL` 要写成 `\N`，还原走
+    /// [`DataType::from_csv_field`]（与数据文件**同一套可往返的写法**）。
+    /// 缺列时补的就是它；没有 `DEFAULT` 的列补 `NULL`（与 PostgreSQL 一致）。
+    ///
+    /// 老模式文件里没有这个键，`#[serde(default)]` 会读成 `None`。
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 impl Column {
-    /// 构造一列（可空）。
+    /// 构造一列（可空、无默认值）。
     pub fn new(name: impl Into<String>, ty: DataType) -> Self {
         Column {
             name: name.into(),
             ty,
             not_null: false,
+            default: None,
         }
     }
 
@@ -874,7 +931,19 @@ impl Column {
             name: name.into(),
             ty,
             not_null: true,
+            default: None,
         }
+    }
+
+    /// 带 `DEFAULT` 的列（参数必须是 **CSV 字段形式**，见 [`Column::default`]）。
+    pub fn with_default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+
+    /// `DEFAULT` 的规范文本；没写就是 `None`。
+    pub fn default_text(&self) -> Option<&str> {
+        self.default.as_deref()
     }
 
     /// 列名。
@@ -893,6 +962,9 @@ impl fmt::Display for Column {
         write!(f, "{} {}", self.name, self.ty)?;
         if self.not_null {
             f.write_str(" NOT NULL")?;
+        }
+        if let Some(default) = &self.default {
+            write!(f, " DEFAULT {}", default)?;
         }
         Ok(())
     }
@@ -1082,6 +1154,16 @@ pub enum DbError {
         /// 候选的限定名。
         candidates: Vec<String>,
     },
+    /// 一个候选行违反了表上的 `CHECK` 约束。
+    ///
+    /// 只有**确定是假**才算违规：三值逻辑的 `Unknown`（例如 `died + 0 = died`
+    /// 在 `died IS NULL` 时）与 PostgreSQL 一样放行。
+    CheckViolation {
+        /// 表名。
+        table: String,
+        /// 约束名（没写名字时是约束原文）。
+        constraint: String,
+    },
     /// 一个值无法被解释成目标类型，或超出了该类型的 typmod 限制。
     ///
     /// 覆盖：`VARCHAR(3)` 插 4 个字符、`NUMERIC(4,2)` 插 `1234.56`、
@@ -1161,6 +1243,11 @@ impl fmt::Display for DbError {
                 "ambiguous column `{}` (candidates: {})",
                 name,
                 candidates.join(", ")
+            ),
+            DbError::CheckViolation { table, constraint } => write!(
+                f,
+                "new row for table `{}` violates check constraint `{}`",
+                table, constraint
             ),
             DbError::BadValue {
                 column,
@@ -1270,6 +1357,16 @@ pub trait Table: TabShape {
     ///
     /// 默认实现拒绝写入（表是只读的）。
     fn update(&mut self, _r: usize, _c: usize, _value: Value) -> Result<()> {
+        Err(DbError::ReadOnly {
+            table: self.name().to_string(),
+        })
+    }
+
+    /// 用**一整行**替换第 `r` 行。
+    ///
+    /// `UPDATE` 走它：所有 `SET` 表达式在**旧行**上算完之后一次性落库，于是
+    /// 「约束看到的是最终那一行」，而不是改到一半的行。默认实现拒绝写入。
+    fn update_row(&mut self, _r: usize, _row: Row) -> Result<()> {
         Err(DbError::ReadOnly {
             table: self.name().to_string(),
         })

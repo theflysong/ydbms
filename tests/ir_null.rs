@@ -342,6 +342,36 @@ fn csv_null_in_an_int_column() {
 }
 
 #[test]
+fn csv_schema_records_the_default_and_old_files_still_load() {
+    let dir = TempDir::new("default");
+    let at = TablePath::new(dir.path(), "t");
+
+    // `DEFAULT` 是**列定义的一部分**，跟着模式文件走；存的是 CSV 字段形式
+    let shape = ColumnsShape::new(vec![
+        Column::new("a", DataType::Int).with_default("7"),
+        Column::new("b", DataType::Text).with_default("\\N"),
+    ]);
+    let saved = PhysTab::new("t", &shape);
+    CsvPersister::new().save(&saved, &at).unwrap();
+
+    let loaded = CsvPersister::new().load(&at).unwrap();
+    assert_eq!(loaded.columns()[0].default_text(), Some("7"));
+    assert_eq!(loaded.columns()[1].default_text(), Some("\\N"), "NULL 记作 \\N");
+
+    // 老文件（没有 default 键）照常读
+    let old = TablePath::new(dir.path(), "old");
+    std::fs::write(
+        old.schema_path(),
+        r#"{"version":1,"name":"old","columns":[{"name":"x","ty":"INT"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(old.data_path(), "x\n1\n").unwrap();
+
+    let loaded = CsvPersister::new().load(&old).unwrap();
+    assert_eq!(loaded.columns()[0].default_text(), None, "缺键应当读成 None");
+}
+
+#[test]
 fn csv_schema_records_not_null_and_old_files_still_load() {
     let dir = TempDir::new("schema");
     let at = TablePath::new(dir.path(), "t");

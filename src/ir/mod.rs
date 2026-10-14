@@ -7,7 +7,7 @@
 //!    │ pg_query::parse（PostgreSQL 的真实解析器）
 //!    ▼
 //! pg_query 裸语法树
-//!    │ lower()                          ← lower.rs   绑定：查表、解列名、类型检查
+//!    │ lower()                          ← irgen.rs   绑定：查表、解列名、类型检查
 //!    ▼
 //! Plan { nodes: Vec<Node>, root }       ← plan.rs    节点之间的边是「下标」
 //!    │  每个节点的算子各带若干
@@ -25,7 +25,17 @@
 //! 上层拉一行下层才算一行；[`execute_source`] 把「拉多少、什么时候停」交给调用方，
 //! [`execute`] 则抽干 root 返回结果表。
 //!
-//! 名字 → 表的映射由 [`SymbolTable`]（`symbol.rs`）提供。
+//! 名字 → 表/索引的映射由 [`SymbolTable`]（`symbol.rs`）提供。
+//!
+//! # 文件分工
+//!
+//! * `value.rs` —— 值层：[`Scalar`] / [`Tri`] / [`ScalarType`]（`Value` 本身在
+//!   `db::table`，见那里的说明）；
+//! * `irgen.rs` —— 降级（绑定器）：查表、解列名、挑访问路径；
+//! * `opt/` —— **优化器**：谓词推到哪张表、连接怎么执行（`ir` 内部模块）；
+//! * `expr.rs` —— 表达式 IR 与求值；`plan.rs` —— 计划与静态校验；`exec.rs` ——
+//!   拉取式执行；`stmt.rs` —— 语句层（DDL/DML）；`checks.rs` —— `CHECK` 的强制点；
+//! * `symbol.rs` —— 符号表（表、别名、索引、schema/search_path）。
 //!
 //! # 两条不变量
 //!
@@ -37,33 +47,57 @@
 //! 过这一关——所以就算绑定器算错了列下标，也会以
 //! [`crate::db::table::DbError::IrInvalid`] 被抓住，而不是安静地读错列。
 //!
+//! 子查询还多一条（同样由 [`Plan::analyze`] 检查）：**`SubPlan::outers` 必须与
+//! 执行时压着的那几层外层行逐层对上**（`outers[0]` 就是所在节点程序面对的那份
+//! schema）。绑定器算错外层下标只有这里抓得住——[`Prog::verify`] 看不到符号表，
+//! 也就看不到外层是什么。
+//!
 //! # 已实现 / 未实现
 //!
-//! 已实现：`SELECT`（多表内连接与左外连接、`WHERE`、`ORDER BY`、`LIMIT`/`OFFSET`）、
-//! 聚合与 `GROUP BY`/`HAVING`、`CASE`、`ROUND`、`CREATE TABLE`、`INSERT`、
-//! NULL 与三值逻辑、`INT`/`TEXT`/`CHAR`/`VARCHAR`/`TIMESTAMP`/`NUMERIC`、
-//! **拉取式**的执行（见 [`exec`]），以及三样访问路径与连接上的东西：
+//! 已实现：`SELECT`（多表内连接与左外连接、`WHERE`、`ORDER BY` 含**输出列序号**、
+//! `LIMIT`/`OFFSET`、`DISTINCT`）、聚合与 `GROUP BY`/`HAVING`/`COUNT(*) FILTER`、
+//! `CASE`、`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`~*`、`ROUND`/`UPPER`/`LEFT`/`CONCAT_WS`/
+//! `LENGTH`/`EXTRACT(YEAR FROM …)`/`CURRENT_DATE`、`::numeric`、
+//! `CREATE TABLE`（`NOT NULL` / `DEFAULT` / `CHECK` 真强制；`PRIMARY KEY` / `UNIQUE` /
+//! `FOREIGN KEY` 接受并**如实记录为未强制**）、`INSERT`、`UPDATE`、
+//! `CREATE INDEX` / `DROP INDEX`、`UNION [ALL]`、
+//! **子查询**（标量 / `IN` / `EXISTS` / 相关引用 / 派生表 / `ANY`/`ALL`）、
+//! NULL 与三值逻辑、`INT`/`TEXT`/`CHAR`/`VARCHAR`/`TIMESTAMP`/`DATE`/`NUMERIC`、
+//! **拉取式**的执行（见 [`exec`]），以及访问路径与连接上的几件事：
 //!
-//! * **谓词下推**：`WHERE` 的合取项只引用一个 FROM 项时推进那张表的 `Scan.filter`
-//!   （`LEFT JOIN` 的可空侧不推，见 [`lower`]）；
-//! * **索引**：`Scan` 可以带一条索引路径（`<列> = <不读列的表达式>`），由
-//!   [`crate::db::index`] 的「键 → 行号」取行；
+//! * **谓词下推**：`WHERE` 的合取项只引用一个 FROM 项时推进那张表的 `Scan.filter`；
+//!   `LEFT JOIN` 的**可空侧**只放行 null-rejecting 的谓词（`b.y = 5`、
+//!   `b.y IS NOT NULL`），而且连接之上仍留一份——外连接补出来的 NULL 行没被那张表
+//!   扫过，只有上面的谓词丢得掉它们。含子查询/外层引用的合取项一律不推；
+//! * **索引**：`Scan` 可以带一条索引路径（`<列> = <不读列的表达式>`），走的是
+//!   `CREATE INDEX` 建在目录里的那份索引（[`crate::db::index::IndexSlot`]）；
 //! * **连接策略**：嵌套循环 / [`JoinStrategy::Hash`] / [`JoinStrategy::IndexNestedLoop`]，
-//!   由绑定器按等值键挑（见 [`JoinStrategy`]）。
+//!   由绑定器按等值键挑（索引嵌套循环要求内侧那列**目录里有索引**）；
+//! * **表达式层的短路**：`CASE` 的分支与 `AND`/`OR` 的右侧是自足子程序，只有被
+//!   选中时才求值（死分支里的除零不再冒出来，见 [`Step`]）。
 //!
-//! 未实现：**优化器**——没有连接重排、没有代价估算（策略是定规则挑的）；子查询；
-//! 集合运算（`UNION` 等）；CTE；`DISTINCT`；窗口函数；`RIGHT`/`FULL` JOIN；
-//! `UPDATE`/`DELETE`/`DROP`/`ALTER`；`CREATE INDEX`；事务。
+//! 语句层还认几条"不改数据"的语句：`BEGIN`/`COMMIT`（**没有事务**，只如实记一行
+//! 状态）、`CREATE SCHEMA`、`SET search_path`（真生效）、`DROP SCHEMA … CASCADE`；
+//! `ROLLBACK` 显式拒绝（见 [`stmt`]）。
+//!
+//! 未实现：**代价估算与连接重排**（策略是定规则挑的）；CTE；`INTERSECT`/`EXCEPT`；
+//! `DISTINCT ON`；窗口函数；`RIGHT`/`FULL` JOIN；`LATERAL`；`DELETE`/`DROP TABLE`/
+//! `ALTER`；真事务；唯一索引与部分索引。（`CHECK` 与索引**不落盘**——它们不是列定义；
+//! `DEFAULT` 是列定义的一部分，跟着模式文件走。）
 
+pub mod checks;
 pub mod exec;
 pub mod expr;
-pub mod lower;
+mod opt;
+pub mod irgen;
 pub mod plan;
 pub mod stmt;
 pub mod symbol;
+pub mod value;
 
+pub use checks::Check;
 pub use exec::{execute, execute_source};
-pub use expr::{BinOp, EvalError, Prog, ProgBuilder, Reg, Scalar, ScalarType, Step, UnOp};
+pub use expr::{BinOp, EvalError, Prog, ProgBuilder, Reg, Step, UnOp};
 pub use plan::{
     Analysis, EqKey, IndexPath, JoinKind, JoinStrategy, Node, NodeId, Op, Plan, PlanBuilder, SortKey,
 };
@@ -71,13 +105,14 @@ pub use stmt::{
     execute_stmt, has_top_level_terminator, run_script, Outcome, Script, Stmt, StmtResult,
 };
 pub use symbol::{Symbol, SymbolTable};
+pub use value::{Scalar, ScalarType, Tri};
 
 use crate::db::table::Result;
 
 /// 把一段 SQL 解析并降级成线性 IR。
 ///
 /// 这是给外部用的入口（`main.rs` 之类的调用方）；需要一步步来的话用
-/// [`lower::lower`] 与 [`lower::lower_statement`]。
+/// [`irgen::lower`] 与 [`irgen::lower_statement`]。
 ///
 /// 降级本身**不执行**任何东西，也不会碰数据——要拿结果得再调 [`execute`]。
 ///
@@ -99,5 +134,5 @@ use crate::db::table::Result;
 /// assert_eq!(rows.nrows(), 1);
 /// ```
 pub fn compile(sql: &str, symbols: &SymbolTable) -> Result<Plan> {
-    lower::lower(sql, symbols)
+    irgen::lower(sql, symbols)
 }

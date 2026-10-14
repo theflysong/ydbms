@@ -161,6 +161,26 @@ fn describe_lists_the_columns_and_types() {
 }
 
 #[test]
+fn describe_lists_the_indexes_of_the_table() {
+    let mut s = buffered();
+    s.run_interactive("CREATE TABLE m (a INT, b INT)");
+    s.run_interactive("CREATE INDEX m_a ON m (a)");
+    s.run_interactive("\\d m");
+
+    let out = s.messages();
+    assert!(out.contains("索引"), "{out}");
+    assert!(out.contains("m_a"), "{out}");
+    assert!(out.contains("(a)"), "{out}");
+
+    // `DROP INDEX` 之后 `\d` 就不再报它
+    s.run_interactive("DROP INDEX m_a");
+    s.run_interactive("\\d m");
+    let out = s.messages();
+    let after_drop = out.split("已删除").last().unwrap_or("");
+    assert!(!after_drop.contains("m_a"), "{out}");
+}
+
+#[test]
 fn describe_without_argument_is_like_dt() {
     let mut s = buffered();
     s.run_interactive("CREATE TABLE m (a INT)");
@@ -582,4 +602,77 @@ fn unknown_metacommand_lists_the_new_ones_too() {
     let out = s.messages();
     assert!(out.contains("\\timing"), "{out}");
     assert!(out.contains("\\set"), "{out}");
+}
+
+// -------------------------------------------- 事务 / schema / search_path
+
+#[test]
+fn transaction_statements_report_one_status_line_each() {
+    let mut s = buffered();
+    s.run_interactive("BEGIN;");
+    s.run_interactive("COMMIT;");
+
+    let out = s.messages();
+    assert!(out.contains("→ BEGIN"), "{out}");
+    assert!(out.contains("→ COMMIT"), "{out}");
+    // 没有结果集，所以查询那一路什么都不该有
+    assert!(s.query_output().is_empty(), "{}", s.query_output());
+}
+
+#[test]
+fn rollback_reports_an_error_and_keeps_going() {
+    let mut s = buffered();
+    s.run_interactive("CREATE TABLE p (a INT)");
+    s.run_interactive("ROLLBACK;");
+    s.run_interactive("INSERT INTO p VALUES (1)");
+
+    let out = s.messages();
+    assert!(out.contains("ROLLBACK"), "{out}");
+    assert!(out.contains("错误"), "{out}");
+    // 默认不遇错就停：后面那条 INSERT 照样跑
+    assert!(out.contains("插入 1 行"), "{out}");
+}
+
+#[test]
+fn search_path_is_visible_in_dt_and_in_qualified_queries() {
+    let mut s = buffered();
+    s.run_interactive("CREATE SCHEMA study; SET search_path TO study;");
+    s.run_interactive("CREATE TABLE movies (movieid INT)");
+    s.run_interactive("INSERT INTO movies VALUES (7)");
+    s.run_interactive("\\dt");
+    s.run_interactive("SELECT movieid FROM study.movies");
+
+    let out = s.messages();
+    assert!(out.contains("search_path = study"), "{out}");
+    // `\dt` 列的是**存下来的**名字（带前缀）
+    assert!(out.contains("study.movies"), "{out}");
+    // 限定名与非限定名查的是同一张表
+    assert!(s.query_output().contains("7"), "{}", s.query_output());
+}
+
+#[test]
+fn an_init_script_with_metacommands_and_schema_runs_twice() {
+    let dir = TempDir::new("init");
+    let path = dir.path().join("init.sql");
+    std::fs::write(
+        &path,
+        "\\set ON_ERROR_STOP on\n\
+         BEGIN;\n\
+         DROP SCHEMA IF EXISTS study CASCADE;\n\
+         CREATE SCHEMA study;\n\
+         SET search_path TO study, public;\n\
+         CREATE TABLE movies (movieid INT, title TEXT);\n\
+         INSERT INTO movies VALUES (1, 'A');\n\
+         COMMIT;\n\
+         \\echo init done\n",
+    )
+    .unwrap();
+
+    let mut s = buffered();
+    for round in 1..=2 {
+        s.run_interactive(&format!("\\i {}", path.display()));
+        let out = s.messages();
+        assert!(out.contains("init done"), "第 {round} 轮：{out}");
+        assert!(!out.contains("错误"), "第 {round} 轮有错误：{out}");
+    }
 }
