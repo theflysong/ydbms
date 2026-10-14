@@ -840,6 +840,7 @@ dependencies = [
  "bigdecimal",
  "csv",
  "pg_query",
+ "regex",
  "rustyline",
  "serde",
  "serde_json",

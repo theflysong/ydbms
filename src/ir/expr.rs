@@ -652,7 +652,7 @@ impl Prog {
             .ok_or(EvalError::NotABool)
     }
 
-    /// 这个程序引用到的所有输入列下标。将来做谓词下推分派时要用。
+    /// 这个程序引用到的所有输入列下标。谓词下推分派用它。
     pub fn columns(&self) -> BTreeSet<usize> {
         self.steps
             .iter()
@@ -661,6 +661,65 @@ impl Prog {
                 _ => None,
             })
             .collect()
+    }
+
+    /// 把两个程序合成一个 `self AND other`（真值程序）。
+    ///
+    /// `other` 的寄存器整体后移 `self.nregs`，末尾追加一条 [`Step::Binary`] 的
+    /// `And`，于是两个程序各自的原样逻辑都不变。**这不是短路求值**：与
+    /// [`Step::Binary`] 一直以来的行为一样，两侧都会被算完（见 §2.2）。
+    ///
+    /// 谓词下推要把同一张表上的几个合取项并进同一个 `Scan.filter`，用的就是它。
+    ///
+    /// > 寄存器数是 `u16`：合并后越界会报 [`DbError::IrInvalid`]，不静默回绕。
+    pub fn and(self, other: Prog) -> Result<Prog> {
+        let shift = self.nregs;
+        let lhs = self.result;
+        let rhs = add_reg(other.result, shift)?;
+
+        let mut steps = self.steps;
+        for step in other.steps {
+            steps.push(shift_step(step, shift)?);
+        }
+
+        let dst = shift.checked_add(other.nregs).ok_or_else(|| {
+            invalid("两个程序合并后的寄存器数超过 u16".to_string())
+        })?;
+        steps.push(Step::Binary {
+            dst,
+            op: BinOp::And,
+            lhs,
+            rhs,
+        });
+
+        let nregs = dst
+            .checked_add(1)
+            .ok_or_else(|| invalid("合并后的寄存器数超过 u16".to_string()))?;
+        Ok(Prog::new(steps, dst, nregs))
+    }
+
+    /// 把程序里所有列下标整体减掉 `offset`。
+    ///
+    /// 用途只有一个：**谓词下推**——程序本来是按**扁平 schema**（`左 ++ 右`）编的，
+    /// 推到某一张表的 `Scan.filter` 上之后，下标必须是**这张表自己**的列。
+    ///
+    /// 调用方保证这些下标都落在 `offset` 之后；万一不在，这里报错，**不静默取 0**
+    /// （那会读错列，是个安静的错答案）。
+    pub fn rebase_columns(&self, offset: usize) -> Result<Prog> {
+        let steps = self
+            .steps
+            .iter()
+            .map(|step| match step {
+                Step::Col { dst, index } => {
+                    let index = index.checked_sub(offset).ok_or_else(|| {
+                        invalid(format!("列下标 {} 落在 offset {} 之前", index, offset))
+                    })?;
+                    Ok(Step::Col { dst: *dst, index })
+                }
+                other => Ok(other.clone()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Prog::new(steps, self.result, self.nregs))
     }
 
     /// 用列名把程序渲染成中缀表达式。`input` 是本算子输入的列定义。
@@ -855,6 +914,63 @@ fn invalid(message: String) -> DbError {
         node: None,
         message,
     }
+}
+
+/// 寄存器号加一个偏移，越界即报错（`u16` 不静默回绕）。
+fn add_reg(reg: Reg, delta: Reg) -> Result<Reg> {
+    reg.checked_add(delta)
+        .ok_or_else(|| invalid(format!("寄存器 {} 后移 {} 后越界", reg, delta)))
+}
+
+/// 把一条指令里**所有**寄存器后移 `delta`（[`Prog::and`] 用）。
+///
+/// 这是穷尽 match：将来加 [`Step`] 变体会在这里编译报错，不会漏改。
+fn shift_step(step: Step, delta: Reg) -> Result<Step> {
+    Ok(match step {
+        Step::Col { dst, index } => Step::Col {
+            dst: add_reg(dst, delta)?,
+            index,
+        },
+        Step::Const { dst, value } => Step::Const {
+            dst: add_reg(dst, delta)?,
+            value,
+        },
+        Step::Unary { dst, op, src } => Step::Unary {
+            dst: add_reg(dst, delta)?,
+            op,
+            src: add_reg(src, delta)?,
+        },
+        Step::Binary { dst, op, lhs, rhs } => Step::Binary {
+            dst: add_reg(dst, delta)?,
+            op,
+            lhs: add_reg(lhs, delta)?,
+            rhs: add_reg(rhs, delta)?,
+        },
+        Step::Case {
+            dst,
+            cond,
+            then_value,
+            else_value,
+        } => Step::Case {
+            dst: add_reg(dst, delta)?,
+            cond: add_reg(cond, delta)?,
+            then_value: add_reg(then_value, delta)?,
+            else_value: add_reg(else_value, delta)?,
+        },
+        Step::Call { dst, func, args } => Step::Call {
+            dst: add_reg(dst, delta)?,
+            func,
+            args: args
+                .into_iter()
+                .map(|reg| add_reg(reg, delta))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        Step::IsNull { dst, src, negated } => Step::IsNull {
+            dst: add_reg(dst, delta)?,
+            src: add_reg(src, delta)?,
+            negated,
+        },
+    })
 }
 
 fn write_reg(

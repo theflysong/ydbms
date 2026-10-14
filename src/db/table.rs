@@ -340,6 +340,10 @@ impl fmt::Display for DataType {
 ///
 /// 刻意**没有**实现 `Copy`：`Text(String)` 之类本来就不能 `Copy`。
 ///
+/// 实现了 `Hash`，于是能直接当哈希表的键（哈希连接与索引都用它）。它只要求
+/// **与 `Eq` 一致**——`Eq` 是派生的按文本/内容相等，而 `Ord` 是手写的（`NUMERIC`
+/// 按定点比、跨大类按大类排名）。两者不冲突：规范文本是不变式，相等的值文本也相等。
+///
 /// # 三种新值都用“规范化文本”存
 ///
 /// * `Text` —— 原样。
@@ -351,7 +355,7 @@ impl fmt::Display for DataType {
 /// > 规范化的 `Value::Numeric("1.50".into())` 会让 `Ord`（数值比较）与 `PartialEq`
 /// > （文本比较）**不一致**，从而违反 `Ord` 的契约。请一律用 [`DataType::parse`]
 /// > 或 [`Value::numeric`] 构造。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     /// SQL 的 NULL。**它没有类型**——靠上下文定型（见 [`crate::ir`] 的
     /// `ScalarType::Null`）。

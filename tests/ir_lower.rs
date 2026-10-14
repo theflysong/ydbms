@@ -533,12 +533,12 @@ fn multiple_statements_are_rejected_by_compile() {
 fn explain_shows_the_whole_pipeline() {
     let symbols = build_database();
 
+    // `WHERE value > 10` 只引用 `f` 一列，于是被推到 `Scan` 里：**没有** `Filter` 节点
     let expected = concat!(
         "Limit(limit=3, offset=0)\n",
         "  Sort(keys=[x DESC])\n",
         "    Project(names=[x, value], exprs=[x, value])\n",
-        "      Filter([value > 10])\n",
-        "        Scan(f, filter=[])\n",
+        "      Scan(f, filter=[value > 10])\n",
     );
 
     assert_eq!(
@@ -554,9 +554,10 @@ fn explain_shows_the_whole_pipeline() {
 fn explain_shows_a_join_with_both_inputs() {
     let symbols = build_database();
 
+    // 单键等值连接、内侧是基表 → 索引嵌套循环
     let expected = concat!(
         "Project(names=[x, label], exprs=[x, label])\n",
-        "  Join(inner, on=[x = x])\n",
+        "  Join(inner, index=x, on=[x = x])\n",
         "    Scan(f, filter=[])\n",
         "    Scan(t, filter=[])\n",
     );
@@ -565,4 +566,107 @@ fn explain_shows_a_join_with_both_inputs() {
         explain(&symbols, "SELECT f.x, t.label FROM f JOIN t ON f.x = t.x"),
         expected
     );
+}
+
+// ------------------------------------------------------------ 谓词下推（3.3）
+
+#[test]
+fn a_single_table_where_is_pushed_into_the_scan() {
+    let symbols = build_database();
+
+    // `SELECT *` 是恒等投影，没有 Project 节点，形状最干净
+    assert_eq!(
+        explain(&symbols, "SELECT * FROM f WHERE value > 10"),
+        "Scan(f, filter=[value > 10])\n"
+    );
+
+    // 多个合取项照样并成一个 `filter`
+    assert_eq!(
+        explain(&symbols, "SELECT * FROM f WHERE value > 10 AND x < 0"),
+        "Scan(f, filter=[(value > 10) AND (x < 0)])\n"
+    );
+}
+
+#[test]
+fn a_where_on_one_side_of_a_join_is_pushed_below_it() {
+    let symbols = build_database();
+
+    // 谓词下推的验收形状：`WHERE` 里只引用 `f` 的合取项落到 Join **之下**，
+    // 于是整个计划里根本没有 `Filter` 节点
+    let rendered = explain(
+        &symbols,
+        "SELECT f.x FROM f JOIN t ON f.x = t.x WHERE f.value = 10",
+    );
+
+    assert!(
+        rendered.contains("Scan(f, index=[value], filter=[value = 10])"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Filter("), "{rendered}");
+}
+
+#[test]
+fn a_predicate_over_two_tables_stays_in_a_filter() {
+    let symbols = build_database();
+
+    // `f.value + t.label > 10` 引用了两张表 → 推不下去，留在 Join 之上
+    let rendered = explain(
+        &symbols,
+        "SELECT f.x FROM f JOIN t ON f.x = t.x WHERE f.value + t.label > 10",
+    );
+
+    assert!(rendered.contains("Filter([(value + label) > 10])"), "{rendered}");
+    // 而只引用 `f` 的那一项仍然推得下去
+    let rendered = explain(
+        &symbols,
+        "SELECT f.x FROM f JOIN t ON f.x = t.x WHERE f.value > 10 AND f.x + t.label > 10",
+    );
+    assert!(rendered.contains("Scan(f, filter=[value > 10])"), "{rendered}");
+    assert!(rendered.contains("Filter([(x + label) > 10])"), "{rendered}");
+}
+
+#[test]
+fn a_constant_predicate_is_not_pushed() {
+    let symbols = build_database();
+
+    // 常量谓词（不读列）不推：推到哪张表都是白搭，留在 Filter 里
+    assert_eq!(
+        explain(&symbols, "SELECT * FROM f WHERE 1 = 1"),
+        "Filter([1 = 1])\n  Scan(f, filter=[])\n"
+    );
+}
+
+#[test]
+fn nothing_is_pushed_into_the_nullable_side_of_a_left_join() {
+    let symbols = build_database();
+
+    // `t.label` 在 LEFT JOIN 的可空侧：补出来的 NULL 也满足 `IS NULL`，
+    // 推下去会让那些行凭空消失——所以这一项不推。
+    let rendered = explain(
+        &symbols,
+        "SELECT f.x FROM f LEFT JOIN t ON f.x = t.x WHERE t.label IS NULL",
+    );
+
+    assert!(rendered.contains("Filter([(label IS NULL)])"), "{rendered}");
+    assert!(rendered.contains("Scan(t, filter=[])"), "{rendered}");
+}
+
+#[test]
+fn pushdown_does_not_change_the_rows() {
+    let symbols = build_database();
+
+    // 同一批数据，写成一个合取项与拆成两个合取项必须一模一样
+    let joined = query(
+        &symbols,
+        "SELECT f.x FROM f WHERE value > 10 AND x < 0",
+    )
+    .unwrap();
+    let nested = query(
+        &symbols,
+        "SELECT f.x FROM f WHERE (value > 10 AND x < 0)",
+    )
+    .unwrap();
+
+    assert_eq!(col_i32(&joined, 0), vec![-5, -4]);
+    assert_eq!(col_i32(&joined, 0), col_i32(&nested, 0));
 }

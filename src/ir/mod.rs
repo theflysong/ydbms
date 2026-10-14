@@ -41,12 +41,19 @@
 //!
 //! 已实现：`SELECT`（多表内连接与左外连接、`WHERE`、`ORDER BY`、`LIMIT`/`OFFSET`）、
 //! 聚合与 `GROUP BY`/`HAVING`、`CASE`、`ROUND`、`CREATE TABLE`、`INSERT`、
-//! NULL 与三值逻辑、`INT`/`TEXT`/`CHAR`/`VARCHAR`/`TIMESTAMP`/`NUMERIC`，
-//! 以及**拉取式**的执行（见 [`exec`]）。
+//! NULL 与三值逻辑、`INT`/`TEXT`/`CHAR`/`VARCHAR`/`TIMESTAMP`/`NUMERIC`、
+//! **拉取式**的执行（见 [`exec`]），以及三样访问路径与连接上的东西：
 //!
-//! 未实现：**优化器**——降级出来的就是朴素计划，没有重排、没有谓词下推、没有
-//! 代价估算；子查询；集合运算（`UNION` 等）；CTE；`DISTINCT`；窗口函数；
-//! `RIGHT`/`FULL` JOIN；`UPDATE`/`DELETE`/`DROP`/`ALTER`；事务。
+//! * **谓词下推**：`WHERE` 的合取项只引用一个 FROM 项时推进那张表的 `Scan.filter`
+//!   （`LEFT JOIN` 的可空侧不推，见 [`lower`]）；
+//! * **索引**：`Scan` 可以带一条索引路径（`<列> = <不读列的表达式>`），由
+//!   [`crate::db::index`] 的「键 → 行号」取行；
+//! * **连接策略**：嵌套循环 / [`JoinStrategy::Hash`] / [`JoinStrategy::IndexNestedLoop`]，
+//!   由绑定器按等值键挑（见 [`JoinStrategy`]）。
+//!
+//! 未实现：**优化器**——没有连接重排、没有代价估算（策略是定规则挑的）；子查询；
+//! 集合运算（`UNION` 等）；CTE；`DISTINCT`；窗口函数；`RIGHT`/`FULL` JOIN；
+//! `UPDATE`/`DELETE`/`DROP`/`ALTER`；`CREATE INDEX`；事务。
 
 pub mod exec;
 pub mod expr;
@@ -57,7 +64,9 @@ pub mod symbol;
 
 pub use exec::{execute, execute_source};
 pub use expr::{BinOp, EvalError, Prog, ProgBuilder, Reg, Scalar, ScalarType, Step, UnOp};
-pub use plan::{Analysis, JoinKind, Node, NodeId, Op, Plan, PlanBuilder, SortKey};
+pub use plan::{
+    Analysis, EqKey, IndexPath, JoinKind, JoinStrategy, Node, NodeId, Op, Plan, PlanBuilder, SortKey,
+};
 pub use stmt::{
     execute_stmt, has_top_level_terminator, run_script, Outcome, Script, Stmt, StmtResult,
 };

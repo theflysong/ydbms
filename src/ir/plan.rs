@@ -48,6 +48,69 @@ impl JoinKind {
     }
 }
 
+/// 一次等值连接用的键：两侧各一个程序，**各自面对自己那一支的 schema**。
+///
+/// 两个程序都是「按自己那一支编的」（外侧的下标相对左支、内侧的相对于右支），
+/// 于是哈希表的两侧都能直接 `eval`，谁也不用知道对方的宽度。
+///
+/// **两侧必须同一大类**：`Value::Int(1)` 与 `Value::Numeric("1")` 在 `Value` 层面
+/// 不是同一个值，混着当键会让哈希/索引**安静地漏掉**本该匹配的行。嵌套循环里的
+/// 比较有 `widen_numeric` 兜着，键没有——所以这条由 [`Plan::analyze`] 静态强制。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EqKey {
+    /// 外侧（左支）的键。
+    pub outer: Prog,
+    /// 内侧（右支）的键。
+    pub inner: Prog,
+}
+
+/// 连接的执行策略（由绑定器挑，见 [`crate::ir::lower`]）。
+///
+/// 三者对**输出**完全一致（行序都等于「外侧顺序 × 内侧顺序」），换的只是
+/// 「内侧怎么找」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinStrategy {
+    /// 朴素嵌套循环：内侧整体物化，外侧逐行去配。
+    NestedLoop,
+    /// 哈希连接：内侧抽干成 `键 → 行` 的哈希表，外侧流式探查。
+    Hash {
+        /// 等值键（至少一个）。
+        keys: Vec<EqKey>,
+    },
+    /// 索引嵌套循环：内侧是**基表 [`Op::Scan`]**，给它建一次索引，
+    /// 外侧每行按键查一次——内侧的行**不必物化**。
+    ///
+    /// 内侧 `Scan` 自己的 `index` 槽位这时用不上（连接建的是**连接列**上的索引），
+    /// 它的 `filter` 仍要由执行器逐行复核。
+    IndexNestedLoop {
+        /// 等值键；`inner` 必须是**裸列**（索引只能建在一列上）。
+        key: EqKey,
+    },
+}
+
+impl JoinStrategy {
+    /// 渲染用的名字。
+    pub fn name(&self) -> &'static str {
+        match self {
+            JoinStrategy::NestedLoop => "nested-loop",
+            JoinStrategy::Hash { .. } => "hash",
+            JoinStrategy::IndexNestedLoop { .. } => "index-nested-loop",
+        }
+    }
+}
+
+/// 一次索引访问：走第 `column` 列上的索引，要查的键由 `key` 求值。
+///
+/// `key` **不能引用列**：索引是访问路径而不是算子，它没有输入行，键在空行上
+/// 求值。这条由 [`Plan::analyze`] 强制。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexPath {
+    /// 索引建在哪一列（**这张表自己**的列下标）。
+    pub column: usize,
+    /// 要查的键；不读列。
+    pub key: Prog,
+}
+
 /// 聚合函数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
@@ -122,6 +185,11 @@ pub enum Op {
         table: String,
         /// 下推到扫描的谓词；输入是这张表的列。
         filter: Option<Prog>,
+        /// 索引访问路径；有它就按键取行，没有就顺序扫描。
+        ///
+        /// 它只是**访问路径**：`filter` 照旧逐行求值，所以路径挑错也只是慢，
+        /// 不会算错。
+        index: Option<IndexPath>,
     },
     /// 选择。
     Filter {
@@ -141,6 +209,8 @@ pub enum Op {
         kind: JoinKind,
         /// 连接条件；输入是 **左 schema ++ 右 schema**。
         on: Option<Prog>,
+        /// 怎么执行这次连接。
+        strategy: JoinStrategy,
     },
     /// 分组聚合。
     ///
@@ -288,7 +358,11 @@ impl Plan {
             let (schema, program_input) = match &node.op {
                 Op::SingleRow => (Vec::new(), None),
 
-                Op::Scan { table, filter } => {
+                Op::Scan {
+                    table,
+                    filter,
+                    index,
+                } => {
                     let columns = symbols
                         .columns(table)
                         .ok_or_else(|| DbError::UnknownSymbol {
@@ -298,6 +372,9 @@ impl Plan {
                     if let Some(prog) = filter {
                         let ty = prog.verify(&columns).map_err(|e| at(id, e))?;
                         expect(ty, ScalarType::Bool, id, "Scan.filter")?;
+                    }
+                    if let Some(path) = index {
+                        verify_index_path(path, table, &columns, id)?;
                     }
                     (columns.clone(), Some(columns))
                 }
@@ -365,8 +442,12 @@ impl Plan {
                     (columns.clone(), Some(input))
                 }
 
-                Op::Join { kind, on } => {
-                    let mut input = schemas[node.inputs[0]].clone();
+                Op::Join {
+                    kind,
+                    on,
+                    strategy,
+                } => {
+                    let left = schemas[node.inputs[0]].clone();
                     let mut right = schemas[node.inputs[1]].clone();
 
                     // 左外连接里，没匹配上的行会让**右支所有列**变成 NULL。
@@ -378,6 +459,11 @@ impl Plan {
                         }
                     }
 
+                    // 策略的守卫先用**分开的**左/右 schema 校验（键是两侧各一份程序）
+                    let inner = &self.nodes[node.inputs[1]].op;
+                    verify_join_strategy(strategy, &left, &right, on.as_ref(), inner, symbols, id)?;
+
+                    let mut input = left;
                     input.extend(right);
                     if let Some(prog) = on {
                         let ty = prog.verify(&input).map_err(|e| at(id, e))?;
@@ -499,6 +585,7 @@ impl PlanBuilder {
             op: Op::Scan {
                 table: table.to_string(),
                 filter: None,
+                index: None,
             },
             inputs: Vec::new(),
         });
@@ -511,10 +598,44 @@ impl PlanBuilder {
             op: Op::Scan {
                 table: table.to_string(),
                 filter: Some(filter),
+                index: None,
             },
             inputs: Vec::new(),
         });
         self.nodes.len() - 1
+    }
+
+    /// 把谓词**并进**某个 `Scan` 已经有的 `filter`（谓词下推的落点）。
+    ///
+    /// 本来没有 filter 就直接挂上；已经有一个就 `AND` 上去（两个合取项仍然是一个
+    /// 程序，扫一遍就够）。
+    pub fn add_scan_filter(&mut self, id: NodeId, filter: Prog) -> Result<()> {
+        match self.nodes.get_mut(id).map(|node| &mut node.op) {
+            Some(Op::Scan { filter: slot, .. }) => {
+                *slot = Some(match slot.take() {
+                    None => filter,
+                    Some(existing) => existing.and(filter)?,
+                });
+                Ok(())
+            }
+            _ => Err(invalid(id, "add_scan_filter 只对 Scan 节点有意义".to_string())),
+        }
+    }
+
+    /// 给某个 `Scan` 挂上索引访问路径。
+    pub fn set_scan_index(&mut self, id: NodeId, path: IndexPath) -> Result<()> {
+        match self.nodes.get_mut(id).map(|node| &mut node.op) {
+            Some(Op::Scan { index, .. }) => {
+                *index = Some(path);
+                Ok(())
+            }
+            _ => Err(invalid(id, "set_scan_index 只对 Scan 节点有意义".to_string())),
+        }
+    }
+
+    /// 看一个已经压进去的节点的算子（绑定器挑连接策略时要看内侧是不是基表 `Scan`）。
+    pub fn op(&self, id: NodeId) -> Option<&Op> {
+        self.nodes.get(id).map(|node| &node.op)
     }
 
     /// 单行零列。
@@ -548,8 +669,16 @@ impl PlanBuilder {
         right: NodeId,
         kind: JoinKind,
         on: Option<Prog>,
+        strategy: JoinStrategy,
     ) -> Result<NodeId> {
-        self.push(Op::Join { kind, on }, vec![left, right])
+        self.push(
+            Op::Join {
+                kind,
+                on,
+                strategy,
+            },
+            vec![left, right],
+        )
     }
 
     /// 排序。
@@ -644,6 +773,139 @@ fn at(node: NodeId, e: DbError) -> DbError {
     }
 }
 
+/// 校验一条索引访问路径。
+///
+/// 两条检查都是为了**不安静地漏行**：
+///
+/// * 键不能读列——索引是访问路径而不是算子，键在没有输入行的情况下求值；
+/// * 键与索引列必须**同一大类**——`Value::Int(1)` 与 `Value::Numeric("1")` 在值
+///   层面不是同一个键，混着用会漏掉本该匹配的行。
+fn verify_index_path(path: &IndexPath, table: &str, columns: &[Column], id: NodeId) -> Result<()> {
+    let column = columns.get(path.column).ok_or_else(|| {
+        invalid(
+            id,
+            format!(
+                "索引列 {} 越界（`{}` 只有 {} 列）",
+                path.column,
+                table,
+                columns.len()
+            ),
+        )
+    })?;
+
+    let ty = path.key.verify(columns).map_err(|e| at(id, e))?;
+    if !path.key.columns().is_empty() {
+        return Err(invalid(
+            id,
+            "索引的键不能引用列：它在没有输入行的情况下求值".to_string(),
+        ));
+    }
+
+    match ty {
+        ScalarType::Value(family) if family == column.ty.family() => Ok(()),
+        other => Err(invalid(
+            id,
+            format!(
+                "索引键的类型 {} 与列 `{}` 的类型 {} 不是同一大类——跨大类在值层面是不同的键，\
+                 用索引会安静地漏掉本该匹配的行",
+                other, column.name, column.ty
+            ),
+        )),
+    }
+}
+
+/// 校验一个等值键：两侧各自面对自己那一支的 schema，且**同一大类**。
+fn verify_eq_key(key: &EqKey, left: &[Column], right: &[Column], id: NodeId, what: &str) -> Result<()> {
+    let outer = key.outer.verify(left).map_err(|e| at(id, e))?;
+    let inner = key.inner.verify(right).map_err(|e| at(id, e))?;
+
+    match (outer, inner) {
+        (ScalarType::Value(a), ScalarType::Value(b)) if a == b => Ok(()),
+        _ => Err(invalid(
+            id,
+            format!(
+                "{} 的两侧必须同一大类，实际是 {} 与 {}（跨大类的值在哈希表里不是同一个键）",
+                what, outer, inner
+            ),
+        )),
+    }
+}
+
+/// 校验连接策略：与 `ON` 配不配套、键同不同族、内侧能不能建索引。
+///
+/// 这些都为了让**手写的不一致计划**直接报错，而不是跑出一个奇怪的结果。
+fn verify_join_strategy(
+    strategy: &JoinStrategy,
+    left: &[Column],
+    right: &[Column],
+    on: Option<&Prog>,
+    inner: &Op,
+    symbols: &SymbolTable,
+    id: NodeId,
+) -> Result<()> {
+    match strategy {
+        JoinStrategy::NestedLoop => Ok(()),
+
+        JoinStrategy::Hash { keys } => {
+            if on.is_none() {
+                return Err(invalid(id, "哈希连接要求有 ON".to_string()));
+            }
+            if keys.is_empty() {
+                return Err(invalid(id, "哈希连接至少要有一个等值键".to_string()));
+            }
+            for key in keys {
+                verify_eq_key(key, left, right, id, "哈希连接的等值键")?;
+            }
+            Ok(())
+        }
+
+        JoinStrategy::IndexNestedLoop { key } => {
+            if on.is_none() {
+                return Err(invalid(id, "索引嵌套循环要求有 ON".to_string()));
+            }
+
+            let table = match inner {
+                Op::Scan { table, .. } => table,
+                _ => {
+                    return Err(invalid(
+                        id,
+                        "索引嵌套循环要求内侧是一个基表 Scan（索引建在基表上）".to_string(),
+                    ))
+                }
+            };
+
+            let index_column = passthrough_column(&key.inner).ok_or_else(|| {
+                invalid(
+                    id,
+                    "索引嵌套循环的内侧键必须是裸列（索引只能建在一列上）".to_string(),
+                )
+            })?;
+
+            let columns = symbols.columns(table).ok_or_else(|| DbError::UnknownSymbol {
+                name: table.clone(),
+            })?;
+            let column = columns.get(index_column).ok_or_else(|| {
+                invalid(
+                    id,
+                    format!("索引列 {} 越界（`{}` 只有 {} 列）", index_column, table, columns.len()),
+                )
+            })?;
+
+            let outer = key.outer.verify(left).map_err(|e| at(id, e))?;
+            match outer {
+                ScalarType::Value(family) if family == column.ty.family() => Ok(()),
+                other => Err(invalid(
+                    id,
+                    format!(
+                        "索引嵌套循环的键两侧必须同一大类，实际是 {} 与 `{}.{}` 的 {}",
+                        other, table, column.name, column.ty
+                    ),
+                )),
+            }
+        }
+    }
+}
+
 fn invalid(node: NodeId, message: String) -> DbError {
     DbError::IrInvalid {
         node: Some(node),
@@ -666,10 +928,30 @@ fn render(id: NodeId, node: &Node, analysis: &Analysis) -> String {
     let input = analysis.program_input(id);
     match &node.op {
         Op::SingleRow => "SingleRow".to_string(),
-        Op::Scan { table, filter } => match filter {
-            Some(prog) => format!("Scan({}, filter=[{}])", table, prog.explain(input)),
-            None => format!("Scan({}, filter=[])", table),
-        },
+        Op::Scan {
+            table,
+            filter,
+            index,
+        } => {
+            let path = match index {
+                Some(path) => format!(
+                    "index=[{}], ",
+                    input
+                        .get(path.column)
+                        .map(|column| column.name.as_str())
+                        .unwrap_or("?")
+                ),
+                None => String::new(),
+            };
+            match filter {
+                Some(prog) => format!(
+                    "Scan({}, {path}filter=[{}])",
+                    table,
+                    prog.explain(input)
+                ),
+                None => format!("Scan({}, {path}filter=[])", table),
+            }
+        }
         Op::Filter { predicate } => format!("Filter([{}])", predicate.explain(input)),
         Op::Project { progs, names } => {
             let exprs: Vec<String> = progs.iter().map(|p| p.explain(input)).collect();
@@ -679,10 +961,41 @@ fn render(id: NodeId, node: &Node, analysis: &Analysis) -> String {
                 exprs.join(", ")
             )
         }
-        Op::Join { kind, on } => match on {
-            Some(prog) => format!("Join({}, on=[{}])", kind.name(), prog.explain(input)),
-            None => format!("Join({}, on=[])", kind.name()),
-        },
+        Op::Join {
+            kind,
+            on,
+            strategy,
+        } => {
+            // 等值键的两个程序各按自己那一支的 schema 渲染
+            let left = analysis.program_input(node.inputs[0]);
+            let right = analysis.program_input(node.inputs[1]);
+            let one_key = |key: &EqKey| {
+                format!(
+                    "{} = {}",
+                    key.outer.explain(left),
+                    key.inner.explain(right)
+                )
+            };
+            let picked = match strategy {
+                JoinStrategy::NestedLoop => String::new(),
+                JoinStrategy::Hash { keys } => {
+                    let rendered: Vec<String> = keys.iter().map(one_key).collect();
+                    format!("hash=[{}], ", rendered.join(", "))
+                }
+                JoinStrategy::IndexNestedLoop { key } => {
+                    format!("index={}, ", key.inner.explain(right))
+                }
+            };
+            match on {
+                Some(prog) => format!(
+                    "Join({}, {}on=[{}])",
+                    kind.name(),
+                    picked,
+                    prog.explain(input)
+                ),
+                None => format!("Join({}, {}on=[])", kind.name(), picked),
+            }
+        }
         Op::Aggregate {
             group_by,
             aggs,

@@ -10,6 +10,8 @@
 - `phys.rs` —— 物化表 [`PhysTab`](phys.rs)。
 - `source.rs` —— 拉取式的中间结果 [`RowSource`](source.rs) / 基表游标
   [`TableCursor`](source.rs) / 物化 [`materialize`](source.rs) 与抽干 [`drain`](source.rs)。
+- `index.rs` —— 一列上的「键 → 行号」索引 [`Index`](index.rs)，以及把行号读成行的
+  [`IndexSource`](index.rs)。
 
 **上游**：`pers/` 通过 `&dyn Table` 落盘；`ir/` 把 `Value` 当标量用、把 `RowSource`
 当执行管道的每一节。这一层**被依赖，不依赖别人**，请保持这个方向。
@@ -20,11 +22,13 @@
 
 - **`Table` 是随机访问**（`nrows()` + `row(r)`）：基表与落盘要它。
 - **`RowSource` 是只进不退**（`next()` + `error()`）：执行器要它。连接、哈希连接、
-  索引扫描将来都是"又一个 `RowSource`"，**不需要**再有一个 `JoinTab: Table`。
+  索引扫描都是"又一个 `RowSource`"（`ir/exec.rs` 与 `index.rs`），**不需要**再有
+  一个 `JoinTab: Table`。
 
-**物化只发生在 `materialize`/`drain` 的调用点**（`Sort`/`Aggregate`、连接的内侧、
-被多个父节点引用的节点、最终结果）。别为了图方便在别的算子里攒行——拉取式的收益
-全在"上层停手，下层就不算"上。
+**物化只发生在 `materialize`/`drain` 的调用点**（`Sort`/`Aggregate`、嵌套循环连接的
+内侧、哈希连接的 build 侧、被多个父节点引用的节点、最终结果）。别为了图方便在别的
+算子里攒行——拉取式的收益全在"上层停手，下层就不算"上。索引攒的是**行号**而不是行，
+所以索引嵌套循环不物化内侧。
 
 `next()` 返回 `None` 有两个可能：**正常结束**与**出错**，后者必须能通过 `error()`
 问到。一旦结束或出错，后续 `next()` 要继续返回 `None`（幂等）。
@@ -36,6 +40,10 @@
   `Ord` 说相等而 `PartialEq` 说不等，排序与 `GROUP BY` 就会出错。
 - **NULL 没有类型。** `Value::family()` 返回 `Option<TypeFamily>`，别给它编一个大类。
   它能进任何列，能不能放由 `Column::not_null` 决定。
+- **`Value` 的 `Hash` 只跟派生的 `Eq` 对齐**（文本/内容相等），那是哈希连接与索引拿它
+  当键的依据；`Ord` 是另一套（`NUMERIC` 按定点比）。两者不冲突靠的是规范文本这条不变式。
+  **跨大类的值不是同一个键**（`Int(1)` 与 `Numeric("1")`），所以键必须同族——
+  `ir/plan.rs` 的 `analyze` 强制这一条。
 - **`DataType::parse` 是强制 typmod 的唯一入口**，**`Table::validate` 是强制 typmod
   与 `NOT NULL` 的唯一入口**。别在别处重复校验——两处校验迟早会分叉。
 

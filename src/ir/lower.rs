@@ -7,6 +7,11 @@
 //! * **解列名**：`x`、`f.x`、`study.people.x` 都要落到**扁平下标**上；
 //! * **类型检查**：交给下游 [`Plan::analyze`] 与 [`Prog::verify`]；
 //! * **确认形状**：`AS` 只影响限定名匹配，不改变列名（列名保持表自己的）。
+//! * **挑访问路径与连接策略**：`WHERE` 里只引用一个 FROM 项的合取项下推到那
+//!   张表的 `Scan.filter`（能走索引就顺手挑索引路径，见 [`lower_where`]）；
+//!   `ON` 里的「裸列 = 裸列」等值键决定这次连接走嵌套循环 / 哈希 / 索引嵌套循环
+//!   （见 [`equi_keys`] 与 [`join_strategy`]）。两条都**只挑已知能对的**：挑不出
+//!   来就退回首选方案，正确性不变。
 //!
 //! # 一条铁律：不认识的写法一律拒绝
 //!
@@ -29,6 +34,8 @@
 //! [`Plan::analyze`] 推导出来的完全一致——若哪天不一致，`analyze` 会以
 //! `IrInvalid` 报出来，而不会静默读错列。
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use pg_query::protobuf::{
     a_const::Val, node, AConst, AExpr, AExprKind, BoolExpr, BoolExprType, CaseExpr, ColumnDef,
     ConstrType, CreateStmt, FuncCall, InsertStmt, JoinExpr, JoinType, LimitOption, Node,
@@ -44,8 +51,8 @@ use crate::db::table::{
 
 use super::expr::{BinOp, Prog, ProgBuilder, Reg, ScalarFunc, ScalarType, UnOp};
 use super::plan::{
-    passthrough_column, project_column, AggFunc, AggSpec, JoinKind, NodeId, Op, Plan, PlanBuilder,
-    SortKey,
+    passthrough_column, project_column, AggFunc, AggSpec, EqKey, IndexPath, JoinKind, JoinStrategy,
+    NodeId, Op, Plan, PlanBuilder, SortKey,
 };
 use super::stmt::Stmt;
 use super::symbol::SymbolTable;
@@ -403,8 +410,6 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
 
 /// 算出「表的第 i 列，值应该从行内第几个位置取」。
 fn column_permutation(insert: &InsertStmt, target: &[Column], table: &str) -> Result<Vec<usize>> {
-    use std::collections::{BTreeMap, BTreeSet};
-
     // 没写列名表：值就按表的列序
     if insert.cols.is_empty() {
         return Ok((0..target.len()).collect());
@@ -502,12 +507,10 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable) -> Result<Plan> {
     let schema = scope.schema();
 
     // ---- WHERE（Filter 不改变 schema，所以后面几个都还按同一个 scope 解）
+    //
+    // 能推到单表的合取项就推（见 `lower_where`），推不动的留在 `Filter` 里。
     let filtered = match &select.where_clause {
-        Some(expr) => {
-            let mut p = ProgBuilder::new();
-            let reg = lower_expr(expr, &scope, &mut p)?;
-            b.filter(from_id, p.finish(reg))?
-        }
+        Some(expr) => lower_where(expr, from_id, &scope, &mut b)?,
         None => from_id,
     };
 
@@ -539,7 +542,7 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable) -> Result<Plan> {
         .zip(names.iter())
         .map(|(prog, name)| project_column(prog, name, &schema))
         .collect::<Result<_>>()?;
-    let output_scope = Scope::from_range(String::new(), None, output_columns);
+    let output_scope = Scope::from_range(String::new(), None, output_columns, None);
 
     let (sort_keys, sort_below_project) = if select.sort_clause.is_empty() {
         (Vec::new(), false)
@@ -735,7 +738,13 @@ fn lower_from(
     // 左深折叠成无条件内连接（笛卡尔积），过滤条件由 WHERE 提供。
     for item in iter {
         let (right_id, right_scope) = lower_from_item(item, b, symbols)?;
-        id = b.join(id, right_id, JoinKind::Inner, None)?;
+        id = b.join(
+            id,
+            right_id,
+            JoinKind::Inner,
+            None,
+            JoinStrategy::NestedLoop,
+        )?;
         scope = Scope::concat(scope, right_scope);
     }
 
@@ -769,7 +778,7 @@ fn lower_from_item(
             let id = b.scan(&name);
             // 别名只用于限定名匹配（`t.x`），**不改列名**——列名保持表自己的，
             // 这样 Scope 的 schema 才与 `Plan::analyze` 推出来的一致。
-            Ok((id, Scope::from_range(name, alias, columns)))
+            Ok((id, Scope::from_range(name, alias, columns, Some(id))))
         }
 
         Some(node::Node::JoinExpr(j)) => lower_join(j, b, symbols),
@@ -819,9 +828,17 @@ fn lower_join(
     let rarg = j.rarg.as_deref().ok_or_else(|| unsupported("连接缺右支"))?;
 
     let (left_id, left_scope) = lower_from_item(larg, b, symbols)?;
-    let (right_id, right_scope) = lower_from_item(rarg, b, symbols)?;
+    let (right_id, mut right_scope) = lower_from_item(rarg, b, symbols)?;
+
+    // 左外连接：右支是**可空侧**，它的 FROM 项不下推谓词（见 `Range::nullable`）
+    if join_kind == JoinKind::Left {
+        right_scope.mark_nullable();
+    }
+
+    let left_width = left_scope.schema().len();
     let scope = Scope::concat(left_scope, right_scope);
 
+    // `ON` 整条降级成**一个**程序：等值键只用来缩小候选集，候选对不对仍由它复核
     let on = match &j.quals {
         Some(expr) => {
             let mut p = ProgBuilder::new();
@@ -831,8 +848,268 @@ fn lower_join(
         None => None,
     };
 
-    let id = b.join(left_id, right_id, join_kind, on)?;
+    // 挑执行策略：先认等值键，再看内侧能不能建索引
+    let strategy = match &j.quals {
+        Some(expr) => {
+            let mut items = Vec::new();
+            conjuncts(expr, &mut items);
+            let keys = equi_keys(&items, &scope, left_width);
+            let inner = b.op(right_id).expect("右支刚压进去");
+            join_strategy(keys, inner)
+        }
+        // 没有 `ON`（`JOIN ... ON` 之外只在 `FROM a, b` 的叉积里出现）就没有键
+        None => JoinStrategy::NestedLoop,
+    };
+
+    let id = b.join(left_id, right_id, join_kind, on, strategy)?;
     Ok((id, scope))
+}
+
+// ------------------------------------------------------ WHERE / ON 的合取项
+
+/// 把 `WHERE` / `ON` 拆成**顶层合取项**（`a AND b AND c` → 三项）。
+///
+/// 只拆 `AND`：`OR` 整体算一项（拆开就不是「都要成立」了）。嵌套的 `AND` 是递归
+/// 展开的——`lower_expr` 本来就在表达式嵌套上递归，这里不引入新的失败类别。
+fn conjuncts<'a>(node: &'a Node, out: &mut Vec<&'a Node>) {
+    if let Some(node::Node::BoolExpr(b)) = &node.node {
+        if BoolExprType::try_from(b.boolop).unwrap_or(BoolExprType::Undefined)
+            == BoolExprType::AndExpr
+        {
+            for arg in &b.args {
+                conjuncts(arg, out);
+            }
+            return;
+        }
+    }
+    out.push(node);
+}
+
+/// 把一到多个谓词程序合成一个 `AND`；只有一个就原样返回。
+fn and_all(progs: impl IntoIterator<Item = Prog>) -> Result<Prog> {
+    let mut iter = progs.into_iter();
+    let first = iter.next().expect("调用方保证至少有一个谓词");
+    iter.try_fold(first, |acc, prog| acc.and(prog))
+}
+
+/// 这个节点是 `l = r` 吗；是就把两侧给出来（别的比较、别的写法都返回 `None`）。
+fn equi_sides(node: &Node) -> Option<(&Node, &Node)> {
+    let a = match &node.node {
+        Some(node::Node::AExpr(a)) => a,
+        _ => return None,
+    };
+    if AExprKind::try_from(a.kind).unwrap_or(AExprKind::Undefined) != AExprKind::AexprOp {
+        return None;
+    }
+    if single_string(&a.name).as_deref() != Some("=") {
+        return None;
+    }
+    Some((a.lexpr.as_deref()?, a.rexpr.as_deref()?))
+}
+
+/// 这个节点是个能解析的裸列引用吗；是就返回它在**扁平 schema** 里的下标。
+fn bare_column(node: &Node, scope: &Scope) -> Option<usize> {
+    let c = match &node.node {
+        Some(node::Node::ColumnRef(c)) => c,
+        _ => return None,
+    };
+    let parts = ref_parts(&c.fields)?;
+    scope.resolve(&parts).ok()
+}
+
+/// 一条「原样取第 `index` 列」的程序。
+fn col_prog(index: usize) -> Prog {
+    let mut p = ProgBuilder::new();
+    let reg = p.col(index);
+    p.finish(reg)
+}
+
+// ------------------------------------------------------------- 连接：等值键
+
+/// 从 `ON` 的合取项里挑**等值键**。
+///
+/// 只认「裸列 = 裸列」，且两侧分别落在连接的两支上（一侧在左支、另一侧在右支，
+/// 谁在等号左边都行）。两侧还必须**同一大类**：`Value::Int(1)` 与
+/// `Value::Numeric("1")` 在哈希表里不是同一个键，当键用会**安静地漏掉**本该匹配的
+/// 行——嵌套循环里的比较有 `widen_numeric` 兜着，键没有。
+///
+/// 挑不出来就不挑：连接退化成嵌套循环，正确性不变。
+fn equi_keys(items: &[&Node], scope: &Scope, left_width: usize) -> Vec<EqKey> {
+    let mut keys = Vec::new();
+
+    for item in items {
+        let (lhs, rhs) = match equi_sides(item) {
+            Some(sides) => sides,
+            None => continue,
+        };
+        let (Some(left), Some(right)) = (bare_column(lhs, scope), bare_column(rhs, scope)) else {
+            continue;
+        };
+
+        // 下标 < left_width 的在左支
+        let (outer_flat, inner_flat) = match (left < left_width, right < left_width) {
+            (true, false) => (left, right),
+            (false, true) => (right, left),
+            // 两侧都在同一支（或者就是同一个下标）——不是连接键
+            _ => continue,
+        };
+
+        // 同族才敢当键
+        let (Some(outer_ty), Some(inner_ty)) = (
+            scope.column_type_at(outer_flat),
+            scope.column_type_at(inner_flat),
+        ) else {
+            continue;
+        };
+        if outer_ty.family() != inner_ty.family() {
+            continue;
+        }
+
+        keys.push(EqKey {
+            outer: col_prog(outer_flat),
+            inner: col_prog(inner_flat - left_width),
+        });
+    }
+
+    keys
+}
+
+/// 挑连接策略。这里不做代价估算（那是 3.4 的事），规则是确定的：
+///
+/// * 挑不出等值键 → 嵌套循环；
+/// * 恰好一个键、内侧是**基表 `Scan`**、且内键是裸列 → 索引嵌套循环
+///   （内侧的行不必物化）；
+/// * 其余 → 哈希连接。
+fn join_strategy(keys: Vec<EqKey>, inner: &Op) -> JoinStrategy {
+    if keys.is_empty() {
+        return JoinStrategy::NestedLoop;
+    }
+
+    if keys.len() == 1
+        && matches!(inner, Op::Scan { .. })
+        && passthrough_column(&keys[0].inner).is_some()
+    {
+        return JoinStrategy::IndexNestedLoop {
+            key: keys.into_iter().next().expect("只有一个键"),
+        };
+    }
+
+    JoinStrategy::Hash { keys }
+}
+
+// ------------------------------------------------------------------- WHERE
+
+/// 降级 `WHERE`：**能推的推到基表**，推不动的合成一个 `Filter`。
+///
+/// 做法：把 `WHERE` 拆成顶层合取项，每一项先按**完整作用域**降级一次，看它引用到了
+/// 哪些列（[`Prog::columns`]）：
+///
+/// * 列全落在**一个** FROM 项里、而这一项可以下推 → 把下标改成「这一项自己的列」
+///   （[`Prog::rebase_columns`]）并进那张表的 `Scan.filter`；
+/// * 否则（引用了多张表、或者是个常量谓词）→ 留在连接之上的 `Filter` 里。
+///
+/// 拉取式之下这一步的收益是**少拉行**：被推掉的行根本不进上层管道。顺带在这一步
+/// 挑索引访问路径（见 [`index_path`]）。
+///
+/// 下推**不改变结果**，但会改变**运行期错误出现的时机**：谓词现在可能在「本来配不上
+/// 对、会被连接丢掉」的行上求值（除零之类）。PostgreSQL 同样不保证谓词的求值顺序，
+/// 而错误是响的、不是安静的。
+fn lower_where(expr: &Node, from_id: NodeId, scope: &Scope, b: &mut PlanBuilder) -> Result<NodeId> {
+    let mut items = Vec::new();
+    conjuncts(expr, &mut items);
+
+    // 每个 FROM 项一个列表；块内顺序都保持 WHERE 里的书写顺序
+    let mut pushed: Vec<Vec<(&Node, Prog)>> = vec![Vec::new(); scope.ranges.len()];
+    let mut kept: Vec<Prog> = Vec::new();
+
+    for conjunct in items {
+        let mut p = ProgBuilder::new();
+        let reg = lower_expr(conjunct, scope, &mut p)?;
+        let prog = p.finish(reg);
+
+        match scope.pushable_range(&prog.columns()) {
+            Some(ri) => {
+                let offset = scope.ranges[ri].offset;
+                pushed[ri].push((conjunct, prog.rebase_columns(offset)?));
+            }
+            None => kept.push(prog),
+        }
+    }
+
+    for (ri, items) in pushed.into_iter().enumerate() {
+        if items.is_empty() {
+            continue;
+        }
+
+        let range = &scope.ranges[ri];
+        // 可下推的项一定有基表 `Scan`（`pushable_range` 保证）
+        let scan = range.scan.expect("可下推的项一定有基表 Scan");
+        let index = index_path(&items, range, scope)?;
+        let filter = and_all(items.into_iter().map(|(_, prog)| prog))?;
+
+        b.add_scan_filter(scan, filter)?;
+        if let Some(path) = index {
+            b.set_scan_index(scan, path)?;
+        }
+    }
+
+    match kept.is_empty() {
+        true => Ok(from_id),
+        false => b.filter(from_id, and_all(kept)?),
+    }
+}
+
+/// 从推到某一个 FROM 项的合取项里挑一条索引访问路径。
+///
+/// 只认 `<这一项的裸列> = <不读列的表达式>`（两侧反过来也行）：索引就是这一列的
+/// 「键 → 行号」，所以键必须是个**值**而不是列。键与索引列还必须同族，否则索引会
+/// 安静地漏行（`Plan::analyze` 还会再挡一次）。
+///
+/// 一项最多挑一条（多列索引不在本版范围内）。挑不出来就顺序扫描：慢，但不会错。
+fn index_path(items: &[(&Node, Prog)], range: &Range, scope: &Scope) -> Result<Option<IndexPath>> {
+    for (ast, _) in items {
+        let (lhs, rhs) = match equi_sides(ast) {
+            Some(sides) => sides,
+            None => continue,
+        };
+
+        // 哪一侧是「这一项的裸列」都行
+        for (column_node, key_node) in [(lhs, rhs), (rhs, lhs)] {
+            let Some(index) = bare_column(column_node, scope) else {
+                continue;
+            };
+            if !range.contains(index) {
+                continue;
+            }
+
+            let mut p = ProgBuilder::new();
+            let reg = lower_expr(key_node, scope, &mut p)?;
+            let key = p.finish(reg);
+            if !key.columns().is_empty() {
+                continue;
+            }
+
+            let column_family = match scope.column_type_at(index) {
+                Some(ty) => ty.family(),
+                None => continue,
+            };
+            let key_family = match key.verify(&range.columns)? {
+                ScalarType::Value(family) => family,
+                // 无类型 NULL（`x = NULL` 本来就是 UNKNOWN）与真值都不走索引
+                _ => continue,
+            };
+            if key_family != column_family {
+                continue;
+            }
+
+            return Ok(Some(IndexPath {
+                column: index - range.offset,
+                key,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 fn qualified_name(rv: &RangeVar) -> Result<String> {
@@ -1721,6 +1998,17 @@ struct Range {
     offset: usize,
     /// 列定义。
     columns: Vec<Column>,
+    /// 这一项对应的基表 `Scan` 节点。
+    ///
+    /// `None` 表示「不是 FROM 项」——现在只有 `ORDER BY` 的输出作用域是这种
+    /// （它只是拿来解名字的，没有基表）。
+    scan: Option<NodeId>,
+    /// 这一项落在某个 `LEFT JOIN` 的**可空侧**吗。
+    ///
+    /// 可空侧的列会被外连接补出来的 NULL 污染，于是「把只引用这一项的谓词推到它的
+    /// 基表 `Scan`」不再保语义：`WHERE b.y IS NULL` 就是反例——补出来的 NULL 也满足
+    /// 它，推下去那些行就没了。所以这些项一律不下推：宁可少优化，也不改语义。
+    nullable: bool,
 }
 
 impl Range {
@@ -1740,6 +2028,11 @@ impl Range {
     fn qualified(&self) -> String {
         self.alias.clone().unwrap_or_else(|| self.name.clone())
     }
+
+    /// 扁平下标是这一项的列吗。
+    fn contains(&self, index: usize) -> bool {
+        index >= self.offset && index < self.offset + self.columns.len()
+    }
 }
 
 /// 降级期的名字作用域。顺序必须与 [`Plan::analyze`] 推导的 schema 一致。
@@ -1749,13 +2042,20 @@ struct Scope {
 }
 
 impl Scope {
-    fn from_range(name: String, alias: Option<String>, columns: Vec<Column>) -> Self {
+    fn from_range(
+        name: String,
+        alias: Option<String>,
+        columns: Vec<Column>,
+        scan: Option<NodeId>,
+    ) -> Self {
         Scope {
             ranges: vec![Range {
                 name,
                 alias,
                 offset: 0,
                 columns,
+                scan,
+                nullable: false,
             }],
         }
     }
@@ -1767,6 +2067,34 @@ impl Scope {
             self.ranges.push(Range { offset, ..range });
         }
         self
+    }
+
+    /// 把**现在**这些项都标成可空侧（`LEFT JOIN` 的右支用它，见 [`Range::nullable`]）。
+    fn mark_nullable(&mut self) {
+        for range in &mut self.ranges {
+            range.nullable = true;
+        }
+    }
+
+    /// `cols` 全部落在**一个可以下推的** FROM 项里吗；是就返回那一项的下标。
+    ///
+    /// 这几种情况都给 `None`（谓词留在 `Filter` 里）：
+    ///
+    /// * 空集合（常量谓词，`WHERE 1 = 1`）——推下去也没收益；
+    /// * 列横跨多个 FROM 项——那只有连接本身判得了；
+    /// * 落在 `LEFT JOIN` 的可空侧，或者压根不是基表。
+    fn pushable_range(&self, cols: &BTreeSet<usize>) -> Option<usize> {
+        let first = *cols.iter().next()?;
+        let ri = self.ranges.iter().position(|range| range.contains(first))?;
+        let range = &self.ranges[ri];
+
+        if range.nullable || range.scan.is_none() {
+            return None;
+        }
+        if !cols.iter().all(|&index| range.contains(index)) {
+            return None;
+        }
+        Some(ri)
     }
 
     /// 扁平 schema。

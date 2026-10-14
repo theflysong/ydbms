@@ -5,14 +5,18 @@
 //! 所以再深的计划也不会爆栈。
 //!
 //! 每个节点产出的是一个 [`RowSource`]——一行一行拉的游标，不再是物化的表。上层拉一行，
-//! 下层才算一行。**只有三处会把行攒下来**：
+//! 下层才算一行。**只有这几处会把行攒下来**：
 //!
 //! * 需要**随机访问**的算子（`Sort`、`Aggregate` 必须先看完全部输入）；
 //! * 需要**重扫**的地方（嵌套循环连接的内侧、被多个父节点引用的节点）；
+//! * 哈希连接的 build 侧（抽干成 `键 → 行`）；
 //! * **最终结果**（[`execute`] 抽干 root 的那一步）。
 //!
+//! 索引嵌套循环**不在这张名单里**：它只建一份「键 → 行号」的索引，内侧的行按需
+//! 从基表取（见 [`crate::db::index`]）。
+//!
 //! 于是 `LIMIT` 之下不再被完整求值、连接不再为每一对候选行拼整行——详见
-//! `LimitSource` 与 `JoinSource`。
+//! `LimitSource`、`JoinSource`（嵌套循环）、`HashJoinSource` 与 `IndexJoinSource`。
 //!
 //! # 只从 root 出发
 //!
@@ -26,8 +30,10 @@
 //! 所以这类节点会被**物化一次**，每个消费者各拿一个 `SharedCursor`。
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::db::index::{Index, IndexSource};
 use crate::db::phys::PhysTab;
 use crate::db::source::{self, RowSource, TableCursor};
 use crate::db::table::{
@@ -35,7 +41,10 @@ use crate::db::table::{
 };
 
 use super::expr::{Prog, Scalar};
-use super::plan::{AggFunc, AggSpec, JoinKind, NodeId, Op, Plan, SortKey};
+use super::plan::{
+    passthrough_column, AggFunc, AggSpec, EqKey, IndexPath, JoinKind, JoinStrategy, NodeId, Op,
+    Plan, SortKey,
+};
 use super::symbol::SymbolTable;
 
 /// 构建拉取式的执行管道，返回 root 的行源。
@@ -78,7 +87,11 @@ pub fn execute_source<'a>(
         let source: Box<dyn RowSource + 'a> = match &node.op {
             Op::SingleRow => Box::new(SingleRowSource::new()),
 
-            Op::Scan { table, filter } => {
+            Op::Scan {
+                table,
+                filter,
+                index,
+            } => {
                 // `analyze` 已经查过这个名字，这里只是把表取出来
                 let relation =
                     symbols
@@ -86,7 +99,16 @@ pub fn execute_source<'a>(
                         .ok_or_else(|| DbError::UnknownSymbol {
                             name: table.clone(),
                         })?;
-                Box::new(ScanSource::new(relation, filter.as_ref(), id))
+                // 访问路径：索引（按键取行号）或顺序扫描
+                let base: Box<dyn RowSource + 'a> = match index {
+                    Some(path) => Box::new(IndexSource::new(
+                        relation,
+                        path.column,
+                        index_key(path, id)?,
+                    )),
+                    None => Box::new(TableCursor::new(relation)),
+                };
+                Box::new(ScanSource::new(base, filter.as_ref(), id))
             }
 
             Op::Filter { predicate } => Box::new(FilterSource::new(
@@ -102,14 +124,68 @@ pub fn execute_source<'a>(
                 id,
             )),
 
-            Op::Join { kind, on } => Box::new(JoinSource::new(
-                input(&mut done, node.inputs[0])?,
-                input(&mut done, node.inputs[1])?,
-                *kind,
-                on.as_ref(),
-                schema,
-                id,
-            )),
+            Op::Join {
+                kind,
+                on,
+                strategy,
+            } => {
+                let left = input(&mut done, node.inputs[0])?;
+
+                match strategy {
+                    JoinStrategy::NestedLoop => Box::new(JoinSource::new(
+                        left,
+                        input(&mut done, node.inputs[1])?,
+                        *kind,
+                        on.as_ref(),
+                        schema,
+                        id,
+                    )),
+
+                    JoinStrategy::Hash { keys } => Box::new(HashJoinSource::new(
+                        left,
+                        input(&mut done, node.inputs[1])?,
+                        *kind,
+                        on.as_ref(),
+                        keys,
+                        schema,
+                        id,
+                    )),
+
+                    JoinStrategy::IndexNestedLoop { key } => {
+                        // 内侧是基表 `Scan`（`analyze` 保证），索引直接建在基表上，
+                        // 于是**内侧的源根本不建、不抽干**。
+                        let (table, filter) = match &plan.nodes[node.inputs[1]].op {
+                            Op::Scan { table, filter, .. } => (table, filter.as_ref()),
+                            _ => {
+                                return Err(runtime(
+                                    id,
+                                    "索引嵌套循环的内侧不是基表 Scan".to_string(),
+                                ))
+                            }
+                        };
+                        let relation = symbols.relation(table).ok_or_else(|| {
+                            DbError::UnknownSymbol {
+                                name: table.clone(),
+                            }
+                        })?;
+                        let column = passthrough_column(&key.inner).ok_or_else(|| {
+                            runtime(id, "索引嵌套循环的内侧键不是裸列".to_string())
+                        })?;
+
+                        Box::new(IndexJoinSource::new(
+                            left,
+                            relation,
+                            column,
+                            filter,
+                            key,
+                            *kind,
+                            on.as_ref(),
+                            schema,
+                            id,
+                        ))
+                    }
+                }
+            }
 
             Op::Aggregate {
                 group_by, aggs, ..
@@ -264,18 +340,22 @@ impl RowSource for SingleRowSource {
     }
 }
 
-/// 扫描：基表按名字取出来，逐行跑已下推的谓词。
+/// 扫描：**访问路径**（顺序游标或索引）逐行给行，再逐行跑下推的谓词。
+///
+/// 索引只是访问路径：谓词照旧逐行求值，所以路径挑错也只是慢，不会算错。
 struct ScanSource<'a> {
-    cursor: TableCursor<'a>,
+    /// 访问路径：[`TableCursor`]（顺序）或 [`IndexSource`]（索引）。
+    base: Box<dyn RowSource + 'a>,
     filter: Option<&'a Prog>,
     node: NodeId,
     error: Option<DbError>,
 }
 
 impl<'a> ScanSource<'a> {
-    fn new(relation: &'a dyn Table, filter: Option<&'a Prog>, node: NodeId) -> Self {
+    /// `base` 给出的是**这张表自己的行**。
+    fn new(base: Box<dyn RowSource + 'a>, filter: Option<&'a Prog>, node: NodeId) -> Self {
         ScanSource {
-            cursor: TableCursor::new(relation),
+            base,
             filter,
             node,
             error: None,
@@ -285,11 +365,11 @@ impl<'a> ScanSource<'a> {
 
 impl RowSource for ScanSource<'_> {
     fn name(&self) -> &str {
-        self.cursor.name()
+        self.base.name()
     }
 
     fn columns(&self) -> &[Column] {
-        self.cursor.columns()
+        self.base.columns()
     }
 
     fn next(&mut self) -> Option<Row> {
@@ -298,7 +378,7 @@ impl RowSource for ScanSource<'_> {
         }
 
         loop {
-            let row = self.cursor.next()?;
+            let row = self.base.next()?;
             let keep = match self.filter {
                 Some(prog) => match prog.eval_truth(&row) {
                     Ok(truth) => truth.is_true(),
@@ -316,8 +396,8 @@ impl RowSource for ScanSource<'_> {
     }
 
     fn error(&self) -> Option<&DbError> {
-        // 基表短读的错误在游标里，谓词的错误在这里
-        self.error.as_ref().or_else(|| self.cursor.error())
+        // 访问路径的错误（短读、建索引失败）在 `base` 里，谓词的错误在这里
+        self.error.as_ref().or_else(|| self.base.error())
     }
 }
 
@@ -564,32 +644,25 @@ impl RowSource for JoinSource<'_> {
                 };
 
                 let left_row = self.current.as_ref().expect("上面刚填过");
-                let keep = match self.on {
-                    Some(prog) => match prog.eval_truth_split(left_row, &right_row) {
-                        Ok(truth) => truth.is_true(),
-                        Err(e) => {
-                            self.error = Some(e.into_db_error(Some(self.node)));
-                            return None;
-                        }
-                    },
-                    // 没有 ON 就是笛卡尔积
-                    None => true,
-                };
-
-                if keep {
-                    self.matched = true;
-                    let mut combined = left_row.clone();
-                    combined.extend(right_row);
-                    return Some(combined);
+                match on_matches(self.on, left_row, &right_row, self.node) {
+                    Err(e) => {
+                        self.error = Some(e);
+                        return None;
+                    }
+                    Ok(true) => {
+                        self.matched = true;
+                        return Some(combine(left_row, &right_row));
+                    }
+                    // 没有 ON 就是笛卡尔积；ON 不成立就试下一对
+                    Ok(false) => {}
                 }
                 continue;
             }
 
             // 内侧试完了：左外连接且一个都没配上，就把右支的列全填 NULL
             if self.kind == JoinKind::Left && !self.matched {
-                let mut combined = self.current.take().expect("上面刚填过");
-                combined.extend(std::iter::repeat(Value::Null).take(self.right_arity));
-                return Some(combined);
+                let left_row = self.current.take().expect("上面刚填过");
+                return Some(pad_right(left_row, self.right_arity));
             }
 
             // 换下一个左行
@@ -599,6 +672,434 @@ impl RowSource for JoinSource<'_> {
 
     fn error(&self) -> Option<&DbError> {
         // 内侧的错误在物化时已经收进 `self.error`，所以只往下问左支
+        self.error.as_ref().or_else(|| self.left.error())
+    }
+}
+
+// --------------------------------------------------------------- 连接：共用零件
+
+/// 连接输出的一行：`左 ++ 右`（与 `Join` 的 schema 规则严格一致）。
+fn combine(left: &[Value], right: &[Value]) -> Row {
+    let mut row = left.to_vec();
+    row.extend_from_slice(right);
+    row
+}
+
+/// 左外连接没配上对：把右支的列全填 NULL。
+fn pad_right(left: Row, right_arity: usize) -> Row {
+    let mut row = left;
+    row.extend(std::iter::repeat(Value::Null).take(right_arity));
+    row
+}
+
+/// `ON` 在这一对行上成立吗。`on` 是 `None` 表示无条件（笛卡尔积）。
+///
+/// 程序里的列下标按 **左 ++ 右** 编，用 [`Prog::eval_truth_split`] 直接在两半上求值，
+/// 不为每一对候选行拼整行。
+fn on_matches(
+    on: Option<&Prog>,
+    left: &[Value],
+    right: &[Value],
+    node: NodeId,
+) -> Result<bool> {
+    match on {
+        Some(prog) => prog
+            .eval_truth_split(left, right)
+            .map(|truth| truth.is_true())
+            .map_err(|e| e.into_db_error(Some(node))),
+        None => Ok(true),
+    }
+}
+
+/// 用 `keys` 里的一侧程序，在**那一支自己的行**上算出键值。
+///
+/// `pick` 决定取哪一半（`outer` 还是 `inner`）——两个程序各自面对自己那一支的
+/// schema，所以直接 `eval`，不必知道对方的宽度。
+fn key_of<'k>(
+    keys: &'k [EqKey],
+    pick: impl Fn(&'k EqKey) -> &'k Prog,
+    row: &[Value],
+    node: NodeId,
+) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = pick(key)
+            .eval(row)
+            .map_err(|e| e.into_db_error(Some(node)))?
+            .to_value()
+            .ok_or_else(|| runtime(node, "连接键不能是真值".to_string()))?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// 索引路径的键：在**没有输入行**的前提下求值（`analyze` 保证它不读列）。
+fn index_key(path: &IndexPath, node: NodeId) -> Result<Value> {
+    path.key
+        .eval(&[])
+        .map_err(|e| e.into_db_error(Some(node)))?
+        .to_value()
+        .ok_or_else(|| runtime(node, "索引的键不能是真值".to_string()))
+}
+
+// ------------------------------------------------------------- 连接：哈希
+
+/// 哈希连接。
+///
+/// **build 侧 = 内侧（右支）**：第一次拉取时把它抽干成 `键 → 行`（键取内侧的
+/// 等值键程序）。**probe 侧 = 外侧（左支）**，全程流式：每个左行算出键、查桶，
+/// 桶里的每一行再**复核整条 `ON`**——等值键只用来缩小候选集，正确性由复核兜底。
+///
+/// 行序 = 外侧顺序 × 桶内插入顺序（桶是 `Vec`），于是与嵌套循环**逐行一致**；
+/// 哈希表本身从不被遍历，所以它的迭代顺序不影响结果。
+struct HashJoinSource<'a> {
+    left: Box<dyn RowSource + 'a>,
+    /// 内侧（右支）。第一次拉取时抽干成 `table`。
+    right: Option<Box<dyn RowSource + 'a>>,
+    kind: JoinKind,
+    on: Option<&'a Prog>,
+    keys: &'a [EqKey],
+    shape: ColumnsShape,
+    node: NodeId,
+    error: Option<DbError>,
+    /// 建好的哈希表；`None` 表示还没建。
+    table: Option<HashMap<Vec<Value>, Vec<Row>>>,
+    /// 内侧的列数（左外连接补 NULL 要用）。
+    right_arity: usize,
+    /// 正在配对的左行。
+    current: Option<Row>,
+    /// 当前左行的候选行。
+    candidates: Vec<Row>,
+    /// 候选行扫到第几行。
+    at: usize,
+    /// 当前左行匹配上了没有。
+    matched: bool,
+}
+
+impl<'a> HashJoinSource<'a> {
+    fn new(
+        left: Box<dyn RowSource + 'a>,
+        right: Box<dyn RowSource + 'a>,
+        kind: JoinKind,
+        on: Option<&'a Prog>,
+        keys: &'a [EqKey],
+        shape: ColumnsShape,
+        node: NodeId,
+    ) -> Self {
+        HashJoinSource {
+            left,
+            right: Some(right),
+            kind,
+            on,
+            keys,
+            shape,
+            node,
+            error: None,
+            table: None,
+            right_arity: 0,
+            current: None,
+            candidates: Vec::new(),
+            at: 0,
+            matched: false,
+        }
+    }
+
+    /// 抽干内侧、建哈希表。失败记进 `self.error`。
+    fn fill(&mut self) -> Result<()> {
+        let mut right = self
+            .right
+            .take()
+            .ok_or_else(|| runtime(self.node, "内侧已经被抽干过".to_string()))?;
+
+        self.right_arity = right.columns().len();
+        let mut table: HashMap<Vec<Value>, Vec<Row>> = HashMap::new();
+
+        while let Some(row) = right.next() {
+            let key = key_of(self.keys, |k| &k.inner, &row, self.node)?;
+            table.entry(key).or_default().push(row);
+        }
+        if let Some(e) = right.error() {
+            return Err(e.clone());
+        }
+
+        self.table = Some(table);
+        Ok(())
+    }
+}
+
+impl RowSource for HashJoinSource<'_> {
+    fn name(&self) -> &str {
+        "<hash join>"
+    }
+
+    fn columns(&self) -> &[Column] {
+        self.shape.columns()
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        if self.error.is_some() {
+            return None;
+        }
+
+        if self.table.is_none() {
+            if let Err(e) = self.fill() {
+                self.error = Some(e);
+                return None;
+            }
+        }
+
+        loop {
+            // 手里得先有一个左行，并把它要看的候选行捞出来
+            if self.current.is_none() {
+                let row = self.left.next()?;
+
+                let key = match key_of(self.keys, |k| &k.outer, &row, self.node) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        self.error = Some(e);
+                        return None;
+                    }
+                };
+
+                // 键里有 NULL 就一个都配不上（`NULL = x` 是 UNKNOWN）
+                let candidates = if key.iter().any(Value::is_null) {
+                    Vec::new()
+                } else {
+                    self.table
+                        .as_ref()
+                        .and_then(|table| table.get(&key))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+
+                self.candidates = candidates;
+                self.at = 0;
+                self.matched = false;
+                self.current = Some(row);
+            }
+
+            if self.at < self.candidates.len() {
+                let right_row = self.candidates[self.at].clone();
+                self.at += 1;
+
+                let left_row = self.current.as_ref().expect("上面刚填过");
+                match on_matches(self.on, left_row, &right_row, self.node) {
+                    Err(e) => {
+                        self.error = Some(e);
+                        return None;
+                    }
+                    Ok(true) => {
+                        self.matched = true;
+                        return Some(combine(left_row, &right_row));
+                    }
+                    Ok(false) => {}
+                }
+                continue;
+            }
+
+            // 候选试完了：左外连接且一个都没配上，就补 NULL
+            if self.kind == JoinKind::Left && !self.matched {
+                let left_row = self.current.take().expect("上面刚填过");
+                return Some(pad_right(left_row, self.right_arity));
+            }
+
+            self.current = None;
+        }
+    }
+
+    fn error(&self) -> Option<&DbError> {
+        // 内侧的错误在 build 时已经收进 `self.error`，所以只往下问左支
+        self.error.as_ref().or_else(|| self.left.error())
+    }
+}
+
+// --------------------------------------------------------- 连接：索引嵌套循环
+
+/// 索引嵌套循环。
+///
+/// 内侧是**基表 `Scan`**：给它建一次「键 → 行号」的索引（见 [`Index`]），外侧
+/// 每行按键查一次，只把命中的行从基表取出来。于是内侧**不物化**——这是它与哈希
+/// 连接真正的区别（哈希要复制整行，索引只存键与行号）。
+///
+/// 内侧 `Scan` 自己的 `filter` 由这里逐行复核（它的源没被建过）；`ON` 照旧整条复核。
+/// 索引桶里的行号是升序的，所以行序仍与嵌套循环一致。
+struct IndexJoinSource<'a> {
+    left: Box<dyn RowSource + 'a>,
+    /// 内侧的基表。
+    table: &'a dyn Table,
+    /// 索引建在哪一列。
+    column: usize,
+    /// 内侧 `Scan` 下推的谓词（取到行之后复核）。
+    filter: Option<&'a Prog>,
+    /// 等值键；只用它的 `outer`（内侧那一半就是上面那一列）。
+    key: &'a EqKey,
+    kind: JoinKind,
+    on: Option<&'a Prog>,
+    shape: ColumnsShape,
+    node: NodeId,
+    error: Option<DbError>,
+    /// 建好的索引；`None` 表示还没建。
+    index: Option<Index>,
+    /// 内侧的列数（左外连接补 NULL 要用）。
+    right_arity: usize,
+    /// 正在配对的左行。
+    current: Option<Row>,
+    /// 当前左行命中内侧的行号。
+    rids: Vec<usize>,
+    /// 行号扫到第几个。
+    at: usize,
+    /// 当前左行匹配上了没有。
+    matched: bool,
+}
+
+impl<'a> IndexJoinSource<'a> {
+    fn new(
+        left: Box<dyn RowSource + 'a>,
+        table: &'a dyn Table,
+        column: usize,
+        filter: Option<&'a Prog>,
+        key: &'a EqKey,
+        kind: JoinKind,
+        on: Option<&'a Prog>,
+        shape: ColumnsShape,
+        node: NodeId,
+    ) -> Self {
+        IndexJoinSource {
+            left,
+            table,
+            column,
+            filter,
+            key,
+            kind,
+            on,
+            shape,
+            node,
+            error: None,
+            index: None,
+            // 内侧就是这张表的 `Scan`，所以它的列数就是表的元数
+            right_arity: table.arity(),
+            current: None,
+            rids: Vec::new(),
+            at: 0,
+            matched: false,
+        }
+    }
+
+    /// 建索引。失败记进 `self.error`。
+    fn fill(&mut self) -> Result<()> {
+        self.index = Some(Index::build(self.table, self.column)?);
+        Ok(())
+    }
+
+    /// 当前左行在内侧命中的行号。
+    fn lookup(&self, left_row: &[Value]) -> Result<Vec<usize>> {
+        let key = self
+            .key
+            .outer
+            .eval(left_row)
+            .map_err(|e| e.into_db_error(Some(self.node)))?
+            .to_value()
+            .ok_or_else(|| runtime(self.node, "索引嵌套循环的键不能是真值".to_string()))?;
+
+        // 键是 NULL 就一个都配不上（`NULL = x` 是 UNKNOWN）
+        if key.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let index = self.index.as_ref().expect("上面刚建过");
+        Ok(index.lookup(&key).to_vec())
+    }
+}
+
+impl RowSource for IndexJoinSource<'_> {
+    fn name(&self) -> &str {
+        "<index join>"
+    }
+
+    fn columns(&self) -> &[Column] {
+        self.shape.columns()
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        if self.error.is_some() {
+            return None;
+        }
+
+        if self.index.is_none() {
+            if let Err(e) = self.fill() {
+                self.error = Some(e);
+                return None;
+            }
+        }
+
+        loop {
+            if self.current.is_none() {
+                let row = self.left.next()?;
+                match self.lookup(&row) {
+                    Ok(rids) => self.rids = rids,
+                    Err(e) => {
+                        self.error = Some(e);
+                        return None;
+                    }
+                }
+                self.at = 0;
+                self.matched = false;
+                self.current = Some(row);
+            }
+
+            if self.at < self.rids.len() {
+                let rid = self.rids[self.at];
+                self.at += 1;
+
+                let right_row = match self.table.row(rid) {
+                    Some(row) => row,
+                    None => {
+                        self.error = Some(runtime(
+                            self.node,
+                            format!("读不到内侧第 {} 行", rid),
+                        ));
+                        return None;
+                    }
+                };
+
+                // 内侧 Scan 自己的谓词照旧要过
+                if let Some(filter) = self.filter {
+                    match filter.eval_truth(&right_row) {
+                        Ok(truth) if truth.is_true() => {}
+                        Ok(_) => continue,
+                        Err(e) => {
+                            self.error = Some(e.into_db_error(Some(self.node)));
+                            return None;
+                        }
+                    }
+                }
+
+                let left_row = self.current.as_ref().expect("上面刚填过");
+                match on_matches(self.on, left_row, &right_row, self.node) {
+                    Err(e) => {
+                        self.error = Some(e);
+                        return None;
+                    }
+                    Ok(true) => {
+                        self.matched = true;
+                        return Some(combine(left_row, &right_row));
+                    }
+                    Ok(false) => {}
+                }
+                continue;
+            }
+
+            if self.kind == JoinKind::Left && !self.matched {
+                let left_row = self.current.take().expect("上面刚填过");
+                return Some(pad_right(left_row, self.right_arity));
+            }
+
+            self.current = None;
+        }
+    }
+
+    fn error(&self) -> Option<&DbError> {
+        // 建索引与取行的错误都在 `self.error`，所以只往下问左支
         self.error.as_ref().or_else(|| self.left.error())
     }
 }

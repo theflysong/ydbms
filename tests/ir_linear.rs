@@ -11,8 +11,8 @@
 use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Table, TabShape, Value};
 use ydbms::db::PhysTab;
 use ydbms::ir::{
-    execute, BinOp, JoinKind, Node, Op, Plan, PlanBuilder, Prog, ProgBuilder, SortKey, Step,
-    Symbol, SymbolTable, UnOp,
+    execute, BinOp, JoinKind, JoinStrategy, Node, Op, Plan, PlanBuilder, Prog, ProgBuilder, SortKey,
+    Step, Symbol, SymbolTable, UnOp,
 };
 
 const X_MIN: i32 = -5;
@@ -383,7 +383,7 @@ fn inner_join_on_equality() {
     let eq = p.binary(BinOp::Eq, x, id);
     let on = p.finish(eq);
 
-    let j = b.join(left, right, JoinKind::Inner, Some(on)).unwrap();
+    let j = b.join(left, right, JoinKind::Inner, Some(on), JoinStrategy::NestedLoop).unwrap();
     let plan = b.finish(j).unwrap();
 
     let out = execute(&plan, &symbols).unwrap();
@@ -425,7 +425,7 @@ fn join_with_an_empty_side_yields_nothing() {
     let eq = p.binary(BinOp::Eq, x, id);
     let on = p.finish(eq);
 
-    let j = b.join(left, right, JoinKind::Inner, Some(on)).unwrap();
+    let j = b.join(left, right, JoinKind::Inner, Some(on), JoinStrategy::NestedLoop).unwrap();
     let plan = b.finish(j).unwrap();
 
     assert_eq!(execute(&plan, &symbols).unwrap().nrows(), 0);
@@ -439,7 +439,7 @@ fn join_without_condition_is_a_cross_product() {
     let mut b = PlanBuilder::new();
     let left = b.scan("f");
     let right = b.scan("t");
-    let j = b.join(left, right, JoinKind::Inner, None).unwrap();
+    let j = b.join(left, right, JoinKind::Inner, None, JoinStrategy::NestedLoop).unwrap();
     let plan = b.finish(j).unwrap();
 
     let out = execute(&plan, &symbols).unwrap();

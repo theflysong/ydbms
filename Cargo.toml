@@ -14,3 +14,4 @@ bigdecimal = "0.4.11"
 # 交互式终端的行编辑（补全、多行、历史）。只要行编辑本体：
 # 不开 with-file-history（历史只在内存里）、不开 with-dirs、不开自定义键位。
 rustyline = { version = "18", default-features = false }
+regex = "1.13.1"

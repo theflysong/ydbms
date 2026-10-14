@@ -14,7 +14,8 @@ use ydbms::db::source::{drain, materialize, RowSource, TableCursor};
 use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, TabShape, Table, Value};
 use ydbms::db::PhysTab;
 use ydbms::ir::{
-    execute, execute_source, BinOp, JoinKind, PlanBuilder, ProgBuilder, SortKey, SymbolTable,
+    execute, execute_source, BinOp, JoinKind, JoinStrategy, PlanBuilder, ProgBuilder, SortKey,
+    SymbolTable,
 };
 
 /// 一张会数自己 `row()` 被调过几次的表。
@@ -248,7 +249,7 @@ fn a_node_with_two_consumers_is_materialized_once() {
     let mut b = PlanBuilder::new();
     let s = b.scan("t");
     // **同一个**节点当左右两支：它有两个消费者
-    let j = b.join(s, s, JoinKind::Inner, None).unwrap();
+    let j = b.join(s, s, JoinKind::Inner, None, JoinStrategy::NestedLoop).unwrap();
     let plan = b.finish(j).unwrap();
 
     let out = execute(&plan, &symbols).unwrap();
@@ -265,7 +266,7 @@ fn two_separate_scans_read_the_table_twice() {
     // 两个**各自独立**的 Scan 节点：没有共享，各自拉各自的
     let left = b.scan("t");
     let right = b.scan("t");
-    let j = b.join(left, right, JoinKind::Inner, None).unwrap();
+    let j = b.join(left, right, JoinKind::Inner, None, JoinStrategy::NestedLoop).unwrap();
     let plan = b.finish(j).unwrap();
 
     let out = execute(&plan, &symbols).unwrap();

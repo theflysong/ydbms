@@ -97,6 +97,14 @@ impl Table for PhysTab {
         self.rows.get(r).cloned()
     }
 
+    /// 单格读取：只克隆**一个**值，不克隆整行。
+    ///
+    /// 默认实现走 [`Table::row`]（整行克隆）。索引建表要逐行读**一列**
+    /// （见 [`crate::db::index`]），所以这个覆盖是有意义的。
+    fn value(&self, r: usize, c: usize) -> Option<Value> {
+        self.cell_ref(r, c).cloned()
+    }
+
     fn insert(&mut self, row: Row) -> Result<usize> {
         // 先校验再落库：校验失败不会留下半行脏数据。
         self.validate(&row)?;
