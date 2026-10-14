@@ -6,3 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+pg_query = "6.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.4"
+bigdecimal = "0.4.11"
+# 交互式终端的行编辑（补全、多行、历史）。只要行编辑本体：
+# 不开 with-file-history（历史只在内存里）、不开 with-dirs、不开自定义键位。
+rustyline = { version = "18", default-features = false }

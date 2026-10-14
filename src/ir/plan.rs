@@ -1,0 +1,729 @@
+//! 线性计划 IR：一个扁平的节点数组。
+//!
+//! 计划**不是树**，而是 `Vec<Node>` + 一个 `root` 下标。节点之间的边是**下标**：
+//! [`Node::inputs`] 里放的是更早的节点号。
+//!
+//! # 枢纽不变量 I1
+//!
+//! > 每个节点的 `inputs` 里所有下标，必须**严格小于**该节点自身的下标。
+//!
+//! 这一条同时给出三件事：
+//!
+//! 1. 图**无环**（只可能指向过去）；
+//! 2. 正向扫描时，操作数一定已经算好了；
+//! 3. 于是 **schema 推导与执行都是对一个数组的正向 `for` 循环**，不需要递归
+//!    遍历（深计划也不会爆栈）。
+//!
+//! `explain` 从 `root` 顺着 `inputs` 反向走，用显式栈而不是递归。
+//!
+//! # 允许不可达节点
+//!
+//! `nodes` 里存在从 `root` 走不到的节点是**合法**的：将来的重写会把旧节点
+//! 孤立在数组里。`analyze` / `execute` / `explain` 都只从 `root` 出发。
+
+use crate::db::table::{Column, DataType, DbError, Result, TypeFamily};
+
+use super::expr::{Prog, ScalarType, Step};
+use super::symbol::SymbolTable;
+
+/// 节点号，同时是它在 [`Plan::nodes`] 里的下标。
+pub type NodeId = usize;
+
+/// 连接类型。本版只做内连接。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// 内连接。
+    Inner,
+    /// 左外连接：左行的匹配行一个都没有时，右支的列全部填 NULL。
+    Left,
+}
+
+impl JoinKind {
+    /// 渲染用的名字。
+    pub fn name(&self) -> &'static str {
+        match self {
+            JoinKind::Inner => "inner",
+            JoinKind::Left => "left",
+        }
+    }
+}
+
+/// 聚合函数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    /// `COUNT(*)` / `COUNT(x)` / `COUNT(DISTINCT x)`
+    Count,
+    /// `SUM(x)`
+    Sum,
+    /// `AVG(x)`
+    Avg,
+    /// `MIN(x)`
+    Min,
+    /// `MAX(x)`
+    Max,
+}
+
+impl AggFunc {
+    /// 渲染用的名字。
+    pub fn name(&self) -> &'static str {
+        match self {
+            AggFunc::Count => "COUNT",
+            AggFunc::Sum => "SUM",
+            AggFunc::Avg => "AVG",
+            AggFunc::Min => "MIN",
+            AggFunc::Max => "MAX",
+        }
+    }
+
+    /// 结果类型。`arg` 是参数的类型（`COUNT(*)` 没有参数）。
+    pub fn result_type(&self, arg: Option<ScalarType>) -> ScalarType {
+        match self {
+            AggFunc::Count => ScalarType::Value(TypeFamily::Int),
+            // 整数求平均在 PostgreSQL 里也返回 numeric
+            AggFunc::Avg => ScalarType::Value(TypeFamily::Numeric),
+            AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+                arg.unwrap_or(ScalarType::Value(TypeFamily::Int))
+            }
+        }
+    }
+}
+
+/// 一个聚合：函数 + 参数（**按输入行**求值的程序）+ 是否 DISTINCT。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggSpec {
+    /// 用哪个聚合函数。
+    pub func: AggFunc,
+    /// 参数程序。`COUNT(*)` 没有参数。
+    pub arg: Option<Prog>,
+    /// 是不是 `COUNT(DISTINCT x)`。
+    pub distinct: bool,
+}
+
+/// 一个排序键。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    /// 取值的程序。输入是 `Sort` 的输入 schema。
+    pub prog: Prog,
+    /// 是否降序。
+    pub desc: bool,
+    /// NULL 排在最前吗。
+    ///
+    /// 这是**绝对位置**，不受 `desc` 影响——PostgreSQL 的默认是
+    /// ASC → NULLS LAST、DESC → NULLS FIRST，降级时就算好了填进来。
+    pub nulls_first: bool,
+}
+
+/// 算子。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    /// 从符号表按名字取表；`filter` 是**已经下推到存储**的谓词。
+    Scan {
+        /// 符号表里的名字。
+        table: String,
+        /// 下推到扫描的谓词；输入是这张表的列。
+        filter: Option<Prog>,
+    },
+    /// 选择。
+    Filter {
+        /// 谓词；输入是下层节点的 schema。
+        predicate: Prog,
+    },
+    /// 投影。
+    Project {
+        /// 每个输出列一个程序；输入是下层节点的 schema。
+        progs: Vec<Prog>,
+        /// 输出列名。
+        names: Vec<String>,
+    },
+    /// 连接。
+    Join {
+        /// 连接类型。
+        kind: JoinKind,
+        /// 连接条件；输入是 **左 schema ++ 右 schema**。
+        on: Option<Prog>,
+    },
+    /// 分组聚合。
+    ///
+    /// 输出 schema = `[group_by 的列...] ++ [聚合的结果列...]`，上面接
+    /// `Filter`(HAVING) 与 `Project`。`group_by` 与每个聚合的 `arg` 都是
+    /// **按输入行**求值的程序；聚合结果靠**位置**被上层引用。
+    Aggregate {
+        /// 分组键（按输入行求值）。
+        group_by: Vec<Prog>,
+        /// 聚合列表。
+        aggs: Vec<AggSpec>,
+        /// 输出列名：先是 group_by 的，再是聚合的。
+        names: Vec<String>,
+    },
+    /// 排序。
+    Sort {
+        /// 排序键。
+        keys: Vec<SortKey>,
+    },
+    /// 截断。
+    Limit {
+        /// 最多取多少行；`None` 表示不限制。
+        limit: Option<u64>,
+        /// 先跳过多少行。
+        offset: u64,
+    },
+    /// 单行零列的关系。`SELECT 1 + 1` 这种没有 FROM 的查询用它当底座。
+    SingleRow,
+}
+
+impl Op {
+    /// 这个算子需要几个输入。
+    pub fn input_arity(&self) -> usize {
+        match self {
+            Op::Scan { .. } | Op::SingleRow => 0,
+            Op::Filter { .. }
+            | Op::Project { .. }
+            | Op::Sort { .. }
+            | Op::Limit { .. }
+            | Op::Aggregate { .. } => 1,
+            Op::Join { .. } => 2,
+        }
+    }
+
+    /// 渲染用的名字。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Op::Scan { .. } => "Scan",
+            Op::Filter { .. } => "Filter",
+            Op::Project { .. } => "Project",
+            Op::Aggregate { .. } => "Aggregate",
+            Op::Join { .. } => "Join",
+            Op::Sort { .. } => "Sort",
+            Op::Limit { .. } => "Limit",
+            Op::SingleRow => "SingleRow",
+        }
+    }
+}
+
+/// 计划里的一个节点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    /// 算子。
+    pub op: Op,
+    /// 输入节点的下标。**不变量 I1**：全部严格小于本节点自身的下标。
+    pub inputs: Vec<NodeId>,
+}
+
+/// 线性计划。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// 扁平节点数组，下标即 [`NodeId`]。
+    pub nodes: Vec<Node>,
+    /// 结果所在节点的下标。
+    pub root: NodeId,
+}
+
+/// [`Plan::analyze`] 的产物。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Analysis {
+    /// 每个节点的输出 schema，下标即 [`NodeId`]。
+    pub schemas: Vec<Vec<Column>>,
+    /// 每个节点上「程序所面对」的输入 schema。
+    ///
+    /// `Scan` 是它自己那张表的列，`Join` 是左 ++ 右，`Filter`/`Project`/`Sort`
+    /// 是下层节点的 schema，`Limit`/`SingleRow` 没有程序所以是 `None`。
+    pub program_inputs: Vec<Option<Vec<Column>>>,
+}
+
+impl Analysis {
+    /// 某个节点上程序所面对的输入 schema；没有程序则返回空切片。
+    pub fn program_input(&self, id: NodeId) -> &[Column] {
+        self.program_inputs
+            .get(id)
+            .and_then(|s| s.as_deref())
+            .unwrap_or(&[])
+    }
+}
+
+impl Plan {
+    /// 一次正向扫描，把该检查的全检查了。
+    ///
+    /// 顺序读一遍 `nodes`（靠 I1，操作数一定在前）：
+    ///
+    /// * 输入个数与算子匹配、输入下标严格小于自身下标；
+    /// * 每个程序 [`Prog::verify`]（寄存器先定义后使用、列下标不越界、类型正确）；
+    /// * 谓词必须是 `BOOL`、排序键与结果列必须是 `INT`；
+    /// * 推导出每个节点的输出 schema。
+    pub fn analyze(&self, symbols: &SymbolTable) -> Result<Analysis> {
+        if self.nodes.is_empty() {
+            return Err(DbError::IrInvalid {
+                node: None,
+                message: "计划里没有任何节点".to_string(),
+            });
+        }
+        if self.root >= self.nodes.len() {
+            return Err(DbError::IrInvalid {
+                node: None,
+                message: format!("root {} 越界（共 {} 个节点）", self.root, self.nodes.len()),
+            });
+        }
+
+        let mut schemas: Vec<Vec<Column>> = Vec::with_capacity(self.nodes.len());
+        let mut program_inputs: Vec<Option<Vec<Column>>> = Vec::with_capacity(self.nodes.len());
+
+        for (id, node) in self.nodes.iter().enumerate() {
+            let want = node.op.input_arity();
+            if node.inputs.len() != want {
+                return Err(invalid(id, format!(
+                    "{} 需要 {} 个输入，实际给了 {}",
+                    node.op.name(),
+                    want,
+                    node.inputs.len()
+                )));
+            }
+            for &input in &node.inputs {
+                if input >= id {
+                    return Err(invalid(id, format!(
+                        "输入下标 {} 必须严格小于自身下标 {}（不变量 I1：拓扑序）",
+                        input, id
+                    )));
+                }
+            }
+
+            let (schema, program_input) = match &node.op {
+                Op::SingleRow => (Vec::new(), None),
+
+                Op::Scan { table, filter } => {
+                    let columns = symbols
+                        .columns(table)
+                        .ok_or_else(|| DbError::UnknownSymbol {
+                            name: table.clone(),
+                        })?
+                        .to_vec();
+                    if let Some(prog) = filter {
+                        let ty = prog.verify(&columns).map_err(|e| at(id, e))?;
+                        expect(ty, ScalarType::Bool, id, "Scan.filter")?;
+                    }
+                    (columns.clone(), Some(columns))
+                }
+
+                Op::Filter { predicate } => {
+                    let input = schemas[node.inputs[0]].clone();
+                    let ty = predicate.verify(&input).map_err(|e| at(id, e))?;
+                    expect(ty, ScalarType::Bool, id, "Filter.predicate")?;
+                    (input.clone(), Some(input))
+                }
+
+                Op::Project { progs, names } => {
+                    let input = schemas[node.inputs[0]].clone();
+                    if progs.is_empty() {
+                        return Err(invalid(id, "Project 至少要有 1 个输出列".to_string()));
+                    }
+                    if progs.len() != names.len() {
+                        return Err(invalid(id, format!(
+                            "Project 有 {} 个表达式，却有 {} 个名字",
+                            progs.len(),
+                            names.len()
+                        )));
+                    }
+                    let mut columns = Vec::with_capacity(progs.len());
+                    for (prog, name) in progs.iter().zip(names.iter()) {
+                        columns.push(project_column(prog, name, &input).map_err(|e| at(id, e))?);
+                    }
+                    (columns.clone(), Some(input))
+                }
+
+                Op::Aggregate {
+                    group_by,
+                    aggs,
+                    names,
+                } => {
+                    let input = schemas[node.inputs[0]].clone();
+
+                    if names.len() != group_by.len() + aggs.len() {
+                        return Err(invalid(id, format!(
+                            "Aggregate 的 {} 个输出列对不上 {} 个分组键 + {} 个聚合",
+                            names.len(),
+                            group_by.len(),
+                            aggs.len()
+                        )));
+                    }
+
+                    let mut columns = Vec::with_capacity(names.len());
+
+                    for (prog, name) in group_by.iter().zip(names.iter()) {
+                        columns.push(project_column(prog, name, &input).map_err(|e| at(id, e))?);
+                    }
+
+                    for (spec, name) in aggs.iter().zip(names.iter().skip(group_by.len())) {
+                        let arg = match &spec.arg {
+                            Some(prog) => Some(prog.verify(&input).map_err(|e| at(id, e))?),
+                            None => None,
+                        };
+                        let ty = spec.func.result_type(arg);
+                        columns.push(Column::new(
+                            name.clone(),
+                            scalar_default_type(ty, id, &format!("{}({})", spec.func.name(), name))?,
+                        ));
+                    }
+
+                    (columns.clone(), Some(input))
+                }
+
+                Op::Join { kind, on } => {
+                    let mut input = schemas[node.inputs[0]].clone();
+                    let mut right = schemas[node.inputs[1]].clone();
+
+                    // 左外连接里，没匹配上的行会让**右支所有列**变成 NULL。
+                    // 所以右支的 NOT NULL 不能带过来——带过来就会在真正产生
+                    // 外连接 NULL 的时候报"列声明了 NOT NULL"，把合法结果判成错。
+                    if *kind == JoinKind::Left {
+                        for column in &mut right {
+                            column.not_null = false;
+                        }
+                    }
+
+                    input.extend(right);
+                    if let Some(prog) = on {
+                        let ty = prog.verify(&input).map_err(|e| at(id, e))?;
+                        expect(ty, ScalarType::Bool, id, "Join.on")?;
+                    }
+                    (input.clone(), Some(input))
+                }
+
+                Op::Sort { keys } => {
+                    let input = schemas[node.inputs[0]].clone();
+                    if keys.is_empty() {
+                        return Err(invalid(id, "Sort 至少要有 1 个排序键".to_string()));
+                    }
+                    for key in keys {
+                        let ty = key.prog.verify(&input).map_err(|e| at(id, e))?;
+                        // 排序键可以是任何**可存储**类型（文本按字典序、时间戳按
+                        // 定宽文本、NUMERIC 按手写的定点比较）；只有布尔不行。
+                        if matches!(ty, ScalarType::Bool) {
+                            return Err(invalid(
+                                id,
+                                format!("排序键必须是可存储的值，实际是 {}", ty),
+                            ));
+                        }
+                    }
+                    (input.clone(), Some(input))
+                }
+
+                Op::Limit { .. } => (schemas[node.inputs[0]].clone(), None),
+            };
+
+            schemas.push(schema);
+            program_inputs.push(program_input);
+        }
+
+        Ok(Analysis {
+            schemas,
+            program_inputs,
+        })
+    }
+
+    /// root 的输出 schema。
+    pub fn schema(&self, symbols: &SymbolTable) -> Result<Vec<Column>> {
+        let analysis = self.analyze(symbols)?;
+        Ok(analysis.schemas[self.root].clone())
+    }
+
+    /// 把计划渲染成一棵可读的树（用显式栈，不递归）。
+    pub fn explain(&self, symbols: &SymbolTable) -> Result<String> {
+        let analysis = self.analyze(symbols)?;
+        let mut out = String::new();
+        let mut stack: Vec<(NodeId, usize)> = vec![(self.root, 0)];
+
+        while let Some((id, depth)) = stack.pop() {
+            let node = &self.nodes[id];
+            out.push_str(&"  ".repeat(depth));
+            out.push_str(&render(id, node, &analysis));
+            out.push('\n');
+            // 倒着压栈，弹出顺序才与 inputs 的顺序一致
+            for &child in node.inputs.iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+/// 增量构建 [`Plan`]，顺手挡住坏结构。
+///
+/// 每个 `push` 都校验输入下标严格小于新节点下标（不变量 I1）；`finish` 校验
+/// `root` 不越界。输入个数本来就由各方法固定，所以那一条在这里不可能出错。
+#[derive(Debug, Default)]
+pub struct PlanBuilder {
+    nodes: Vec<Node>,
+}
+
+impl PlanBuilder {
+    /// 空构建器。
+    pub fn new() -> Self {
+        PlanBuilder { nodes: Vec::new() }
+    }
+
+    /// 当前已有多少节点（也就是下一个节点的下标）。
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// 构建器里还没有节点。
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// 压入一个节点，返回它的下标。
+    pub fn push(&mut self, op: Op, inputs: Vec<NodeId>) -> Result<NodeId> {
+        let id = self.nodes.len();
+        if inputs.len() != op.input_arity() {
+            return Err(invalid(id, format!(
+                "{} 需要 {} 个输入，实际给了 {}",
+                op.name(),
+                op.input_arity(),
+                inputs.len()
+            )));
+        }
+        for &input in &inputs {
+            if input >= id {
+                return Err(invalid(id, format!(
+                    "输入下标 {} 必须严格小于新节点下标 {}（不变量 I1：拓扑序）",
+                    input, id
+                )));
+            }
+        }
+        self.nodes.push(Node { op, inputs });
+        Ok(id)
+    }
+
+    /// 扫描一张表。
+    pub fn scan(&mut self, table: &str) -> NodeId {
+        self.nodes.push(Node {
+            op: Op::Scan {
+                table: table.to_string(),
+                filter: None,
+            },
+            inputs: Vec::new(),
+        });
+        self.nodes.len() - 1
+    }
+
+    /// 扫描一张表，并把谓词下推到存储。
+    pub fn scan_with_filter(&mut self, table: &str, filter: Prog) -> NodeId {
+        self.nodes.push(Node {
+            op: Op::Scan {
+                table: table.to_string(),
+                filter: Some(filter),
+            },
+            inputs: Vec::new(),
+        });
+        self.nodes.len() - 1
+    }
+
+    /// 单行零列。
+    pub fn single_row(&mut self) -> NodeId {
+        self.nodes.push(Node {
+            op: Op::SingleRow,
+            inputs: Vec::new(),
+        });
+        self.nodes.len() - 1
+    }
+
+    /// 选择。
+    pub fn filter(&mut self, input: NodeId, predicate: Prog) -> Result<NodeId> {
+        self.push(Op::Filter { predicate }, vec![input])
+    }
+
+    /// 投影。
+    pub fn project(
+        &mut self,
+        input: NodeId,
+        progs: Vec<Prog>,
+        names: Vec<String>,
+    ) -> Result<NodeId> {
+        self.push(Op::Project { progs, names }, vec![input])
+    }
+
+    /// 连接。
+    pub fn join(
+        &mut self,
+        left: NodeId,
+        right: NodeId,
+        kind: JoinKind,
+        on: Option<Prog>,
+    ) -> Result<NodeId> {
+        self.push(Op::Join { kind, on }, vec![left, right])
+    }
+
+    /// 排序。
+    pub fn sort(&mut self, input: NodeId, keys: Vec<SortKey>) -> Result<NodeId> {
+        self.push(Op::Sort { keys }, vec![input])
+    }
+
+    /// 截断。
+    pub fn limit(&mut self, input: NodeId, limit: Option<u64>, offset: u64) -> Result<NodeId> {
+        self.push(Op::Limit { limit, offset }, vec![input])
+    }
+
+    /// 收尾。
+    pub fn finish(self, root: NodeId) -> Result<Plan> {
+        if self.nodes.is_empty() {
+            return Err(DbError::IrInvalid {
+                node: None,
+                message: "计划里没有任何节点".to_string(),
+            });
+        }
+        if root >= self.nodes.len() {
+            return Err(DbError::IrInvalid {
+                node: None,
+                message: format!("root {} 越界（共 {} 个节点）", root, self.nodes.len()),
+            });
+        }
+        Ok(Plan {
+            nodes: self.nodes,
+            root,
+        })
+    }
+}
+
+/// 推导一个投影输出列。
+///
+/// * **原样透传的列引用**（program 恰好只有一条 `Col(i)` 指令）→ 保留那一列自己
+///   的类型，**含 typmod**。所以 `SELECT name FROM t` 出来的 `name` 还是
+///   `VARCHAR(30)`，而不是退化成 `TEXT`。
+/// * 计算出来的表达式 → 退化成它大类的默认类型。
+///
+/// `lower` 里给 `ORDER BY` 建输出作用域时也用它，两处必须一致。
+pub fn project_column(prog: &Prog, name: &str, input: &[Column]) -> Result<Column> {
+    let ty = prog.verify(input)?;
+    let family = match ty {
+        ScalarType::Value(family) => family,
+        // 无类型 NULL 投影出来就是 TEXT（与 `SELECT NULL` 在 PostgreSQL 里一致）
+        ScalarType::Null => TypeFamily::Text,
+        ScalarType::Bool => {
+            return Err(DbError::IrInvalid {
+                node: None,
+                message: format!("结果列 `{}` 是 {}，布尔不能作为结果列", name, ty),
+            })
+        }
+    };
+
+    let data_type = match passthrough_column(prog) {
+        // 透传列：保留原类型（也就是保留 typmod）
+        Some(index) => input
+            .get(index)
+            .map(|column| column.ty)
+            .unwrap_or_else(|| family.default_type()),
+        None => family.default_type(),
+    };
+
+    Ok(Column::new(name, data_type))
+}
+
+/// 标量类型 → 一个具体的默认类型（用来给计算出来的列贴标签）。
+fn scalar_default_type(ty: ScalarType, node: NodeId, what: &str) -> Result<DataType> {
+    match ty {
+        ScalarType::Value(family) => Ok(family.default_type()),
+        ScalarType::Null => Ok(TypeFamily::Text.default_type()),
+        ScalarType::Bool => Err(invalid(node, format!("{} 不能是布尔", what))),
+    }
+}
+
+/// 这个程序是不是「原样取第 i 列」。
+pub fn passthrough_column(prog: &Prog) -> Option<usize> {
+    match prog.steps() {
+        [Step::Col { dst: 0, index }] if prog.result() == 0 => Some(*index),
+        _ => None,
+    }
+}
+
+fn at(node: NodeId, e: DbError) -> DbError {
+    match e {
+        DbError::IrInvalid { message, .. } => DbError::IrInvalid {
+            node: Some(node),
+            message,
+        },
+        other => other,
+    }
+}
+
+fn invalid(node: NodeId, message: String) -> DbError {
+    DbError::IrInvalid {
+        node: Some(node),
+        message,
+    }
+}
+
+fn expect(actual: ScalarType, want: ScalarType, node: NodeId, what: &str) -> Result<()> {
+    if actual == want {
+        Ok(())
+    } else {
+        Err(invalid(
+            node,
+            format!("{} 必须是 {}，实际是 {}", what, want, actual),
+        ))
+    }
+}
+
+fn render(id: NodeId, node: &Node, analysis: &Analysis) -> String {
+    let input = analysis.program_input(id);
+    match &node.op {
+        Op::SingleRow => "SingleRow".to_string(),
+        Op::Scan { table, filter } => match filter {
+            Some(prog) => format!("Scan({}, filter=[{}])", table, prog.explain(input)),
+            None => format!("Scan({}, filter=[])", table),
+        },
+        Op::Filter { predicate } => format!("Filter([{}])", predicate.explain(input)),
+        Op::Project { progs, names } => {
+            let exprs: Vec<String> = progs.iter().map(|p| p.explain(input)).collect();
+            format!(
+                "Project(names=[{}], exprs=[{}])",
+                names.join(", "),
+                exprs.join(", ")
+            )
+        }
+        Op::Join { kind, on } => match on {
+            Some(prog) => format!("Join({}, on=[{}])", kind.name(), prog.explain(input)),
+            None => format!("Join({}, on=[])", kind.name()),
+        },
+        Op::Aggregate {
+            group_by,
+            aggs,
+            names,
+        } => {
+            let groups: Vec<String> = group_by.iter().map(|p| p.explain(input)).collect();
+            let list: Vec<String> = aggs
+                .iter()
+                .map(|spec| match (&spec.arg, spec.distinct) {
+                    (None, _) => format!("{}(*)", spec.func.name()),
+                    (Some(prog), true) => {
+                        format!("{}(DISTINCT {})", spec.func.name(), prog.explain(input))
+                    }
+                    (Some(prog), false) => {
+                        format!("{}({})", spec.func.name(), prog.explain(input))
+                    }
+                })
+                .collect();
+            format!(
+                "Aggregate(names=[{}], group_by=[{}], aggs=[{}])",
+                names.join(", "),
+                groups.join(", "),
+                list.join(", ")
+            )
+        }
+        Op::Sort { keys } => {
+            let rendered: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{} {}",
+                        k.prog.explain(input),
+                        if k.desc { "DESC" } else { "ASC" }
+                    )
+                })
+                .collect();
+            format!("Sort(keys=[{}])", rendered.join(", "))
+        }
+        Op::Limit { limit, offset } => match limit {
+            Some(limit) => format!("Limit(limit={}, offset={})", limit, offset),
+            None => format!("Limit(limit=none, offset={})", offset),
+        },
+    }
+}
