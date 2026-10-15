@@ -34,6 +34,11 @@
 //! `YDBMS_LANG` → `LC_ALL` → `LC_MESSAGES` → `LANG`,取第一个认得的;都认不出来就用
 //! 默认值.**认不出来不报错**--语言不认识不该让程序跑不起来.
 //!
+//! **语言与"定过没有"那个标志不许错位**:`LOCALE_SET` 为真就意味着语言真的装好了.
+//! 所以三个入口一律"先装语言,后置标志"(置的时候用 `Release`,读的时候用 `Acquire`,
+//! 两两配对).反过来的写法有个窗口:并发首次查表的线程看得见标志,却还在用
+//! `rust-i18n` 内置的 `en` 查表,那句文本于是变成英文.
+//!
 //! 嵌入方想自己定就先 [`set_locale`](crate::i18n::set_locale) (它认了才算数),再建会话--`set_locale` 之后
 //! [`ensure_default`](crate::i18n::ensure_default) 就不再插手了.
 //!
@@ -54,30 +59,43 @@ pub const DEFAULT_LOCALE: &str = "zh-CN";
 /// 认得的所有语言(`locales/` 下一份文件一个,与 [`resolve`] 必须一致).
 pub const KNOWN_LOCALES: &[&str] = &["zh-CN", "en"];
 
-/// 有没有人**显式**定过语言(定过之后 [`ensure_default`](crate::i18n::ensure_default) 就不再动手).
+/// 语言定下来了没有:显式定过([`set_locale`] / [`init_from_env`]),或者
+/// [`ensure_default`] 把默认值装好了.
+///
+/// **为 `true` 就是"语言已经装好"这句承诺**:所以三个入口一律**先装语言,后置标志**,
+/// 且置的时候用 `Release`,读的时候用 `Acquire`(与它配对).反过来写(先置标志,再装
+/// 语言)就有个窗口:别的线程看得见标志,却还在用 `rust-i18n` 内置的 `en` 查表.
 static LOCALE_SET: AtomicBool = AtomicBool::new(false);
 
 /// 把默认语言定下来--幂等,且只在没人显式定过时才动手.
 ///
-/// `tr!` 每次查表前都会先调它(一个 `Relaxed` 的原子读,可以忽略不计).这么设计
+/// `tr!` 每次查表前都会先调它(一个 `Acquire` 的原子读,可以忽略不计).这么设计
 /// 是因为 `rust-i18n` 的初始语言写死是 `en`:不钉一下,测试与嵌入方拿到的是英文,
 /// 而它们(以及本版的日常使用)要的是中文.
+///
+/// **顺序不许换:先把语言装上,再置标志.** 反过来的话,多个线程同时首次查表时,
+/// 后到的那个可以"看得见标志却看不见语言",于是那一次查表拿到的是英文--而这一层
+/// 定默认值正是为了让它们拿到中文.并发首用不是理论问题:一个测试二进制里几十个
+/// 线程一起开工时撞得到(见本文件末尾那条单测).
 pub fn ensure_default() {
-    if LOCALE_SET.load(Ordering::Relaxed) {
+    if LOCALE_SET.load(Ordering::Acquire) {
         return;
     }
-    LOCALE_SET.store(true, Ordering::Relaxed);
+
+    // 多个线程可能同时走到这儿,各自装一次同一个值--`rust-i18n` 的 `set_locale` 是
+    // 线程安全的(内部是 `ArcSwap`),重复装同一个值没有副作用.
     rust_i18n::set_locale(DEFAULT_LOCALE);
+    LOCALE_SET.store(true, Ordering::Release);
 }
 
 /// 按环境定语言:`YDBMS_LANG` → `LC_ALL` → `LC_MESSAGES` → `LANG`(见 [`pick_from`]).
 ///
 /// 两个二进制的 `main` 那一路在**做任何事之前**调它;库里不调([`ensure_default`]
-/// 会兜住默认值).
+/// 会兜住默认值).**标志最后置**,与 [`ensure_default`] 同一个口径.
 pub fn init_from_env() {
     let picked = pick_from(&|name| std::env::var(name).ok());
-    LOCALE_SET.store(true, Ordering::Relaxed);
     rust_i18n::set_locale(picked);
+    LOCALE_SET.store(true, Ordering::Release);
 }
 
 /// 从一组环境变量里挑第一个认得出来的语言;都不认就返回 [`DEFAULT_LOCALE`].
@@ -103,8 +121,9 @@ pub fn set_locale(locale: &str) -> bool {
     let Some(locale) = resolve(locale) else {
         return false;
     };
-    LOCALE_SET.store(true, Ordering::Relaxed);
+    // 与 `ensure_default` 同一个口径:语言装好了才置标志(见 `LOCALE_SET`)
     rust_i18n::set_locale(locale);
+    LOCALE_SET.store(true, Ordering::Release);
     true
 }
 
@@ -146,4 +165,72 @@ macro_rules! tr {
         $crate::i18n::ensure_default();
         rust_i18n::t!($($tt)*)
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    /// `ensure_default` **先把语言装上,再置标志**:谁看见标志为真,谁查表时就该看到
+    /// 装好的语言(`rust_i18n::t!` 正是拿 `locale()` 去查表的).
+    ///
+    /// 观测法:每一轮把状态拨回"还没人定过",一个线程去装默认语言,一群线程在标志上
+    /// 空转--谁看见标志变真,谁立刻看当下是哪种语言.窗口只有几十纳秒,随机线程撞不稳,
+    /// 所以固定起跑线(`Barrier`)再重复很多轮:**先置标志,后装语言**那种写法只要撞上
+    /// 一轮就红;改好之后这条断言由内存序保证(`Release` / `Acquire` 配对,看见了标志
+    /// 就一定看得见语言),不会再红.
+    ///
+    /// 为什么是单测而不是 `tests/`:标志是私有的,而且进程里"第一次装默认值"必须发生
+    /// 在本测试自己起的线程里--只有够得着私有状态的这里能安排这件事.
+    #[test]
+    fn ensure_default_installs_the_locale_before_publishing_the_flag() {
+        /// 观察者的个数:一起空转的人越多,越容易在窗口关掉之前看见标志.
+        const WATCHERS: usize = 8;
+        /// 重复轮数:一轮的窗口极窄,靠轮数把"老写法"钉死.
+        const ROUNDS: usize = 200;
+
+        for round in 0..ROUNDS {
+            // 拨回"谁都没定过",语言放回 `rust-i18n` 内置的英文
+            LOCALE_SET.store(false, Ordering::Release);
+            rust_i18n::set_locale("en");
+
+            // 起跑线:观察者一定先转起来,装语言的那个也同时出发
+            let start = Arc::new(Barrier::new(WATCHERS + 1));
+
+            let watchers: Vec<_> = (0..WATCHERS)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        while !LOCALE_SET.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        rust_i18n::locale().to_string()
+                    })
+                })
+                .collect();
+
+            let installer = {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    ensure_default();
+                })
+            };
+
+            installer.join().expect("installer thread");
+            for (n, watcher) in watchers.into_iter().enumerate() {
+                let seen = watcher.join().expect("watcher thread");
+                assert_eq!(
+                    seen, DEFAULT_LOCALE,
+                    "round {round}, watcher {n}: the flag was published before the locale \
+                     was installed, so a concurrent lookup would read `{seen}`"
+                );
+            }
+        }
+
+        // 别把语言留在英文上(这个测试二进制只有这一条测试,但别留坑)
+        set_locale(DEFAULT_LOCALE);
+    }
 }
