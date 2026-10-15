@@ -1,20 +1,20 @@
-//! `ysql` 的参数解析 testbench（阶段 6.2）。
+//! `ysql` 的参数解析 testbench(阶段 6.2).
 //!
-//! [`parse`] 与 [`resolve`] 都是**纯函数**（不读环境、不碰文件系统），环境通过
-//! 一个闭包传进去，所以"没有 `$USER`"、"没有 `$HOME`"这些情况也能在这里测。
-//! 真进程的行为在 `tests/ysql_cli.rs`。
+//! [`parse`] 与 [`resolve`] 都是**纯函数**(不读环境,不碰文件系统),环境通过
+//! 一个闭包传进去,所以"没有 `$USER`","没有 `$HOME`"这些情况也能在这里测.
+//! 真进程的行为在 `tests/ysql_cli.rs`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ydbms::cmd::cli::{parse, resolve, Args, Options, HELP};
+use ydbms::cmd::cli::{help, parse, resolve, Args, Options};
 
-/// 把参数写成人话（`&["-U", "bob"]`）。
+/// 把参数写成人话(`&["-U", "bob"]`).
 fn argv(items: &[&str]) -> Vec<String> {
     items.iter().map(|item| item.to_string()).collect()
 }
 
-/// 假环境。
+/// 假环境.
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: BTreeMap<String, String> = pairs
         .iter()
@@ -23,7 +23,7 @@ fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     move |key: &str| map.get(key).cloned()
 }
 
-/// 一个"什么环境变量都没有"的环境。
+/// 一个"什么环境变量都没有"的环境.
 fn no_env() -> impl Fn(&str) -> Option<String> {
     |_: &str| None
 }
@@ -33,10 +33,10 @@ fn no_env() -> impl Fn(&str) -> Option<String> {
 #[test]
 fn help_lists_the_four_options_and_their_defaults() {
     for needle in ["-U", "-d", "-f", "--server-dist", "$USER", "$HOME/.ydbms", "PGPASSWORD"] {
-        assert!(HELP.contains(needle), "帮助里少了 `{needle}`：\n{HELP}");
+        assert!(help().contains(needle), "帮助里少了 `{needle}`:\n{}", help());
     }
     // 默认值也要写出来
-    assert!(HELP.contains("与 -U 同名"), "{HELP}");
+    assert!(help().contains("与 -U 同名"), "{}", help());
 }
 
 // ------------------------------------------------------------------ 解析
@@ -57,7 +57,7 @@ fn the_four_options_are_parsed_with_and_without_a_space() {
         }
     );
 
-    // 贴写：短选项贴值、长选项用 =
+    // 贴写:短选项贴值,长选项用 =
     let attached = parse(&argv(&["-Ubob", "-dfilmdb", "-fs.sql", "--server-dist=/x"])).expect("解析");
     assert_eq!(attached, options);
 }
@@ -82,14 +82,14 @@ fn an_unknown_option_or_a_missing_value_is_an_error() {
     ] {
         let err = parse(&argv(&bad)).expect_err(&format!("{bad:?} 应当报错"));
         assert!(!err.is_empty());
-        // 报错要带上用法，不然用户不知道有哪些选项
+        // 报错要带上用法,不然用户不知道有哪些选项
         assert!(err.contains("用法"), "{bad:?}: {err}");
     }
 }
 
 #[test]
 fn an_attached_value_may_contain_an_equals_sign() {
-    // `-f脚本` 的值里带 `=`：不能因为"含 `=`"就当成长选项去认
+    // `-f脚本` 的值里带 `=`:不能因为"含 `=`"就当成长选项去认
     assert_eq!(
         parse(&argv(&["-fsql/a=b.sql"])).expect("解析").script,
         Some(PathBuf::from("sql/a=b.sql"))
@@ -112,7 +112,7 @@ fn defaults_come_from_user_and_home() {
         args,
         Args {
             user: "bob".to_string(),
-            database: "bob".to_string(), // -d 默认与用户同名（照 psql 的习惯）
+            database: "bob".to_string(), // -d 默认与用户同名(照 psql 的习惯)
             database_given: false,
             script: None,
             server_dist: PathBuf::from("/home/bob/.ydbms"),

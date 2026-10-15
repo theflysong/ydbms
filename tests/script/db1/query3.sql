@@ -1,11 +1,11 @@
--- query3.sql —— 聚合
--- COUNT / SUM / AVG / MIN / MAX，GROUP BY 与 HAVING。
+-- query3.sql -- 聚合
+-- COUNT / SUM / AVG / MIN / MAX,GROUP BY 与 HAVING.
 --
--- 注意：本数据集里**每个学生都修了全部 20 门课**（13 门 GPA 制 + 7 门 P/F 制），
--- 所以按课程分组的 COUNT(*) 恒为 40、按学生分组的 COUNT(*) 恒为 13。
--- 计数列在这份数据里是常量，真正有区分度的是 AVG / MIN / MAX 与通过率。
+-- 注意:本数据集里**每个学生都修了全部 20 门课**(13 门 GPA 制 + 7 门 P/F 制),
+-- 所以按课程分组的 COUNT(*) 恒为 40,按学生分组的 COUNT(*) 恒为 13.
+-- 计数列在这份数据里是常量,真正有区分度的是 AVG / MIN / MAX 与通过率.
 
--- [3-1] 每个学生的 GPA 课数、平均/最高/最低绩点
+-- [3-1] 每个学生的 GPA 课数,平均/最高/最低绩点
 SELECT s.student_id, s.name,
        COUNT(*)             AS gpa_courses,
        ROUND(AVG(g.gpa), 2) AS avg_gpa,
@@ -26,7 +26,7 @@ FROM courses AS c
 GROUP BY c.course_id, c.code, c.title
 ORDER BY avg_gpa DESC;
 
--- [3-3] HAVING（按平均绩点筛组）：平均绩点 2.65 以上的课程
+-- [3-3] HAVING(按平均绩点筛组):平均绩点 2.65 以上的课程
 SELECT c.code, c.title,
        COUNT(*)             AS enrolled,
        ROUND(AVG(g.gpa), 2) AS avg_gpa
@@ -36,7 +36,7 @@ GROUP BY c.course_id, c.code, c.title
 HAVING AVG(g.gpa) >= 2.65
 ORDER BY avg_gpa DESC;
 
--- [3-4] HAVING（按算出来的比例筛组）：P/F 通过率低于 90% 的课程
+-- [3-4] HAVING(按算出来的比例筛组):P/F 通过率低于 90% 的课程
 SELECT c.code, c.title,
        COUNT(*) AS enrolled,
        ROUND(100.0 * SUM(CASE WHEN p.result = 'P' THEN 1 ELSE 0 END) / COUNT(*), 1) AS pass_rate
@@ -55,7 +55,7 @@ FROM students AS s
 GROUP BY s.gender
 ORDER BY s.gender;
 
--- [3-6] P/F 课程的通过率（CASE WHEN 分类计数）
+-- [3-6] P/F 课程的通过率(CASE WHEN 分类计数)
 SELECT c.code, c.title,
        COUNT(*)                                        AS enrolled,
        SUM(CASE WHEN p.result = 'P' THEN 1 ELSE 0 END) AS passed,

@@ -1,9 +1,9 @@
-//! 执行引擎与元命令的 testbench。
+//! 执行引擎与元命令的 testbench.
 //!
-//! 两路输出都攒在内存里，所以可以精确断言**哪一路**拿到了什么——这正是 `\o`
-//! "仅限于查询输出"这句话能不能被验证的关键。
+//! 两路输出都攒在内存里,所以可以精确断言**哪一路**拿到了什么--这正是 `\o`
+//! "仅限于查询输出"这句话能不能被验证的关键.
 //!
-//! `\cd` 改的是**进程级**工作目录，所以碰它的测试要拿一把锁串行，用完还原。
+//! `\cd` 改的是**进程级**工作目录,所以碰它的测试要拿一把锁串行,用完还原.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,17 +11,17 @@ use std::sync::Mutex;
 
 use ydbms::cmd::{Session, Sink};
 
-/// 改工作目录的测试之间互斥（`set_current_dir` 是进程级的）。
+/// 改工作目录的测试之间互斥(`set_current_dir` 是进程级的).
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
-/// 两路输出都进内存的会话。
+/// 两路输出都进内存的会话.
 fn buffered() -> Session {
     Session::with_sinks(Sink::buffer(), Sink::buffer())
 }
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// 自清理的临时目录。
+/// 自清理的临时目录.
 struct TempDir {
     path: PathBuf,
 }
@@ -214,8 +214,8 @@ fn o_redirects_only_the_query_table() {
     assert!(written.contains('a'), "{written}");
     assert!(written.contains('7'), "{written}");
     // 状态行与汇总**不该**进文件
-    assert!(!written.contains('→'), "状态行不该进文件：{written}");
-    assert!(!written.contains("成功"), "汇总不该进文件：{written}");
+    assert!(!written.contains('→'), "状态行不该进文件:{written}");
+    assert!(!written.contains("成功"), "汇总不该进文件:{written}");
     assert!(!written.contains("建表成功"), "{written}");
 
     // 而它们确实在消息那一路
@@ -244,7 +244,7 @@ fn o_failure_keeps_the_previous_sink() {
     s.run_interactive("\\o /no/such/dir/r.txt");
     assert!(s.messages().contains("打不开"), "{}", s.messages());
 
-    // 输出没丢：仍然回到原来的 buffer
+    // 输出没丢:仍然回到原来的 buffer
     s.run_interactive("SELECT 1 + 1 AS n");
     assert!(s.query_output().contains('n'), "{:?}", s.query_output());
 }
@@ -255,7 +255,7 @@ fn query_table_never_leaks_into_messages() {
     s.run_interactive("CREATE TABLE m (a INT)");
     s.run_interactive("INSERT INTO m VALUES (42)");
 
-    // 只截 SELECT 这一段的消息看——INSERT 的状态行里回显了语句原文，本来就有 42
+    // 只截 SELECT 这一段的消息看--INSERT 的状态行里回显了语句原文,本来就有 42
     let before = s.messages().len();
     s.run_interactive("SELECT a FROM m");
     let all = s.messages();
@@ -263,7 +263,7 @@ fn query_table_never_leaks_into_messages() {
 
     // 数据行只进查询那一路
     assert!(s.query_output().contains("42"), "{:?}", s.query_output());
-    assert!(!during_select.contains("42"), "结果表漏进了消息：{during_select}");
+    assert!(!during_select.contains("42"), "结果表漏进了消息:{during_select}");
     assert!(during_select.contains("1 行"), "{during_select}");
 }
 
@@ -403,7 +403,7 @@ fn sql_and_metacommands_interleave_preserving_order() {
     let created = messages.find("建表成功").expect("应当建表");
     let middle = messages.find("中部").expect("应当回显");
     let inserted = messages.find("插入 1 行").expect("应当插入");
-    assert!(created < middle && middle < inserted, "顺序错了：{messages}");
+    assert!(created < middle && middle < inserted, "顺序错了:{messages}");
 }
 
 #[test]
@@ -432,7 +432,7 @@ fn a_script_can_use_metacommands_themselves() {
     let mut s = buffered();
     s.run_interactive(&format!("\\i {}", script.display()));
 
-    // 脚本里的 \o 生效了：结果表进了文件
+    // 脚本里的 \o 生效了:结果表进了文件
     let written = std::fs::read_to_string(&redirected).unwrap();
     assert!(written.contains('9'), "{written}");
     // \o 之后的 \dt 走到消息那一路
@@ -445,14 +445,14 @@ fn a_script_can_use_metacommands_themselves() {
 fn timing_reports_every_statement() {
     let mut s = buffered();
     s.run_interactive("\\timing on");
-    assert!(s.messages().contains("计时：开"), "{}", s.messages());
+    assert!(s.messages().contains("计时:开"), "{}", s.messages());
     assert!(s.timing());
 
     s.run_interactive("CREATE TABLE m (a INT);\nINSERT INTO m VALUES (1);");
 
     let out = s.messages();
-    assert_eq!(out.matches("耗时").count(), 2, "两条语句两条计时：{out}");
-    assert!(out.contains("成功 2 条，失败 0 条"), "{out}");
+    assert_eq!(out.matches("耗时").count(), 2, "两条语句两条计时:{out}");
+    assert!(out.contains("成功 2 条,失败 0 条"), "{out}");
 }
 
 #[test]
@@ -478,7 +478,7 @@ fn timing_off_goes_back_to_silent() {
     assert_eq!(
         s.messages().matches("耗时").count(),
         1,
-        "关掉之后不该再打：{}",
+        "关掉之后不该再打:{}",
         s.messages()
     );
 }
@@ -507,7 +507,7 @@ fn on_error_stop_stops_at_the_first_error() {
     assert!(out.contains("建表成功"), "{out}");
     assert!(out.contains("unknown symbol"), "{out}");
     assert!(out.contains("已停止后续语句"), "{out}");
-    assert!(!out.contains("插入 1 行到 m"), "第三条不该跑：{out}");
+    assert!(!out.contains("插入 1 行到 m"), "第三条不该跑:{out}");
     assert_eq!(
         s.symbols().relation("m").unwrap().nrows(),
         0,
@@ -547,7 +547,7 @@ fn on_error_stop_stops_the_including_script_too() {
 
     let out = s.messages();
     assert!(out.contains("unknown symbol"), "{out}");
-    assert!(!out.contains("插入 1 行到 m"), "外层后面的语句也要停：{out}");
+    assert!(!out.contains("插入 1 行到 m"), "外层后面的语句也要停:{out}");
     assert_eq!(s.symbols().relation("m").unwrap().nrows(), 0);
 }
 
@@ -560,7 +560,7 @@ fn on_error_stop_stops_on_a_metacommand_error_too() {
     let out = s.messages();
     assert!(out.contains("读不了"), "{out}");
     assert!(out.contains("已停止后续语句"), "{out}");
-    assert!(!out.contains("1 行"), "读文件失败之后那条 SELECT 不该跑：{out}");
+    assert!(!out.contains("1 行"), "读文件失败之后那条 SELECT 不该跑:{out}");
 }
 
 #[test]
@@ -573,7 +573,7 @@ fn set_on_error_stop_off_resumes() {
     s.run_interactive("SELECT 1 FROM nope;\nSELECT 2 AS n");
     let out = s.messages();
     assert!(!out.contains("已停止后续语句"), "{out}");
-    assert!(out.contains("成功 1 条，失败 1 条"), "{out}");
+    assert!(out.contains("成功 1 条,失败 1 条"), "{out}");
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn set_rejects_an_unknown_variable_and_a_bad_value() {
     let mut s = buffered();
     s.run_interactive("\\set ON_ERROR_STOP ture");
     assert!(s.messages().contains("只认 on / off"), "{}", s.messages());
-    assert!(!s.on_error_stop(), "写错了就当没写，别悄悄打开");
+    assert!(!s.on_error_stop(), "写错了就当没写,别悄悄打开");
 }
 
 #[test]
@@ -615,12 +615,12 @@ fn transaction_statements_report_one_status_line_each() {
     let out = s.messages();
     assert!(out.contains("→ BEGIN"), "{out}");
     assert!(out.contains("→ COMMIT"), "{out}");
-    // 没有结果集，所以查询那一路什么都不该有
+    // 没有结果集,所以查询那一路什么都不该有
     assert!(s.query_output().is_empty(), "{}", s.query_output());
 }
 
 #[test]
-fn rollback_reports_an_error_and_keeps_going() {
+fn rollback_without_a_transaction_warns_and_keeps_going() {
     let mut s = buffered();
     s.run_interactive("CREATE TABLE p (a INT)");
     s.run_interactive("ROLLBACK;");
@@ -628,9 +628,40 @@ fn rollback_reports_an_error_and_keeps_going() {
 
     let out = s.messages();
     assert!(out.contains("ROLLBACK"), "{out}");
-    assert!(out.contains("错误"), "{out}");
-    // 默认不遇错就停：后面那条 INSERT 照样跑
+    // 照 PostgreSQL 的口径:只给一句警告,**不是**错误(退出码也不该受影响)
+    assert!(out.contains("警告"), "{out}");
+    assert!(!out.contains("错误"), "{out}");
+    assert_eq!(s.failed(), 0);
+    // 默认不遇错就停:后面那条 INSERT 照样跑
     assert!(out.contains("插入 1 行"), "{out}");
+}
+
+#[test]
+fn a_transaction_keeps_its_changes_in_memory_until_commit() {
+    let mut s = buffered();
+    s.run_interactive("CREATE TABLE p (a INT); INSERT INTO p VALUES (1)");
+
+    // `BEGIN` 之后敲的两条都在事务里:会话自己的符号表**看得见**
+    s.run_interactive("BEGIN;");
+    s.run_interactive("INSERT INTO p VALUES (2)");
+    s.run_interactive("SELECT a FROM p ORDER BY a");
+    assert!(s.query_output().contains("1"), "{}", s.query_output());
+    assert!(s.query_output().contains("2"), "{}", s.query_output());
+
+    // `ROLLBACK` 之后只剩事务前那一行
+    s.run_interactive("ROLLBACK;");
+    s.run_interactive("SELECT a FROM p ORDER BY a");
+
+    let out = s.messages();
+    assert!(!out.contains("错误"), "{out}");
+
+    // 查询输出是**累积**的:事务里那次 SELECT 打过一个 `2`,回滚后这次不该再有
+    assert_eq!(
+        s.query_output().matches('2').count(),
+        1,
+        "回滚后不该还能查到那一行:{}",
+        s.query_output()
+    );
 }
 
 #[test]
@@ -644,7 +675,7 @@ fn search_path_is_visible_in_dt_and_in_qualified_queries() {
 
     let out = s.messages();
     assert!(out.contains("search_path = study"), "{out}");
-    // `\dt` 列的是**存下来的**名字（带前缀）
+    // `\dt` 列的是**存下来的**名字(带前缀)
     assert!(out.contains("study.movies"), "{out}");
     // 限定名与非限定名查的是同一张表
     assert!(s.query_output().contains("7"), "{}", s.query_output());
@@ -672,7 +703,7 @@ fn an_init_script_with_metacommands_and_schema_runs_twice() {
     for round in 1..=2 {
         s.run_interactive(&format!("\\i {}", path.display()));
         let out = s.messages();
-        assert!(out.contains("init done"), "第 {round} 轮：{out}");
-        assert!(!out.contains("错误"), "第 {round} 轮有错误：{out}");
+        assert!(out.contains("init done"), "第 {round} 轮:{out}");
+        assert!(!out.contains("错误"), "第 {round} 轮有错误:{out}");
     }
 }

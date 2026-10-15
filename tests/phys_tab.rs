@@ -1,20 +1,20 @@
-//! [`PhysTab`] 的 testbench。
+//! [`PhysTab`] 的 testbench.
 //!
-//! 构造一张物理表 `(x, value, drvd)`，其中
+//! 构造一张物理表 `(x, value, drvd)`,其中
 //!
 //! * `x ∈ {-5, ..., 5}`
 //! * `value = f(x) = x² + 1`
 //! * `drvd  = f'(x) = 2x`
 //!
-//! 除了逐行核对数值，还验证了表抽象本身：形状确实来自 tabshape、trait object
-//! 可用、越界与元数不匹配被拒绝、以及「只实现必需方法即为只读表」的默认行为。
+//! 除了逐行核对数值,还验证了表抽象本身:形状确实来自 tabshape,trait object
+//! 可用,越界与元数不匹配被拒绝,以及"只实现必需方法即为只读表"的默认行为.
 
 use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Row, TabShape, Table, Value};
 use ydbms::db::PhysTab;
 
 const X_MIN: i32 = -5;
 const X_MAX: i32 = 5;
-/// 行数：x 取遍闭区间 `[-5, 5]`。
+/// 行数:x 取遍闭区间 `[-5, 5]`.
 const N: usize = (X_MAX - X_MIN + 1) as usize;
 
 /// f(x) = x² + 1
@@ -27,7 +27,7 @@ fn df(x: i32) -> i32 {
     2 * x
 }
 
-/// 表形状：`x INT, value INT, drvd INT`。
+/// 表形状:`x INT, value INT, drvd INT`.
 fn quadratic_shape() -> ColumnsShape {
     ColumnsShape::new(vec![
         Column::new("x", DataType::Int),
@@ -36,7 +36,7 @@ fn quadratic_shape() -> ColumnsShape {
     ])
 }
 
-/// 把 `x ∈ [-5, 5]` 的 `(x, f(x), f'(x))` 全部插入，返回建好的物理表。
+/// 把 `x ∈ [-5, 5]` 的 `(x, f(x), f'(x))` 全部插入,返回建好的物理表.
 fn build_quadratic_table() -> PhysTab {
     let shape = quadratic_shape();
     let mut tab = PhysTab::new("f", &shape);
@@ -47,7 +47,7 @@ fn build_quadratic_table() -> PhysTab {
     tab
 }
 
-/// 把 x 换成它在表中的行号。行序与 `x` 的升序一致。
+/// 把 x 换成它在表中的行号.行序与 `x` 的升序一致.
 fn row_of(x: i32) -> usize {
     (x - X_MIN) as usize
 }
@@ -177,7 +177,7 @@ fn even_function_and_odd_derivative() {
         sum_df += tab.value(r, 2).unwrap().as_int().unwrap();
     }
 
-    assert_eq!(sum_df, 0, "f' 是奇函数，全部取值之和为 0");
+    assert_eq!(sum_df, 0, "f' 是奇函数,全部取值之和为 0");
 }
 
 #[test]
@@ -271,14 +271,14 @@ fn truncate_empties_the_table_but_keeps_the_shape() {
     assert_eq!(tab.nrows(), 0);
     assert_eq!(tab.row(0), None);
     assert_eq!(tab.iter_rows().count(), 0);
-    assert_eq!(tab.arity(), 3, "清空的是数据，不是形状");
+    assert_eq!(tab.arity(), 3, "清空的是数据,不是形状");
 
     tab.truncate();
     assert_eq!(tab.nrows(), 0, "truncate 是幂等的");
 }
 
-/// 一个只读视图：**只**实现必需方法，变更操作完全依赖 [`Table`] 的默认实现。
-/// 未来的 `JoinTab` 就是这种形状。
+/// 一个只读视图:**只**实现必需方法,变更操作完全依赖 [`Table`] 的默认实现.
+/// 未来的 `JoinTab` 就是这种形状.
 struct ReadOnlyView {
     shape: ColumnsShape,
     rows: Vec<Row>,

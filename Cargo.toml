@@ -16,3 +16,4 @@ bigdecimal = "0.4.11"
 rustyline = { version = "18", default-features = false }
 regex = "1.13.1"
 sha2 = "0.10"
+rust-i18n = "4.2.4"

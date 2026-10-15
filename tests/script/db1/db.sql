@@ -1,23 +1,23 @@
 -- ============================================================
--- script1.sql —— Student Management Database
+-- script1.sql -- Student Management Database
 -- ============================================================
 --
--- 五张表（成绩表按评分方式拆成两张，因为本版**没有 NULL**：
--- "GPA 或 P/F"若挤在一张表里，必然有一列对某些行不适用，只能塞哨兵值；
--- 拆开之后每行都只出现在它适用的那张表里，不需要哨兵）：
+-- 五张表(成绩表按评分方式拆成两张,因为本版**没有 NULL**:
+-- "GPA 或 P/F"若挤在一张表里,必然有一列对某些行不适用,只能塞哨兵值;
+-- 拆开之后每行都只出现在它适用的那张表里,不需要哨兵):
 --
 --   teachers     12 位教师
 --   students     40 位学生
---   courses      20 门课程，grade_mode 标明自己是 'GPA' 还是 'P/F'
---   gpa_grades   GPA 制课程的成绩，gpa NUMERIC(3,2)
---   pf_grades    P/F 制课程的成绩，result CHAR(1)
+--   courses      20 门课程,grade_mode 标明自己是 'GPA' 还是 'P/F'
+--   gpa_grades   GPA 制课程的成绩,gpa NUMERIC(3,2)
+--   pf_grades    P/F 制课程的成绩,result CHAR(1)
 --
--- 课程构成：GPA 制 13 门，P/F 制 7 门
--- 成绩行数：每个学生每门课一行 → GPA 表 520 行，P/F 表 280 行
+-- 课程构成:GPA 制 13 门,P/F 制 7 门
+-- 成绩行数:每个学生每门课一行 → GPA 表 520 行,P/F 表 280 行
 --
--- 说明：本版还没有聚合函数（AVG/COUNT），所以脚本末尾的查询都是明细查询。
--- 说明：本版不支持表级约束，所以复合主键（student_id, course_id）没有写；
---       单列主键写成了列级约束，会被接受但**不强制**唯一性。
+-- 说明:本版还没有聚合函数(AVG/COUNT),所以脚本末尾的查询都是明细查询.
+-- 说明:本版不支持表级约束,所以复合主键(student_id, course_id)没有写;
+--       单列主键写成了列级约束,会被接受但**不强制**唯一性.
 --
 
 -- ------------------------------------------------------------ 建表
@@ -140,8 +140,8 @@ INSERT INTO courses (course_id, code, title, teacher_id, credits, grade_mode, ca
   (13, 'EN101', '学术英语', 9, 2, 'GPA', 40),
   (14, 'EC101', '经济学原理', 11, 3, 'GPA', 50),
   (15, 'AR101', '设计基础', 12, 2, 'P/F', 35),
-  (16, 'PE101', '体育（一）', 10, 1, 'P/F', 100),
-  (17, 'PE102', '体育（二）', 10, 1, 'P/F', 100),
+  (16, 'PE101', '体育(一)', 10, 1, 'P/F', 100),
+  (17, 'PE102', '体育(二)', 10, 1, 'P/F', 100),
   (18, 'CS499', '毕业设计', 2, 6, 'P/F', 30),
   (19, 'SE499', '工程实践', 4, 4, 'P/F', 40),
   (20, 'CS390', '学术讲座', 1, 1, 'P/F', 200);
@@ -1032,13 +1032,13 @@ INSERT INTO pf_grades (student_id, course_id, result) VALUES
 
 -- ------------------------------------------------------------ 查询
 
--- 课程清单（含授课教师与评分方式）
+-- 课程清单(含授课教师与评分方式)
 SELECT c.code, c.title, t.name AS teacher, c.credits, c.grade_mode
 FROM courses AS c
     JOIN teachers AS t ON c.teacher_id = t.teacher_id
 ORDER BY c.course_id;
 
--- A 档明细：3.67 及以上
+-- A 档明细:3.67 及以上
 SELECT s.student_id, s.name, c.code, g.gpa
 FROM gpa_grades AS g
     JOIN students AS s ON g.student_id = s.student_id
@@ -1046,7 +1046,7 @@ FROM gpa_grades AS g
 WHERE g.gpa >= 3.67
 ORDER BY s.student_id, c.code;
 
--- 不及格的 GPA 记录（低于 1.00）
+-- 不及格的 GPA 记录(低于 1.00)
 SELECT s.student_id, s.name, c.code, g.gpa
 FROM gpa_grades AS g
     JOIN students AS s ON g.student_id = s.student_id

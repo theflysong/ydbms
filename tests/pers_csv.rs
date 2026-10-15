@@ -1,7 +1,7 @@
-//! [`CsvPersister`] 的 testbench。
+//! [`CsvPersister`] 的 testbench.
 //!
-//! 主线是从磁盘「存→读」一张物理表并逐格核对数值；此外覆盖了旁路模式文件方案
-//! 特有的失败模式：两份文件不同步、模式缺失、数据被改坏。
+//! 主线是从磁盘"存→读"一张物理表并逐格核对数值;此外覆盖了旁路模式文件方案
+//! 特有的失败模式:两份文件不同步,模式缺失,数据被改坏.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +12,7 @@ use ydbms::pers::{CsvPersister, Persister, TablePath};
 
 const X_MIN: i32 = -5;
 const X_MAX: i32 = 5;
-/// 行数：x 取遍闭区间 `[-5, 5]`。
+/// 行数:x 取遍闭区间 `[-5, 5]`.
 const N: usize = (X_MAX - X_MIN + 1) as usize;
 
 /// f(x) = x² + 1
@@ -33,7 +33,7 @@ fn quadratic_shape() -> ColumnsShape {
     ])
 }
 
-/// 建一张 `(x, f(x), f'(x))` 物理表，`x ∈ [-5, 5]`。
+/// 建一张 `(x, f(x), f'(x))` 物理表,`x ∈ [-5, 5]`.
 fn build_quadratic_table(name: &str) -> PhysTab {
     let shape = quadratic_shape();
     let mut tab = PhysTab::new(name, &shape);
@@ -44,7 +44,7 @@ fn build_quadratic_table(name: &str) -> PhysTab {
     tab
 }
 
-/// 自清理的临时目录。不引入 `tempfile` 依赖，用进程号 + 计数器保证并行唯一。
+/// 自清理的临时目录.不引入 `tempfile` 依赖,用进程号 + 计数器保证并行唯一.
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct TempDir {
@@ -125,7 +125,7 @@ fn csv_quoting_round_trips_awkward_column_names() {
     let dir = TempDir::new("quoting");
     let at = TablePath::new(dir.path(), "quoted");
 
-    // 目前只有 INT，值里不可能出现逗号；列名是唯一能走到 CSV 引号逻辑的地方。
+    // 目前只有 INT,值里不可能出现逗号;列名是唯一能走到 CSV 引号逻辑的地方.
     let shape = ColumnsShape::new(vec![
         Column::new("odd,name", DataType::Int),
         Column::new("say\"hi", DataType::Int),
@@ -157,7 +157,7 @@ fn detects_header_schema_mismatch() {
     let persister = CsvPersister::new();
     persister.save(&build_quadratic_table("f"), &at).unwrap();
 
-    // 只改旁路模式文件：两份文件从此描述的不是同一张表
+    // 只改旁路模式文件:两份文件从此描述的不是同一张表
     let raw = std::fs::read_to_string(at.schema_path()).unwrap();
     let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
     json["columns"][0]["name"] = serde_json::Value::from("renamed");
@@ -171,7 +171,7 @@ fn detects_header_schema_mismatch() {
     assert!(matches!(err, DbError::Format { .. }), "got {err:?}");
     assert!(
         err.to_string().contains("does not match schema"),
-        "错误信息应当说明两份文件对不上：{err}"
+        "错误信息应当说明两份文件对不上:{err}"
     );
 }
 
@@ -186,7 +186,7 @@ fn missing_schema_file_is_reported() {
 
     let err = persister.load(&at).unwrap_err();
     assert!(matches!(err, DbError::MissingSchema { .. }), "got {err:?}");
-    assert!(at.data_path().exists(), "数据文件还在，只是模式丢了");
+    assert!(at.data_path().exists(), "数据文件还在,只是模式丢了");
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn rejects_non_integer_field() {
     let persister = CsvPersister::new();
     persister.save(&build_quadratic_table("f"), &at).unwrap();
 
-    // 把第一条数据（表头之后，即文件第 2 行）的第二列改成非整数
+    // 把第一条数据(表头之后,即文件第 2 行)的第二列改成非整数
     let data = std::fs::read_to_string(at.data_path()).unwrap();
     let mut lines: Vec<&str> = data.lines().collect();
     lines[1] = "-5,abc,-10";
@@ -368,6 +368,6 @@ fn table_path_layout() {
         Path::new("/tmp/ydbms-layout/f.schema.json")
     );
 
-    // 从数据文件路径反推（扫目录之后用），应当得到同一个位置
+    // 从数据文件路径反推(扫目录之后用),应当得到同一个位置
     assert_eq!(TablePath::from_data_path(at.data_path()), at);
 }

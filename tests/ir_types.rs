@@ -1,12 +1,12 @@
-//! 六种数据类型的 testbench：`TEXT` / `CHAR(N)` / `VARCHAR(N)` / `TIMESTAMP(N)` /
-//! `DATE` / `NUMERIC(N,M)`。
+//! 六种数据类型的 testbench:`TEXT` / `CHAR(N)` / `VARCHAR(N)` / `TIMESTAMP(N)` /
+//! `DATE` / `NUMERIC(N,M)`.
 //!
-//! 重点在三处：
+//! 重点在三处:
 //!
-//! 1. **typmod 真的被强制**（长度按字符算、精度标度超了报错）；
-//! 2. **`NUMERIC` 的排序不是字典序**——`2 < 10` 必须成立，这一条直接钉住手写的
-//!    定点比较；
-//! 3. **`TIMESTAMP` 规范化成定宽文本**，于是字典序就等于时间序。
+//! 1. **typmod 真的被强制**(长度按字符算,精度标度超了报错);
+//! 2. **`NUMERIC` 的排序不是字典序**--`2 < 10` 必须成立,这一条直接钉住手写的
+//!    定点比较;
+//! 3. **`TIMESTAMP` 规范化成定宽文本**,于是字典序就等于时间序.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,39 +16,39 @@ use ydbms::db::PhysTab;
 use ydbms::ir::{run_script, Outcome, SymbolTable};
 use ydbms::pers::{CsvPersister, Persister, TablePath};
 
-/// 跑一段 SQL，要求全部成功。
+/// 跑一段 SQL,要求全部成功.
 fn ok(db: &mut SymbolTable, sql: &str) {
     let results = run_script(sql, db).expect("应当能解析");
     for r in &results {
-        assert!(r.outcome.is_ok(), "第 {} 条失败了：{:?}", r.index, r.outcome);
+        assert!(r.outcome.is_ok(), "第 {} 条失败了:{:?}", r.index, r.outcome);
     }
 }
 
-/// 建一张表并填好数据。
+/// 建一张表并填好数据.
 fn db_with(sql: &str) -> SymbolTable {
     let mut db = SymbolTable::new();
     ok(&mut db, sql);
     db
 }
 
-/// 跑一条查询。
+/// 跑一条查询.
 fn query(db: &mut SymbolTable, sql: &str) -> PhysTab {
     let mut results = run_script(sql, db).expect("应当能解析");
     assert_eq!(results.len(), 1, "期望恰好一条语句");
     match results.remove(0).outcome.expect("应当成功") {
         Outcome::Rows(table) => table,
-        other => panic!("期望 Rows，得到 {other:?}"),
+        other => panic!("期望 Rows,得到 {other:?}"),
     }
 }
 
-/// 跑一条语句并要求失败。
+/// 跑一条语句并要求失败.
 fn failure(db: &mut SymbolTable, sql: &str) -> DbError {
     let mut results = run_script(sql, db).expect("应当能解析");
     assert_eq!(results.len(), 1, "期望恰好一条语句");
     results.remove(0).outcome.expect_err("本应失败")
 }
 
-/// 取第 `c` 列的文本形式。
+/// 取第 `c` 列的文本形式.
 fn col(db: &PhysTab, c: usize) -> Vec<String> {
     (0..db.nrows())
         .map(|r| db.value(r, c).expect("格子").to_string())
@@ -89,7 +89,7 @@ fn date_is_canonicalised_and_orders_as_text() {
     let mut db = db_with("CREATE TABLE m (d DATE)");
     ok(&mut db, "INSERT INTO m VALUES ('2017-3-8'), ('2017-01-31'), (NULL)");
 
-    // 规范成定宽文本（补零），于是字典序就是时间序
+    // 规范成定宽文本(补零),于是字典序就是时间序
     assert_eq!(
         col(&query(&mut db, "SELECT d FROM m ORDER BY d"), 0),
         vec!["2017-01-31".to_string(), "2017-03-08".to_string(), "NULL".to_string()]
@@ -120,7 +120,7 @@ fn date_and_timestamp_are_different_families() {
     let mut db = db_with("CREATE TABLE m (d DATE, ts TIMESTAMP)");
     ok(&mut db, "INSERT INTO m VALUES ('2017-03-08', '2017-03-08 00:00:00')");
 
-    // 两个大类互不比较：`date = timestamp` 必须继续拒绝（PG 有隐式转换，本版没有）
+    // 两个大类互不比较:`date = timestamp` 必须继续拒绝(PG 有隐式转换,本版没有)
     let err = failure(&mut db, "SELECT * FROM m WHERE d = ts");
     assert!(err.to_string().contains("两侧类型不同"), "{err}");
 }
@@ -171,7 +171,7 @@ fn length_works_on_a_typed_column() {
 
 #[test]
 fn bare_char_defaults_to_char_1() {
-    // SQL 标准：裸 CHAR 就是 CHAR(1)。注意语法树里它的实名是 bpchar。
+    // SQL 标准:裸 CHAR 就是 CHAR(1).注意语法树里它的实名是 bpchar.
     let db = db_with("CREATE TABLE m (a CHAR)");
     assert_eq!(ty_of(&db, "m", "a"), DataType::Char(1));
 }
@@ -191,14 +191,14 @@ fn bare_varchar_is_rejected_with_a_hint() {
 
 #[test]
 fn bare_numeric_is_now_unconstrained() {
-    // 放开精度之后裸 `NUMERIC` 是合法的，精度与标度都不限
+    // 放开精度之后裸 `NUMERIC` 是合法的,精度与标度都不限
     let db = db_with("CREATE TABLE m (a NUMERIC)");
     assert_eq!(ty_of(&db, "m", "a"), DataType::NumericAny);
 }
 
 #[test]
 fn bare_timestamp_defaults_to_six_digits() {
-    // 裸 TIMESTAMP 是合法的，默认 6 位（与 PostgreSQL 一致）
+    // 裸 TIMESTAMP 是合法的,默认 6 位(与 PostgreSQL 一致)
     let db = db_with("CREATE TABLE m (a TIMESTAMP)");
     assert_eq!(ty_of(&db, "m", "a"), DataType::Timestamp(6));
 }
@@ -229,7 +229,7 @@ fn text_round_trips_including_awkward_characters() {
 
 #[test]
 fn varchar_length_counts_characters_not_bytes() {
-    // '中文' 是 2 个字符、6 个字节。按字节算会误判超长。
+    // '中文' 是 2 个字符,6 个字节.按字节算会误判超长.
     let mut db = db_with("CREATE TABLE m (a VARCHAR(2))");
     ok(&mut db, "INSERT INTO m VALUES ('中文')");
 
@@ -251,7 +251,7 @@ fn char_length_is_enforced() {
 
 #[test]
 fn char_is_not_blank_padded() {
-    // 已知偏差：PostgreSQL 会把 char(4) 的值补到 4 位，本版存原值。
+    // 已知偏差:PostgreSQL 会把 char(4) 的值补到 4 位,本版存原值.
     let mut db = db_with("CREATE TABLE m (a CHAR(4))");
     ok(&mut db, "INSERT INTO m VALUES ('ab')");
 
@@ -286,7 +286,7 @@ fn timestamp_rejects_nonsense() {
 
 #[test]
 fn numeric_is_canonicalized_to_strip_trailing_zeros() {
-    // 规范化是必需的：不这么做，`Ord`（按值）与 `PartialEq`（按文本）会打架。
+    // 规范化是必需的:不这么做,`Ord`(按值)与 `PartialEq`(按文本)会打架.
     let mut db = db_with("CREATE TABLE m (a NUMERIC(6,2))");
     ok(&mut db, "INSERT INTO m VALUES (1.50)");
 
@@ -296,7 +296,7 @@ fn numeric_is_canonicalized_to_strip_trailing_zeros() {
 
 #[test]
 fn integer_literal_fits_a_numeric_column() {
-    // 这条曾经是 bug：整数常量走的是 INT 路径，塞进 NUMERIC 列会报类型不符。
+    // 这条曾经是 bug:整数常量走的是 INT 路径,塞进 NUMERIC 列会报类型不符.
     let mut db = db_with("CREATE TABLE m (a NUMERIC(6,2))");
     ok(&mut db, "INSERT INTO m VALUES (100)");
 
@@ -304,11 +304,11 @@ fn integer_literal_fits_a_numeric_column() {
     assert_eq!(col(&table, 0), vec!["100".to_string()]);
 }
 
-// ---------------------------------------------------- NUMERIC 的排序（关键）
+// ---------------------------------------------------- NUMERIC 的排序(关键)
 
 #[test]
 fn numeric_order_is_not_lexicographic() {
-    // 字典序会给 10, 2, 9 —— 所以这条直接钉死"必须定点比较"
+    // 字典序会给 10, 2, 9 -- 所以这条直接钉死"必须定点比较"
     let mut db = db_with("CREATE TABLE m (a NUMERIC(6,2))");
     ok(&mut db, "INSERT INTO m VALUES (2), (10), (9)");
 
@@ -367,7 +367,7 @@ fn timestamp_order_is_chronological() {
 
 #[test]
 fn timestamp_comparison_uses_the_column_type_to_type_the_literal() {
-    // 字面量本身是字符串，靠**列的类型**定成 TIMESTAMP，否则会拿 TEXT 去比
+    // 字面量本身是字符串,靠**列的类型**定成 TIMESTAMP,否则会拿 TEXT 去比
     let mut db = db_with("CREATE TABLE m (a TIMESTAMP)");
     ok(
         &mut db,
@@ -395,9 +395,9 @@ fn text_compares_and_orders() {
 
 #[test]
 fn int_and_numeric_compare_numerically() {
-    // PostgreSQL 里**唯一**的隐式放大：int → numeric。
-    // 注意 `3 > 1.5` 这一条：如果只放宽类型检查、不在运行时真的把 INT 转成
-    // NUMERIC，`Value::cmp` 会退到「按大类排名比」的兜底，把 `3 > 1.5` 算成**假**。
+    // PostgreSQL 里**唯一**的隐式放大:int → numeric.
+    // 注意 `3 > 1.5` 这一条:如果只放宽类型检查,不在运行时真的把 INT 转成
+    // NUMERIC,`Value::cmp` 会退到"按大类排名比"的兜底,把 `3 > 1.5` 算成**假**.
     let mut db = db_with("CREATE TABLE t (x INT); INSERT INTO t VALUES (1)");
 
     let hits = |db: &mut SymbolTable, sql: &str| query(db, sql).nrows();
@@ -408,7 +408,7 @@ fn int_and_numeric_compare_numerically() {
     assert_eq!(hits(&mut db, "SELECT x FROM t WHERE 1 < 1.5"), 1);
     assert_eq!(hits(&mut db, "SELECT x FROM t WHERE 1.0 = 1"), 1);
 
-    // 不相等的仍然是假，不是报错
+    // 不相等的仍然是假,不是报错
     assert_eq!(hits(&mut db, "SELECT x FROM t WHERE 1 = 1.5"), 0);
     assert_eq!(hits(&mut db, "SELECT x FROM t WHERE 1.5 = 1"), 0);
 }
@@ -430,7 +430,7 @@ fn int_and_numeric_columns_compare() {
 
 #[test]
 fn only_int_and_numeric_get_the_implicit_widening() {
-    // 别的跨族比较仍然拒绝——与 PostgreSQL 的 `operator does not exist` 一致
+    // 别的跨族比较仍然拒绝--与 PostgreSQL 的 `operator does not exist` 一致
     let mut db = db_with(
         "CREATE TABLE t (s TEXT, ts TIMESTAMP, n NUMERIC, i INT);
          INSERT INTO t VALUES ('a', '2024-01-01', 1.5, 1)",
@@ -508,7 +508,7 @@ fn numeric_within_bounds_is_accepted() {
 
 #[test]
 fn a_bare_decimal_literal_is_numeric() {
-    // 与 PostgreSQL 一致：`SELECT 1.5` 的类型就是 numeric
+    // 与 PostgreSQL 一致:`SELECT 1.5` 的类型就是 numeric
     let mut db = SymbolTable::new();
     let table = query(&mut db, "SELECT 1.5 AS x");
 
@@ -527,7 +527,7 @@ fn projection_keeps_the_source_column_type() {
     assert_eq!(
         table.columns()[0].ty,
         DataType::VarChar(8),
-        "透传列要保留原类型，而不是退化成 TEXT"
+        "透传列要保留原类型,而不是退化成 TEXT"
     );
 }
 
@@ -536,14 +536,14 @@ fn computed_column_falls_back_to_the_family_default() {
     let mut db = db_with("CREATE TABLE m (a NUMERIC(6,2))");
     ok(&mut db, "INSERT INTO m VALUES (1.5)");
 
-    // 没有算术，就取同一列做两次投影的别名——仍是透传，类型保留
+    // 没有算术,就取同一列做两次投影的别名--仍是透传,类型保留
     let table = query(&mut db, "SELECT a AS x FROM m");
     assert_eq!(table.columns()[0].ty, DataType::Numeric(6, 2));
 }
 
 // -------------------------------------------------- CASE 两分支的类型统一
 
-/// `CASE` 一侧 `INT`、一侧 `NUMERIC` 时统一成 `NUMERIC`——**照 PostgreSQL 办**：
+/// `CASE` 一侧 `INT`,一侧 `NUMERIC` 时统一成 `NUMERIC`--**照 PostgreSQL 办**:
 ///
 /// ```text
 /// select pg_typeof(case when true then 1 else 1.5 end);  →  numeric
@@ -561,11 +561,11 @@ fn case_unifies_int_and_numeric_into_numeric() {
     assert_eq!(
         table.value(0, 0),
         Some(Value::Numeric("1".to_string())),
-        "取到的是 INT 那一侧，但必须已经真的放大成 NUMERIC"
+        "取到的是 INT 那一侧,但必须已经真的放大成 NUMERIC"
     );
 }
 
-/// 取到 `NUMERIC` 那一侧、以及 `THEN` / `ELSE` 互换——四个方向都要对。
+/// 取到 `NUMERIC` 那一侧,以及 `THEN` / `ELSE` 互换--四个方向都要对.
 #[test]
 fn case_widening_is_symmetric() {
     let mut db = SymbolTable::new();
@@ -580,7 +580,7 @@ fn case_widening_is_symmetric() {
     assert_eq!(table.value(0, 0), Some(Value::Numeric("2".to_string())));
 }
 
-/// 一侧是 `NULL` 时**不该**被放大：公共类型就是另一侧自己的类型。
+/// 一侧是 `NULL` 时**不该**被放大:公共类型就是另一侧自己的类型.
 #[test]
 fn case_with_null_does_not_widen() {
     let mut db = db_with("CREATE TABLE m (x INT)");
@@ -591,7 +591,7 @@ fn case_with_null_does_not_widen() {
     assert_eq!(table.value(0, 0), Some(Value::Int(7)));
 }
 
-/// 放大之后要能真的落进 `NUMERIC` 列——物化时的类型校验会盯住这件事。
+/// 放大之后要能真的落进 `NUMERIC` 列--物化时的类型校验会盯住这件事.
 #[test]
 fn widened_case_fits_a_numeric_column() {
     let mut db = db_with("CREATE TABLE m (a INT, b NUMERIC(6,2))");
@@ -601,7 +601,7 @@ fn widened_case_fits_a_numeric_column() {
     assert_eq!(table.value(0, 0), Some(Value::Numeric("1".to_string())));
 }
 
-/// 真的没法统一（`INT` 与 `TEXT`）时仍然拒绝，别把放大当成"什么都行"。
+/// 真的没法统一(`INT` 与 `TEXT`)时仍然拒绝,别把放大当成"什么都行".
 #[test]
 fn case_still_rejects_unrelated_branches() {
     let mut db = SymbolTable::new();
@@ -611,7 +611,7 @@ fn case_still_rejects_unrelated_branches() {
 
 // ---------------------------------------------------------------- 持久化
 
-/// 自清理的临时目录。
+/// 自清理的临时目录.
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct TempDir {
@@ -681,7 +681,7 @@ fn csv_round_trips_an_unconstrained_numeric() {
 
     let shape = ColumnsShape::new(vec![Column::new("n", DataType::NumericAny)]);
     let mut saved = PhysTab::new("t", &shape);
-    // 60 位有效数字：旧的 i128 实现根本存不下
+    // 60 位有效数字:旧的 i128 实现根本存不下
     let big = "123456789012345678901234567890123456789012345678901234567890.5";
     saved
         .insert(vec![Value::Numeric(big.to_string())])
@@ -694,14 +694,14 @@ fn csv_round_trips_an_unconstrained_numeric() {
     assert_eq!(loaded.columns()[0].ty, DataType::NumericAny);
     assert_eq!(loaded.row(0), Some(vec![Value::Numeric(big.to_string())]));
 
-    // schema 里是一个**新增**的标记，不是改老格式
+    // schema 里是一个**新增**的标记,不是改老格式
     let raw = std::fs::read_to_string(at.schema_path()).unwrap();
     assert!(raw.contains("NUMERIC_ANY"), "{raw}");
 }
 
 #[test]
 fn old_schema_files_with_a_constrained_numeric_still_load() {
-    // 向后兼容：老文件里是 `{"NUMERIC":[10,2]}`，仍然要读得回来
+    // 向后兼容:老文件里是 `{"NUMERIC":[10,2]}`,仍然要读得回来
     let dir = TempDir::new("oldnum");
     let at = TablePath::new(dir.path(), "old");
     std::fs::write(
@@ -720,7 +720,7 @@ fn old_schema_files_with_a_constrained_numeric_still_load() {
 
 #[test]
 fn old_schema_files_with_plain_int_still_load() {
-    // 向后兼容：老的 `"ty": "INT"` 是单元变体，仍然能解析
+    // 向后兼容:老的 `"ty": "INT"` 是单元变体,仍然能解析
     let dir = TempDir::new("compat");
     let at = TablePath::new(dir.path(), "old");
     std::fs::write(

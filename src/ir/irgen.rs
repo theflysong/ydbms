@@ -1,55 +1,56 @@
-//! AST → 线性 IR 的降级（绑定器）。
+//! AST → 线性 IR 的降级(绑定器).
 //!
-//! 输入是 `pg_query`（PostgreSQL 服务端的真实解析器）产出的**裸语法树**，输出是
-//! [`Plan`]。中间要做的正是 PostgreSQL 里 `transformStmt` 那一步的缩小版：
+//! 输入是 `pg_query`(PostgreSQL 服务端的真实解析器)产出的**裸语法树**,输出是
+//! [`Plan`].中间要做的正是 PostgreSQL 里 `transformStmt` 那一步的缩小版:
 //!
-//! * **查表**：`FROM` 里的每个名字去 [`SymbolTable`] 换出列定义；
-//! * **解列名**：`x`、`f.x`、`study.people.x` 都要落到**扁平下标**上；
-//! * **类型检查**：交给下游 [`Plan::analyze`] 与 [`Prog::verify`]；
-//! * **确认形状**：`AS` 只影响限定名匹配，不改变列名（列名保持表自己的）。
-//! * **挑访问路径与连接策略**：`WHERE` 里只引用一个 FROM 项的合取项下推到那
-//!   张表的 `Scan.filter`（能走索引就顺手挑索引路径，见 `opt::pushdown` 的 `plan_where`）；
-//!   `ON` 里的「裸列 = 裸列」等值键决定这次连接走嵌套循环 / 哈希 / 索引嵌套循环
-//!   （见 `opt::join`）。两条都**只挑已知能对的**：挑不出
-//!   来就退回首选方案，正确性不变。
+//! * **查表**:`FROM` 里的每个名字去 [`SymbolTable`] 换出列定义;
+//! * **解列名**:`x`,`f.x`,`study.people.x` 都要落到**扁平下标**上;
+//! * **类型检查**:交给下游 [`Plan::analyze`] 与 [`Prog::verify`];
+//! * **确认形状**:`AS` 只影响限定名匹配,不改变列名(列名保持表自己的).
+//! * **挑访问路径与连接策略**:`WHERE` 里只引用一个 FROM 项的合取项下推到那
+//!   张表的 `Scan.filter`(能走索引就顺手挑索引路径,见 `opt::pushdown` 的 `plan_where`);
+//!   `ON` 里的"裸列 = 裸列"等值键决定这次连接走嵌套循环 / 哈希 / 索引嵌套循环
+//!   (见 `opt::join`).两条都**只挑已知能对的**:挑不出
+//!   来就退回首选方案,正确性不变.
 //!
-//! # 一条铁律：不认识的写法一律拒绝
+//! # 一条铁律:不认识的写法一律拒绝
 //!
-//! 凡是指向**尚未实现**能力的写法，一律**显式报 [`DbError::Unsupported`]**，
-//! 绝不猜。宁可拒绝，也不要给一个安静的错误答案——`IS NULL` 就是个例子：在值
-//! 模型还没有 NULL 的年代，若把它当"恒为假"执行，`died IS NULL` 会安静地返回
-//! 0 行，**错得很隐蔽**，比报错危险得多。
+//! 凡是指向**尚未实现**能力的写法,一律**显式报 [`DbError::Unsupported`]**,
+//! 绝不猜.宁可拒绝,也不要给一个安静的错误答案--`IS NULL` 就是个例子:在值
+//! 模型还没有 NULL 的年代,若把它当"恒为假"执行,`died IS NULL` 会安静地返回
+//! 0 行,**错得很隐蔽**,比报错危险得多.
 //!
-//! 仍未实现的（都在本文件里显式拒绝）：CTE；`INTERSECT`/`EXCEPT`；`DISTINCT ON`；
-//! 窗口函数；`GROUPING SETS`/`ROLLUP`/`CUBE`；`RIGHT`/`FULL`/`SEMI`/`ANTI` JOIN、
-//! `JOIN ... USING` 与 `NATURAL JOIN`；`LATERAL`；`UPDATE`/`DELETE`/`DROP TABLE`/
-//! `ALTER`；DDL 的各种变体（`CREATE INDEX`/`VIEW`/`AS SELECT`…）；`ROLLBACK`
-//! 与真事务；参数占位符；数组与位串类型。
+//! 仍未实现的(都在本文件里显式拒绝):CTE;`INTERSECT`/`EXCEPT`;`DISTINCT ON`;
+//! 窗口函数;`GROUPING SETS`/`ROLLUP`/`CUBE`;`RIGHT`/`FULL`/`SEMI`/`ANTI` JOIN,
+//! `JOIN ... USING` 与 `NATURAL JOIN`;`LATERAL`;`UPDATE`/`DELETE`/`DROP TABLE`/
+//! `ALTER TABLE`;DDL 的各种变体(`CREATE VIEW`/`AS SELECT`,`ALTER DATABASE` 的
+//! `RENAME`/`OWNER`...);`SAVEPOINT` 与嵌套事务(`BEGIN`/`COMMIT`/`ROLLBACK` 与
+//! `ALTER DATABASE ... SET search_path` 是支持的);参数占位符;数组与位串类型.
 //!
 //! # 子查询与相关引用
 //!
-//! 子查询就是"再开一个查询"：`lower_select` 多收一个**外层作用域链**
-//! （`outers`，`outers[0]` 是直接外层），解列名时沿着它往外走——解到外层就落成
-//! `Step::Outer { depth, index }`，内层计划则整份装进 `SubPlan`。派生表走
-//! [`PlanBuilder::splice`]：内层计划的节点直接接进外层数组，不新增算子。
+//! 子查询就是"再开一个查询":`lower_select` 多收一个**外层作用域链**
+//! (`outers`,`outers[0]` 是直接外层),解列名时沿着它往外走--解到外层就落成
+//! `Step::Outer { depth, index }`,内层计划则整份装进 `SubPlan`.派生表走
+//! [`PlanBuilder::splice`]:内层计划的节点直接接进外层数组,不新增算子.
 //!
-//! 分组查询里的相关子查询**显式拒绝**（内层链留空，引用外层会以"找不到这一列"
-//! 报出来）：PostgreSQL 也要求那种相关列出现在 `GROUP BY` 里，本版没有那套检查。
+//! 分组查询里的相关子查询**显式拒绝**(内层链留空,引用外层会以"找不到这一列"
+//! 报出来):PostgreSQL 也要求那种相关列出现在 `GROUP BY` 里,本版没有那套检查.
 //!
 //! # 绑定期的作用域
 //!
-//! 列引用解出来的是**相对算子输入 schema 的扁平下标**。`FROM a, b` 或
-//! `a JOIN b` 之后，schema 是「左 ++ 右」，所以 `Scope` 记着每一项的偏移量，
-//! 解列名时先定位到项、再加上偏移。这个扁平 schema 必须与
-//! [`Plan::analyze`] 推导出来的完全一致——若哪天不一致，`analyze` 会以
-//! `IrInvalid` 报出来，而不会静默读错列。
+//! 列引用解出来的是**相对算子输入 schema 的扁平下标**.`FROM a, b` 或
+//! `a JOIN b` 之后,schema 是"左 ++ 右",所以 `Scope` 记着每一项的偏移量,
+//! 解列名时先定位到项,再加上偏移.这个扁平 schema 必须与
+//! [`Plan::analyze`] 推导出来的完全一致--若哪天不一致,`analyze` 会以
+//! `IrInvalid` 报出来,而不会静默读错列.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use pg_query::protobuf::{
-    a_const::Val, node, AConst, AExpr, AExprKind, BoolExpr, BoolExprType, CaseExpr,
-    ConstrType, CreateSchemaStmt, CreateStmt, CreatedbStmt, DropBehavior, DropStmt, DropdbStmt,
-    FuncCall, InsertStmt,
+    a_const::Val, node, AConst, AExpr, AExprKind, AlterDatabaseSetStmt, BoolExpr, BoolExprType,
+    CaseExpr, ConstrType, CreateSchemaStmt, CreateStmt, CreatedbStmt, DropBehavior, DropStmt,
+    DropdbStmt, FuncCall, InsertStmt,
     JoinExpr, JoinType, LimitOption, Node, NullTestType, ObjectType, OnCommitAction, RangeVar,
     IndexStmt, SelectStmt, SetOperation, SortBy, SortByDir, SortByNulls,
     SqlValueFunction, SqlValueFunctionOp, SubLink, SubLinkType, TransactionStmt,
@@ -72,13 +73,13 @@ use super::plan::{
     passthrough_column, plan_has_outer, project_column, AggFunc, AggSpec, JoinKind, JoinStrategy,
     NodeId, Op, Plan, PlanBuilder, SortKey,
 };
-use super::stmt::Stmt;
+use super::stmt::{Stmt, TxOp};
 use super::symbol::SymbolTable;
 
-/// 解析 SQL 并降级成**恰好一条查询**。
+/// 解析 SQL 并降级成**恰好一条查询**.
 ///
-/// 这是给 `EXPLAIN` / [`crate::ir::compile`] 用的：它只要查询。要跑脚本（可能
-/// 含多条语句、可能含 DDL/DML）用 [`crate::ir::run_script`]。
+/// 这是给 `EXPLAIN` / [`crate::ir::compile`] 用的:它只要查询.要跑脚本(可能
+/// 含多条语句,可能含 DDL/DML)用 [`crate::ir::run_script`].
 pub fn lower(sql: &str, symbols: &SymbolTable) -> Result<Plan> {
     let parsed = pg_query::parse(sql).map_err(|e| DbError::Parse {
         message: e.to_string(),
@@ -86,32 +87,31 @@ pub fn lower(sql: &str, symbols: &SymbolTable) -> Result<Plan> {
 
     if parsed.protobuf.stmts.is_empty() {
         return Err(DbError::Parse {
-            message: "没有解析出任何语句".to_string(),
+            message: tr!("ir.irgen.001").into_owned(),
         });
     }
     if parsed.protobuf.stmts.len() > 1 {
-        return Err(unsupported(format!(
-            "这里只接受一条查询（收到 {} 条语句）",
+        return Err(unsupported(format!("{}", tr!("ir.irgen.002", arg0 = 
             parsed.protobuf.stmts.len()
-        )));
+        ))));
     }
 
     let node = parsed.protobuf.stmts[0]
         .stmt
         .as_deref()
         .ok_or_else(|| DbError::Parse {
-            message: "空的语句".to_string(),
+            message: tr!("ir.irgen.003").into_owned(),
         })?;
 
     match lower_statement(node, symbols)? {
         Stmt::Query(plan) => Ok(plan),
         _ => Err(unsupported(
-            "这不是一条查询语句（EXPLAIN / compile 只接受 SELECT；建表与插数据请直接执行）",
+            tr!("ir.irgen.004").into_owned(),
         )),
     }
 }
 
-/// 把一个已经解析好的语句节点降级成 [`Stmt`]。
+/// 把一个已经解析好的语句节点降级成 [`Stmt`].
 pub fn lower_statement(stmt: &Node, symbols: &SymbolTable) -> Result<Stmt> {
     match &stmt.node {
         Some(node::Node::SelectStmt(select)) => {
@@ -129,21 +129,25 @@ pub fn lower_statement(stmt: &Node, symbols: &SymbolTable) -> Result<Stmt> {
         Some(node::Node::CreateSchemaStmt(schema)) => lower_create_schema(schema),
         Some(node::Node::CreatedbStmt(db)) => lower_create_database(db),
         Some(node::Node::DropdbStmt(db)) => lower_drop_database(db),
+        Some(node::Node::AlterDatabaseSetStmt(db)) => lower_alter_database_set(db),
+        Some(node::Node::AlterDatabaseStmt(_)) | Some(node::Node::AlterDatabaseRefreshCollStmt(_)) => {
+            Err(unsupported(tr!("ir.irgen.005").into_owned()))
+        }
         Some(node::Node::TransactionStmt(tx)) => lower_transaction(tx),
         Some(node::Node::VariableSetStmt(set)) => lower_set(set),
-        _ => Err(unsupported("这种语句")),
+        _ => Err(unsupported(tr!("ir.irgen.006").into_owned())),
     }
 }
 
 // --------------------------------------------------------------- 集合运算
 
-/// `SELECT … UNION [ALL] SELECT …`。
+/// `SELECT ... UNION [ALL] SELECT ...`.
 ///
-/// 两支各自降级成**自足**的 `Plan`，再用 `Op::Union` 接起来（[`PlanBuilder::splice`]
-/// 把两支的节点接进同一个数组）。`UNION` 去重、`UNION ALL` 不去——都在执行期做
-/// （见 `exec` 的 `UnionSource`）。
+/// 两支各自降级成**自足**的 `Plan`,再用 `Op::Union` 接起来([`PlanBuilder::splice`]
+/// 把两支的节点接进同一个数组).`UNION` 去重,`UNION ALL` 不去--都在执行期做
+/// (见 `exec` 的 `UnionSource`).
 ///
-/// `INTERSECT` / `EXCEPT` 继续保持显式拒绝：它们要的"另一支里的键"本版没有。
+/// `INTERSECT` / `EXCEPT` 继续保持显式拒绝:它们要的"另一支里的键"本版没有.
 fn lower_setop(
     select: &SelectStmt,
     set_op: SetOperation,
@@ -152,29 +156,29 @@ fn lower_setop(
 ) -> Result<Plan> {
     let all = match set_op {
         SetOperation::SetopUnion => select.all,
-        SetOperation::SetopIntersect => return Err(unsupported("集合运算 INTERSECT")),
-        SetOperation::SetopExcept => return Err(unsupported("集合运算 EXCEPT")),
-        _ => return Err(unsupported("集合运算")),
+        SetOperation::SetopIntersect => return Err(unsupported(tr!("ir.irgen.007").into_owned())),
+        SetOperation::SetopExcept => return Err(unsupported(tr!("ir.irgen.008").into_owned())),
+        _ => return Err(unsupported(tr!("ir.irgen.009").into_owned())),
     };
 
     if select.with_clause.is_some() {
-        return Err(unsupported("WITH（公共表表达式）"));
+        return Err(unsupported(tr!("ir.irgen.010").into_owned()));
     }
 
-    // `larg` / `rarg` 直接就是 `SelectStmt`（不是 `Node`）：嵌套的 `UNION` 递归地
-    // 落在自己的 `lower_select` 里。
+    // `larg` / `rarg` 直接就是 `SelectStmt`(不是 `Node`):嵌套的 `UNION` 递归地
+    // 落在自己的 `lower_select` 里.
     let left = select
         .larg
         .as_deref()
-        .ok_or_else(|| unsupported("UNION 缺左支"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.011").into_owned()))?;
     let right = select
         .rarg
         .as_deref()
-        .ok_or_else(|| unsupported("UNION 缺右支"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.012").into_owned()))?;
 
     let left_plan = lower_select(left, symbols, outers)?;
     let right_plan = lower_select(right, symbols, outers)?;
-    // 输出 schema 取左支的（列名也是）：浅层分析就够，外层链的校验留给外层 `analyze`
+    // 输出 schema 取左支的(列名也是):浅层分析就够,外层链的校验留给外层 `analyze`
     let schema = left_plan.analyze_shallow(symbols)?.schemas[left_plan.root].clone();
 
     let mut b = PlanBuilder::new();
@@ -182,7 +186,7 @@ fn lower_setop(
     let right_id = b.splice(right_plan)?;
     let mut current = b.union(left_id, right_id, all)?;
 
-    // `… UNION … ORDER BY 1 LIMIT 3`：排序键按**并集的输出 schema** 解
+    // `... UNION ... ORDER BY 1 LIMIT 3`:排序键按**并集的输出 schema** 解
     if !select.sort_clause.is_empty() || select.limit_count.is_some() {
         let scope = Scope::from_range(String::new(), None, schema, None, symbols);
         let keys = lower_sort_keys(&select.sort_clause, &scope, true)?;
@@ -198,42 +202,104 @@ fn lower_setop(
     b.finish(current)
 }
 
-// ------------------------------------------------- schema / 事务 / SET（1.5）
+// ------------------------------------------------- schema / 事务 / SET(1.5)
 
-/// 事务控制：`BEGIN` / `COMMIT` 接受为无操作；`ROLLBACK` **显式拒绝**。
+/// 事务控制:`BEGIN` / `START TRANSACTION` → [`TxOp::Begin`],`COMMIT` →
+/// [`TxOp::Commit`],`ROLLBACK` → [`TxOp::Rollback`].
 ///
-/// 本版没有 WAL、没有回滚，所以"接受 BEGIN/COMMIT 并如实记一行状态"是本项目
-/// 一贯的路线；而 `ROLLBACK` 不能假装回滚成功——那会让用户以为数据回滚了。
+/// 三种都是**真的执行**(撤销记录在符号表里,见 [`SymbolTable`]).选项与
+/// `SAVEPOINT` / 两阶段提交继续显式拒绝:本版没有它们,接受下来只能假装.
 fn lower_transaction(tx: &TransactionStmt) -> Result<Stmt> {
     if !tx.options.is_empty() || !tx.savepoint_name.is_empty() || !tx.gid.is_empty() || tx.chain {
-        return Err(unsupported("事务选项 / SAVEPOINT / 两阶段提交"));
+        return Err(unsupported(tr!("ir.irgen.013").into_owned()));
     }
 
     let kind =
         TransactionStmtKind::try_from(tx.kind).unwrap_or(TransactionStmtKind::Undefined);
     match kind {
         TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart => {
-            Ok(Stmt::Transaction { begin: true })
+            Ok(Stmt::Transaction(TxOp::Begin))
         }
-        TransactionStmtKind::TransStmtCommit => Ok(Stmt::Transaction { begin: false }),
-        TransactionStmtKind::TransStmtRollback => Err(unsupported(
-            "ROLLBACK（本版没有事务，不能假装回滚成功）",
-        )),
-        other => Err(unsupported(format!("事务语句 {}", other.as_str_name()))),
+        TransactionStmtKind::TransStmtCommit => Ok(Stmt::Transaction(TxOp::Commit)),
+        TransactionStmtKind::TransStmtRollback => Ok(Stmt::Transaction(TxOp::Rollback)),
+        other => Err(unsupported(format!("{}", tr!("ir.irgen.014", arg0 =  other.as_str_name())))),
     }
 }
 
-/// `CREATE DATABASE name`：只留名字，建目录 / 写 `catalog.json` 是 [`Databases`] 的事。
+/// `ALTER DATABASE name SET search_path TO ...`:库级默认值(见
+/// [`Databases::set_database_search_path`]).
+///
+/// 只认 `search_path` 这一个变量--它是库元数据里唯一有语义的东西,别的变量本版
+/// 没有会话默认值可言,接受下来等于假装.`RESET search_path` 与
+/// `SET search_path TO DEFAULT` 解成**清掉**(空路径).
+fn lower_alter_database_set(db: &AlterDatabaseSetStmt) -> Result<Stmt> {
+    if db.dbname.is_empty() {
+        return Err(unsupported(tr!("ir.irgen.015").into_owned()));
+    }
+    let set = db
+        .setstmt
+        .as_ref()
+        .ok_or_else(|| unsupported(tr!("ir.irgen.016").into_owned()))?;
+
+    let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+    if !set.name.eq_ignore_ascii_case("search_path") {
+        return Err(unsupported(format!("{}", tr!("ir.irgen.017", arg0 = 
+            set.name
+        ))));
+    }
+
+    let search_path = match kind {
+        VariableSetKind::VarSetValue => parse_search_path(set)?,
+        // `RESET search_path` 与 `SET search_path TO DEFAULT`:把这个默认值清掉
+        // (空 = 不加前缀,与过去一样)
+        VariableSetKind::VarSetDefault | VariableSetKind::VarReset => Vec::new(),
+        _ => {
+            return Err(unsupported(format!("{}", tr!("ir.irgen.018", arg0 = 
+                set.name
+            ))))
+        }
+    };
+
+    Ok(Stmt::AlterDatabase {
+        name: db.dbname.clone(),
+        search_path,
+    })
+}
+
+/// 解出 `search_path` 的取值(`SET` 与 `ALTER DATABASE ... SET` 共用的那一份).
+///
+/// 多值时语法树给的是"一串 `A_Const`";单值有时会被包成一层 `List`.
+fn parse_search_path(set: &VariableSetStmt) -> Result<Vec<String>> {
+    match set.args.as_slice() {
+        [only] => match &only.node {
+            Some(node::Node::List(list)) => list
+                .items
+                .iter()
+                .map(const_string)
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| unsupported(tr!("ir.irgen.019").into_owned())),
+            _ => Ok(vec![const_string(only)
+                .ok_or_else(|| unsupported(tr!("ir.irgen.020").into_owned()))?]),
+        },
+        args => args
+            .iter()
+            .map(const_string)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| unsupported(tr!("ir.irgen.021").into_owned())),
+    }
+}
+
+/// `CREATE DATABASE name`:只留名字,建目录 / 写 `catalog.json` 是 [`Databases`] 的事.
 ///
 /// [`Databases`]: super::stmt::Databases
 fn lower_create_database(db: &CreatedbStmt) -> Result<Stmt> {
     if !db.options.is_empty() {
         return Err(unsupported(
-            "CREATE DATABASE 的选项（ENCODING / OWNER / TEMPLATE / LC_COLLATE…）",
+            tr!("ir.irgen.022").into_owned(),
         ));
     }
     if db.dbname.is_empty() {
-        return Err(unsupported("CREATE DATABASE 没有名字"));
+        return Err(unsupported(tr!("ir.irgen.023").into_owned()));
     }
 
     Ok(Stmt::CreateDatabase {
@@ -241,15 +307,15 @@ fn lower_create_database(db: &CreatedbStmt) -> Result<Stmt> {
     })
 }
 
-/// `DROP DATABASE [IF EXISTS] name`。
+/// `DROP DATABASE [IF EXISTS] name`.
 ///
 /// [`Databases`]: super::stmt::Databases
 fn lower_drop_database(db: &DropdbStmt) -> Result<Stmt> {
     if !db.options.is_empty() {
-        return Err(unsupported("DROP DATABASE 的选项（WITH FORCE…）"));
+        return Err(unsupported(tr!("ir.irgen.024").into_owned()));
     }
     if db.dbname.is_empty() {
-        return Err(unsupported("DROP DATABASE 没有名字"));
+        return Err(unsupported(tr!("ir.irgen.025").into_owned()));
     }
 
     Ok(Stmt::DropDatabase {
@@ -258,16 +324,16 @@ fn lower_drop_database(db: &DropdbStmt) -> Result<Stmt> {
     })
 }
 
-/// `CREATE SCHEMA name`：只登记名字（限定名本来就能用，见 [`crate::ir::symbol`]）。
+/// `CREATE SCHEMA name`:只登记名字(限定名本来就能用,见 [`crate::ir::symbol`]).
 fn lower_create_schema(schema: &CreateSchemaStmt) -> Result<Stmt> {
     if schema.authrole.is_some() {
         return Err(unsupported("CREATE SCHEMA ... AUTHORIZATION"));
     }
     if !schema.schema_elts.is_empty() {
-        return Err(unsupported("CREATE SCHEMA 里内嵌建表 / 授权"));
+        return Err(unsupported(tr!("ir.irgen.026").into_owned()));
     }
     if schema.schemaname.is_empty() {
-        return Err(unsupported("CREATE SCHEMA 没有名字"));
+        return Err(unsupported(tr!("ir.irgen.027").into_owned()));
     }
 
     Ok(Stmt::CreateSchema {
@@ -276,10 +342,10 @@ fn lower_create_schema(schema: &CreateSchemaStmt) -> Result<Stmt> {
     })
 }
 
-/// `DROP`：只认 `DROP SCHEMA` 与 `DROP INDEX`，别的仍然整个拒绝。
+/// `DROP`:只认 `DROP SCHEMA` 与 `DROP INDEX`,别的仍然整个拒绝.
 ///
-/// schema 的"删除"在本版就是**清掉该前缀的符号**（一个会话一个进程，
-/// 没有别的地方能引用它们）；索引的删除就是把目录里那一条去掉。
+/// schema 的"删除"在本版就是**清掉该前缀的符号**(一个会话一个进程,
+/// 没有别的地方能引用它们);索引的删除就是把目录里那一条去掉.
 fn lower_drop(drop: &DropStmt) -> Result<Stmt> {
     let object = ObjectType::try_from(drop.remove_type).unwrap_or(ObjectType::Undefined);
 
@@ -287,12 +353,12 @@ fn lower_drop(drop: &DropStmt) -> Result<Stmt> {
         if drop.concurrent {
             return Err(unsupported("DROP INDEX CONCURRENTLY"));
         }
-        // `CASCADE` / `RESTRICT` 都接受：本版没有任何东西依赖索引
+        // `CASCADE` / `RESTRICT` 都接受:本版没有任何东西依赖索引
         let names: Vec<String> = drop.objects.iter().filter_map(object_name).collect();
         let name = match names.as_slice() {
             [one] => one.clone(),
-            [] => return Err(unsupported("DROP INDEX 没有名字")),
-            _ => return Err(unsupported("一次 DROP 多个索引")),
+            [] => return Err(unsupported(tr!("ir.irgen.028").into_owned())),
+            _ => return Err(unsupported(tr!("ir.irgen.029").into_owned())),
         };
         return Ok(Stmt::DropIndex {
             name,
@@ -301,13 +367,14 @@ fn lower_drop(drop: &DropStmt) -> Result<Stmt> {
     }
 
     if object != ObjectType::ObjectSchema {
-        return Err(unsupported(match object {
-            ObjectType::ObjectTable => "DROP TABLE",
-            ObjectType::ObjectView => "DROP VIEW",
-            ObjectType::ObjectSequence => "DROP SEQUENCE",
-            ObjectType::ObjectType => "DROP TYPE",
-            _ => "DROP（本版只支持 DROP SCHEMA / DROP INDEX）",
-        }));
+        let what = match object {
+            ObjectType::ObjectTable => "DROP TABLE".to_string(),
+            ObjectType::ObjectView => "DROP VIEW".to_string(),
+            ObjectType::ObjectSequence => "DROP SEQUENCE".to_string(),
+            ObjectType::ObjectType => "DROP TYPE".to_string(),
+            _ => tr!("ir.irgen.030").into_owned(),
+        };
+        return Err(unsupported(what));
     }
     if drop.concurrent {
         return Err(unsupported("DROP SCHEMA CONCURRENTLY"));
@@ -316,12 +383,12 @@ fn lower_drop(drop: &DropStmt) -> Result<Stmt> {
     let cascade = DropBehavior::try_from(drop.behavior).unwrap_or(DropBehavior::Undefined)
         == DropBehavior::DropCascade;
 
-    // 语法树里每个对象是「`.` 分段的 `List`」；单段的实测也可能是裸 `String`
+    // 语法树里每个对象是"`.` 分段的 `List`";单段的实测也可能是裸 `String`
     let names: Vec<String> = drop.objects.iter().filter_map(object_name).collect();
     let name = match names.as_slice() {
         [one] => one.clone(),
-        [] => return Err(unsupported("DROP SCHEMA 没有名字")),
-        _ => return Err(unsupported("一次 DROP 多个 schema")),
+        [] => return Err(unsupported(tr!("ir.irgen.031").into_owned())),
+        _ => return Err(unsupported(tr!("ir.irgen.032").into_owned())),
     };
 
     Ok(Stmt::DropSchema {
@@ -331,10 +398,10 @@ fn lower_drop(drop: &DropStmt) -> Result<Stmt> {
     })
 }
 
-/// 一个"对象名"节点 → 它的文本（`DROP` 的 `objects` 列表里那些）。
+/// 一个"对象名"节点 → 它的文本(`DROP` 的 `objects` 列表里那些).
 ///
-/// 限定名是 `List[String, String…]`；单段名实测直接是个 `String`。两种都认，
-/// 别的给 `None`（调用方会把它当成"没有名字"报出来）。
+/// 限定名是 `List[String, String...]`;单段名实测直接是个 `String`.两种都认,
+/// 别的给 `None`(调用方会把它当成"没有名字"报出来).
 fn object_name(node: &Node) -> Option<String> {
     match &node.node {
         Some(node::Node::List(list)) => Some(ref_parts(&list.items)?.join(".")),
@@ -343,99 +410,81 @@ fn object_name(node: &Node) -> Option<String> {
     }
 }
 
-/// `SET`：只认 `SET search_path TO …`，别的变量一律拒绝。
+/// `SET`:只认 `SET search_path TO ...`,别的变量一律拒绝.
 ///
-/// `search_path` **不是**无操作的：`filmdb.sql` 的建表写的是非限定名，而测试查的
-/// 是 `study.movies`——不作前缀那些表就永远不存在（见 [`crate::ir::symbol`]）。
+/// `search_path` **不是**无操作的:`filmdb.sql` 的建表写的是非限定名,而测试查的
+/// 是 `study.movies`--不作前缀那些表就永远不存在(见 [`crate::ir::symbol`]).
 fn lower_set(set: &VariableSetStmt) -> Result<Stmt> {
     let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
     if kind != VariableSetKind::VarSetValue {
-        return Err(unsupported(format!("SET {} 的这种写法", set.name)));
+        return Err(unsupported(format!("{}", tr!("ir.irgen.033", arg0 =  set.name))));
     }
     if !set.name.eq_ignore_ascii_case("search_path") {
-        return Err(unsupported(format!("SET {}（本版只认 search_path）", set.name)));
+        return Err(unsupported(format!("{}", tr!("ir.irgen.034", arg0 =  set.name))));
     }
 
-    // 多值时语法树给的是"一串 `A_Const`"；单值有时会被包成一层 `List`
-    let names: Vec<String> = match set.args.as_slice() {
-        [only] => match &only.node {
-            Some(node::Node::List(list)) => list
-                .items
-                .iter()
-                .map(const_string)
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| unsupported("search_path 的项必须是字符串常量"))?,
-            _ => vec![const_string(only)
-                .ok_or_else(|| unsupported("search_path 的项必须是字符串常量"))?],
-        },
-        args => args
-            .iter()
-            .map(const_string)
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| unsupported("search_path 的项必须是字符串常量"))?,
-    };
+    // 多值时语法树给的是"一串 `A_Const`";单值有时会被包成一层 `List`
+    let names = parse_search_path(set)?;
 
     Ok(Stmt::SetSearchPath { path: names })
 }
 
 // ------------------------------------------------------------- CREATE INDEX
 
-/// `CREATE [IF NOT EXISTS] INDEX name ON table (col)` 的降级。
+/// `CREATE [IF NOT EXISTS] INDEX name ON table (col)` 的降级.
 ///
-/// 只认**裸列**、单列、非唯一：本版的索引是「键 → 行号」的哈希表（见
-/// [`crate::db::index`]），唯一性它不强制；表达式键与多列键表达不了，于是显式
-/// 拒绝——宁可拒绝，也不要给一个安静的错答案。
+/// 只认**裸列**,单列,非唯一:本版的索引是"键 → 行号"的哈希表(见
+/// [`crate::db::index`]),唯一性它不强制;表达式键与多列键表达不了,于是显式
+/// 拒绝--宁可拒绝,也不要给一个安静的错答案.
 ///
-/// 真正建索引的动作在 [`crate::ir::SymbolTable::create_index`] 里（那里才有表）。
+/// 真正建索引的动作在 [`crate::ir::SymbolTable::create_index`] 里(那里才有表).
 fn lower_create_index(index: &IndexStmt, symbols: &SymbolTable) -> Result<Stmt> {
     if index.unique || index.primary {
         return Err(unsupported(
-            "CREATE UNIQUE INDEX / PRIMARY KEY（本版索引不强制唯一性）",
+            tr!("ir.irgen.035").into_owned(),
         ));
     }
     if index.concurrent {
         return Err(unsupported("CREATE INDEX CONCURRENTLY"));
     }
     if index.where_clause.is_some() {
-        return Err(unsupported("部分索引（`WHERE ...`）"));
+        return Err(unsupported(tr!("ir.irgen.036").into_owned()));
     }
     if !index.index_including_params.is_empty() {
-        return Err(unsupported("INCLUDE (...) 的索引"));
+        return Err(unsupported(tr!("ir.irgen.037").into_owned()));
     }
     if !index.options.is_empty() {
-        return Err(unsupported("索引的 WITH (...) 存储参数"));
+        return Err(unsupported(tr!("ir.irgen.038").into_owned()));
     }
-    // 注意：**没写 `USING` 时语法树里也带着默认的 `btree`**（实测），所以这里认
-    // `btree` 与空串；别的访问方法一律拒绝——本版的索引只有一种实现，不能假装
-    // 它支持某种方法。
+    // 注意:**没写 `USING` 时语法树里也带着默认的 `btree`**(实测),所以这里认
+    // `btree` 与空串;别的访问方法一律拒绝--本版的索引只有一种实现,不能假装
+    // 它支持某种方法.
     if !index.access_method.is_empty() && index.access_method != "btree" {
-        return Err(unsupported(format!(
-            "索引的 USING {}（本版只有一种索引实现）",
+        return Err(unsupported(format!("{}", tr!("ir.irgen.039", arg0 = 
             index.access_method
-        )));
+        ))));
     }
     if !index.table_space.is_empty() {
-        return Err(unsupported("索引的 TABLESPACE"));
+        return Err(unsupported(tr!("ir.irgen.040").into_owned()));
     }
     if index.idxname.is_empty() {
-        return Err(unsupported("索引没有名字"));
+        return Err(unsupported(tr!("ir.irgen.041").into_owned()));
     }
     if index.index_params.len() != 1 {
-        return Err(unsupported(format!(
-            "索引键的个数（要恰好 1 列，实际 {} 个）",
+        return Err(unsupported(format!("{}", tr!("ir.irgen.042", arg0 = 
             index.index_params.len()
-        )));
+        ))));
     }
 
     let column = match &index.index_params[0].node {
         Some(node::Node::IndexElem(elem)) if !elem.name.is_empty() => elem.name.clone(),
-        _ => return Err(unsupported("索引键只支持裸列（表达式键本版不做）")),
+        _ => return Err(unsupported(tr!("ir.irgen.043").into_owned())),
     };
 
     let relation = index
         .relation
         .as_ref()
-        .ok_or_else(|| unsupported("索引没有写表"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.044").into_owned()))?;
     let table = qualified_name(relation)?;
     let columns = symbols
         .columns(&table)
@@ -458,22 +507,22 @@ fn lower_create_index(index: &IndexStmt, symbols: &SymbolTable) -> Result<Stmt> 
 
 // ------------------------------------------------------------- CREATE TABLE
 
-/// 降级 `CREATE TABLE`。
+/// 降级 `CREATE TABLE`.
 ///
-/// 约束的口径（`filmdb.sql` 的 11 张表全靠这一套）：
+/// 约束的口径(`filmdb.sql` 的 11 张表全靠这一套):
 ///
-/// * **真强制**：列级 `NOT NULL`（进 [`Column::not_null`]）、`DEFAULT`（进
-///   [`Column::default`]，缺列时补）、`CHECK`（降级成 [`Prog`] 挂到表的
-///   `CheckedTable` 上，写行时求值）；
-/// * **接受但如实记录**（进 `unenforced`，建表消息里列出来）：`PRIMARY KEY`、
-///   `UNIQUE`、`FOREIGN KEY ... REFERENCES ...`——本版不做唯一性与引用检查，
-///   也不做 `ON DELETE` / `ON UPDATE` 的动作（没有 `DELETE`，动作没有语义）；
-/// * **拒绝**（有行为语义或会静默违规的）：`DEFERRABLE` / `INITIALLY DEFERRED` /
-///   `NOT VALID`、`IDENTITY`、`GENERATED`、`COLLATE`、`EXCLUDE`。
+/// * **真强制**:列级 `NOT NULL`(进 [`Column::not_null`]),`DEFAULT`(进
+///   [`Column::default`],缺列时补),`CHECK`(降级成 [`Prog`] 挂到表的
+///   `CheckedTable` 上,写行时求值);
+/// * **接受但如实记录**(进 `unenforced`,建表消息里列出来):`PRIMARY KEY`,
+///   `UNIQUE`,`FOREIGN KEY ... REFERENCES ...`--本版不做唯一性与引用检查,
+///   也不做 `ON DELETE` / `ON UPDATE` 的动作(没有 `DELETE`,动作没有语义);
+/// * **拒绝**(有行为语义或会静默违规的):`DEFERRABLE` / `INITIALLY DEFERRED` /
+///   `NOT VALID`,`IDENTITY`,`GENERATED`,`COLLATE`,`EXCLUDE`.
 ///
-/// 表级约束**两种写法都要认**：实测 `CREATE TABLE p (a INT, PRIMARY KEY (a))` 里
-/// 那条 `PRIMARY KEY` 会作为 `Constraint` 出现在 `table_elts` 里，而不是
-/// `CreateStmt.constraints`——所以循环两处都走。
+/// 表级约束**两种写法都要认**:实测 `CREATE TABLE p (a INT, PRIMARY KEY (a))` 里
+/// 那条 `PRIMARY KEY` 会作为 `Constraint` 出现在 `table_elts` 里,而不是
+/// `CreateStmt.constraints`--所以循环两处都走.
 fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt> {
     // 本版只认最朴素的 `CREATE TABLE name (列定义, 约束...)`
     if !create.inh_relations.is_empty() {
@@ -483,20 +532,20 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
         return Err(unsupported("PARTITION BY / PARTITION OF"));
     }
     if create.of_typename.is_some() {
-        return Err(unsupported("CREATE TABLE ... OF <类型>"));
+        return Err(unsupported(tr!("ir.irgen.045").into_owned()));
     }
     if !create.access_method.is_empty() {
-        return Err(unsupported("USING <访问方法>"));
+        return Err(unsupported(tr!("ir.irgen.046").into_owned()));
     }
     if !create.tablespacename.is_empty() {
         return Err(unsupported("TABLESPACE"));
     }
     if !create.options.is_empty() {
-        return Err(unsupported("WITH (...) 存储参数"));
+        return Err(unsupported(tr!("ir.irgen.047").into_owned()));
     }
-    // 注意：`OnCommitAction::OncommitNoop = 1`，**不是** 0。没写 ON COMMIT 时
-    // 这个字段就是 1，所以不能拿 `!= 0` 当"没指定"。（和 `SetopNone = 1` 同一
-    // 类坑：枚举里表示"无"的那个变体不是 0。）
+    // 注意:`OnCommitAction::OncommitNoop = 1`,**不是** 0.没写 ON COMMIT 时
+    // 这个字段就是 1,所以不能拿 `!= 0` 当"没指定".(和 `SetopNone = 1` 同一
+    // 类坑:枚举里表示"无"的那个变体不是 0.)
     let on_commit = OnCommitAction::try_from(create.oncommit).unwrap_or(OnCommitAction::Undefined);
     if on_commit != OnCommitAction::OncommitNoop {
         return Err(unsupported("ON COMMIT"));
@@ -505,16 +554,16 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
     let relation = create
         .relation
         .as_ref()
-        .ok_or_else(|| unsupported("没有表名"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.048").into_owned()))?;
     let name = qualified_name(relation)?;
-    // 合成的约束名用最后一段（`study.movies` → `movies_..._check`），与 PostgreSQL
+    // 合成的约束名用最后一段(`study.movies` → `movies_..._check`),与 PostgreSQL
     // 的 `ChooseConstraintName` 口径一致
     let short_name = name.rsplit('.').next().unwrap_or(&name).to_string();
 
     let mut columns: Vec<Column> = Vec::with_capacity(create.table_elts.len());
     let mut unenforced: Vec<String> = Vec::new();
-    // `(表达式, 约束名, 合成名)`：**所有列都收齐之后**才降级，因为 CHECK 面对的是
-    // 整张表的扁平 schema（列级 CHECK 也一样能引用别的列）
+    // `(表达式, 约束名, 合成名)`:**所有列都收齐之后**才降级,因为 CHECK 面对的是
+    // 整张表的扁平 schema(列级 CHECK 也一样能引用别的列)
     let mut checks: Vec<(&Node, Option<String>, String)> = Vec::new();
 
     let mut elts: Vec<&Node> = create.table_elts.iter().collect();
@@ -524,13 +573,13 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
         match &elt.node {
             Some(node::Node::ColumnDef(def)) => {
                 if def.raw_default.is_some() || def.cooked_default.is_some() {
-                    return Err(unsupported("列上的 DEFAULT（请写成列约束 `DEFAULT …`）"));
+                    return Err(unsupported(tr!("ir.irgen.049").into_owned()));
                 }
                 if !def.identity.is_empty() || def.identity_sequence.is_some() {
-                    return Err(unsupported("IDENTITY 列"));
+                    return Err(unsupported(tr!("ir.irgen.050").into_owned()));
                 }
                 if !def.generated.is_empty() {
-                    return Err(unsupported("生成列（GENERATED ... AS）"));
+                    return Err(unsupported(tr!("ir.irgen.051").into_owned()));
                 }
                 if def.coll_clause.is_some() {
                     return Err(unsupported("COLLATE"));
@@ -539,7 +588,7 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                 let ty = column_type(
                     def.type_name
                         .as_ref()
-                        .ok_or_else(|| unsupported("列没有类型"))?,
+                        .ok_or_else(|| unsupported(tr!("ir.irgen.052").into_owned()))?,
                 )?;
 
                 let mut not_null = false;
@@ -548,33 +597,33 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                     let c = column_constraint(constraint)?;
                     reject_constraint_attributes(c)?;
                     match ConstrType::try_from(c.contype).unwrap_or(ConstrType::Undefined) {
-                        // **真的强制**：`Column::not_null` 会让 `Table::validate` 拦住 NULL。
+                        // **真的强制**:`Column::not_null` 会让 `Table::validate` 拦住 NULL.
                         ConstrType::ConstrNotnull => not_null = true,
 
-                        // **真的强制**：缺列时补它（见 `lower_insert`）
+                        // **真的强制**:缺列时补它(见 `lower_insert`)
                         ConstrType::ConstrDefault => {
                             default = Some(read_default(c, &ty, &def.colname)?);
                         }
 
-                        // **真的强制**：降级成谓词，写行时求值
+                        // **真的强制**:降级成谓词,写行时求值
                         ConstrType::ConstrCheck => {
                             let expr = c
                                 .raw_expr
                                 .as_deref()
-                                .ok_or_else(|| unsupported("空的 CHECK"))?;
+                                .ok_or_else(|| unsupported(tr!("ir.irgen.053").into_owned()))?;
                             let synth = format!("{}_{}_check", short_name, def.colname);
                             checks.push((expr, conname(c), synth));
                         }
 
-                        // 接受，但本版不做唯一性检查，必须让它看得见。
+                        // 接受,但本版不做唯一性检查,必须让它看得见.
                         ConstrType::ConstrPrimary => {
                             unenforced.push(constraint_text(c, &format!("PRIMARY KEY ({})", def.colname)));
                         }
                         ConstrType::ConstrUnique => {
                             unenforced.push(constraint_text(c, &format!("UNIQUE ({})", def.colname)));
                         }
-                        // 外键：接受 + 记录，**不做引用检查**（本版也没有 DELETE，
-                        // 所以 ON DELETE 的动作没有语义）
+                        // 外键:接受 + 记录,**不做引用检查**(本版也没有 DELETE,
+                        // 所以 ON DELETE 的动作没有语义)
                         ConstrType::ConstrForeign => {
                             unenforced.push(constraint_text(
                                 c,
@@ -583,7 +632,7 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                         }
 
                         ConstrType::ConstrNull => {}
-                        other => return Err(unsupported(format!("列约束 {:?}", other))),
+                        other => return Err(unsupported(format!("{}", tr!("ir.irgen.054", arg0 =  other : {:?})))),
                     }
                 }
 
@@ -598,7 +647,7 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                 columns.push(column);
             }
 
-            // 表级约束（`PRIMARY KEY (a, b)` 写在列定义之外）
+            // 表级约束(`PRIMARY KEY (a, b)` 写在列定义之外)
             Some(node::Node::Constraint(c)) => {
                 reject_constraint_attributes(c)?;
                 let body = match ConstrType::try_from(c.contype).unwrap_or(ConstrType::Undefined) {
@@ -611,13 +660,13 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                         let expr = c
                             .raw_expr
                             .as_deref()
-                            .ok_or_else(|| unsupported("空的 CHECK"))?;
+                            .ok_or_else(|| unsupported(tr!("ir.irgen.055").into_owned()))?;
                         let synth = format!("{}_check", short_name);
                         checks.push((expr, conname(c), synth));
                         continue;
                     }
                     other => {
-                        return Err(unsupported(format!("表级约束 {:?}", other)));
+                        return Err(unsupported(format!("{}", tr!("ir.irgen.056", arg0 =  other : {:?}))));
                     }
                 };
                 unenforced.push(constraint_text(c, &body));
@@ -625,17 +674,17 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
 
             _ => {
                 return Err(unsupported(
-                    "表元素里的这种项（本版只支持列定义与约束）",
+                    tr!("ir.irgen.057").into_owned(),
                 ))
             }
         }
     }
 
     if columns.is_empty() {
-        return Err(unsupported("没有任何列的表"));
+        return Err(unsupported(tr!("ir.irgen.058").into_owned()));
     }
 
-    // CHECK 现在才降级：它面对**整张表**的扁平 schema
+    // CHECK 现在才降级:它面对**整张表**的扁平 schema
     let scope = Scope::from_range(name.clone(), None, columns.clone(), None, symbols);
     let mut lowered_checks = Vec::with_capacity(checks.len());
     for (expr, name, synth) in checks {
@@ -643,10 +692,10 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
         let reg = lower_expr(expr, &scope, &mut p)?;
         let program = p.finish(reg);
         if program.has_subquery() || program.has_outer() {
-            return Err(unsupported("CHECK 里的子查询 / 外层引用"));
+            return Err(unsupported(tr!("ir.irgen.059").into_owned()));
         }
         if program.verify(&columns)? != ScalarType::Bool {
-            return Err(unsupported("CHECK 的条件必须是布尔表达式"));
+            return Err(unsupported(tr!("ir.irgen.060").into_owned()));
         }
         lowered_checks.push(Check {
             name: name.unwrap_or(synth),
@@ -663,15 +712,15 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
     })
 }
 
-/// 一个列约束项 → 它的 `Constraint`。
+/// 一个列约束项 → 它的 `Constraint`.
 fn column_constraint(node: &Node) -> Result<&pg_query::protobuf::Constraint> {
     match &node.node {
         Some(node::Node::Constraint(c)) => Ok(c),
-        _ => Err(unsupported("列约束里的这种项")),
+        _ => Err(unsupported(tr!("ir.irgen.061").into_owned())),
     }
 }
 
-/// 约束名（没写就是空串）。
+/// 约束名(没写就是空串).
 fn conname(c: &pg_query::protobuf::Constraint) -> Option<String> {
     if c.conname.is_empty() {
         None
@@ -680,18 +729,18 @@ fn conname(c: &pg_query::protobuf::Constraint) -> Option<String> {
     }
 }
 
-/// 有行为语义、不能假装的约束属性：一律拒绝。
+/// 有行为语义,不能假装的约束属性:一律拒绝.
 fn reject_constraint_attributes(c: &pg_query::protobuf::Constraint) -> Result<()> {
     if c.deferrable || c.initdeferred {
-        return Err(unsupported("DEFERRABLE / INITIALLY DEFERRED（本版没有延迟检查）"));
+        return Err(unsupported(tr!("ir.irgen.062").into_owned()));
     }
     if c.skip_validation {
-        return Err(unsupported("NOT VALID（本版不校验历史数据，也就不能假装没校验）"));
+        return Err(unsupported(tr!("ir.irgen.063").into_owned()));
     }
     Ok(())
 }
 
-/// 记录用的约束文本：写了名字就把名字带上。
+/// 记录用的约束文本:写了名字就把名字带上.
 fn constraint_text(c: &pg_query::protobuf::Constraint, body: &str) -> String {
     match conname(c) {
         Some(name) => format!("CONSTRAINT {} {}", name, body),
@@ -699,7 +748,7 @@ fn constraint_text(c: &pg_query::protobuf::Constraint, body: &str) -> String {
     }
 }
 
-/// `PRIMARY KEY (…)` / `UNIQUE (…)` 的列名表。
+/// `PRIMARY KEY (...)` / `UNIQUE (...)` 的列名表.
 fn constraint_keys(keys: &[Node]) -> Result<String> {
     let mut names = Vec::with_capacity(keys.len());
     for key in keys {
@@ -708,17 +757,17 @@ fn constraint_keys(keys: &[Node]) -> Result<String> {
             // 实测列名也可能是裸 `String` 之外的列引用
             Some(node::Node::ColumnRef(c)) => ref_parts(&c.fields)
                 .map(|parts| parts.join("."))
-                .ok_or_else(|| unsupported("约束里的这种列名"))?,
-            _ => return Err(unsupported("约束里的这种列名")),
+                .ok_or_else(|| unsupported(tr!("ir.irgen.064").into_owned()))?,
+            _ => return Err(unsupported(tr!("ir.irgen.065").into_owned())),
         };
         names.push(name);
     }
     Ok(names.join(", "))
 }
 
-/// `FOREIGN KEY (…) REFERENCES t(…) [ON DELETE …] [ON UPDATE …]` 的文本。
+/// `FOREIGN KEY (...) REFERENCES t(...) [ON DELETE ...] [ON UPDATE ...]` 的文本.
 ///
-/// 只用来**如实记录**（本版不强制外键），所以认不出的动作也照样写出来。
+/// 只用来**如实记录**(本版不强制外键),所以认不出的动作也照样写出来.
 fn describe_foreign(c: &pg_query::protobuf::Constraint, column: Option<&str>) -> Result<String> {
     let local = match column {
         Some(column) => column.to_string(),
@@ -726,7 +775,7 @@ fn describe_foreign(c: &pg_query::protobuf::Constraint, column: Option<&str>) ->
     };
     let table = match &c.pktable {
         Some(rv) => qualified_name(rv)?,
-        None => return Err(unsupported("外键没有写被引用的表")),
+        None => return Err(unsupported(tr!("ir.irgen.066").into_owned())),
     };
     let referenced = constraint_keys(&c.pk_attrs)?;
 
@@ -744,7 +793,7 @@ fn describe_foreign(c: &pg_query::protobuf::Constraint, column: Option<&str>) ->
     Ok(text)
 }
 
-/// 外键动作的单字母编码 → 名字（PostgreSQL 语法树里就是这么编的）。
+/// 外键动作的单字母编码 → 名字(PostgreSQL 语法树里就是这么编的).
 fn fk_action_name(action: &str) -> String {
     match action {
         "a" => "NO ACTION".to_string(),
@@ -756,7 +805,7 @@ fn fk_action_name(action: &str) -> String {
     }
 }
 
-/// 外键 `MATCH` 的单字母编码 → 名字。
+/// 外键 `MATCH` 的单字母编码 → 名字.
 fn fk_match_name(matchtype: &str) -> String {
     match matchtype {
         "f" => "FULL".to_string(),
@@ -765,21 +814,21 @@ fn fk_match_name(matchtype: &str) -> String {
     }
 }
 
-/// 降级一个 `DEFAULT` 字面量。
+/// 降级一个 `DEFAULT` 字面量.
 ///
-/// 只认常量字面量（`DEFAULT now()`、`DEFAULT 1 + 1` 一律拒绝——本版没有"每次插入
-/// 重新求值"的机制，猜一个固定值会给出安静的错误答案）。值按列类型解析并强制
-/// typmod，再存成 **CSV 字段形式**（`NULL` 就是 `\N`）。
+/// 只认常量字面量(`DEFAULT now()`,`DEFAULT 1 + 1` 一律拒绝--本版没有"每次插入
+/// 重新求值"的机制,猜一个固定值会给出安静的错误答案).值按列类型解析并强制
+/// typmod,再存成 **CSV 字段形式**(`NULL` 就是 `\N`).
 fn read_default(c: &pg_query::protobuf::Constraint, ty: &DataType, column: &str) -> Result<String> {
     let expr = c
         .raw_expr
         .as_deref()
-        .ok_or_else(|| unsupported("空的 DEFAULT"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.067").into_owned()))?;
     let konst = match &expr.node {
         Some(node::Node::AConst(konst)) => konst,
         _ => {
             return Err(unsupported(
-                "DEFAULT 的表达式（本版只支持常量字面量，例如 `DEFAULT '?'`）",
+                tr!("ir.irgen.068").into_owned(),
             ))
         }
     };
@@ -787,7 +836,7 @@ fn read_default(c: &pg_query::protobuf::Constraint, ty: &DataType, column: &str)
         return Ok(Value::Null.to_csv_field());
     }
 
-    let text = literal_text(konst).ok_or_else(|| unsupported("DEFAULT 的这类字面量"))?;
+    let text = literal_text(konst).ok_or_else(|| unsupported(tr!("ir.irgen.069").into_owned()))?;
     let value = ty.parse(&text).map_err(|e| match at_value(&text, e) {
         DbError::BadValue {
             ty, value, reason, ..
@@ -802,13 +851,13 @@ fn read_default(c: &pg_query::protobuf::Constraint, ty: &DataType, column: &str)
     Ok(value.to_csv_field())
 }
 
-/// `TypeName` → 本版的 [`DataType`]。
+/// `TypeName` → 本版的 [`DataType`].
 ///
-/// 关键：`INT` 在语法树里是 `names = ["pg_catalog", "int4"]`——**内部的、带
-/// schema 前缀的**名字。所以取**最后一段**再认。
+/// 关键:`INT` 在语法树里是 `names = ["pg_catalog", "int4"]`--**内部的,带
+/// schema 前缀的**名字.所以取**最后一段**再认.
 fn column_type(type_name: &TypeName) -> Result<DataType> {
     if !type_name.array_bounds.is_empty() {
-        return Err(unsupported("数组类型"));
+        return Err(unsupported(tr!("ir.irgen.070").into_owned()));
     }
     let last = type_name
         .names
@@ -817,17 +866,16 @@ fn column_type(type_name: &TypeName) -> Result<DataType> {
             Some(node::Node::String(s)) => Some(s.sval.clone()),
             _ => None,
         })
-        .ok_or_else(|| unsupported("看不懂的类型名"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.071").into_owned()))?;
 
-    // typmods 是**裸字面量**：`VARCHAR(30)` 给 `[Ival(30)]`，`NUMERIC(10,2)` 给
-    // `[Ival(10), Ival(2)]`。没有 PostgreSQL 内部那种 N+4 偏移。
+    // typmods 是**裸字面量**:`VARCHAR(30)` 给 `[Ival(30)]`,`NUMERIC(10,2)` 给
+    // `[Ival(10), Ival(2)]`.没有 PostgreSQL 内部那种 N+4 偏移.
     let mods = type_mods(type_name)?;
     let need = |what: &str, index: usize| -> Result<u32> {
         mods.get(index).copied().ok_or_else(|| {
-            unsupported(format!(
-                "`{}` 需要写全参数（例如 {}(N)），裸的写法本版不接受",
-                what, what
-            ))
+            unsupported(format!("{}", tr!("ir.irgen.072", arg0 = 
+                what, arg1 =  what
+            )))
         })
     };
 
@@ -836,45 +884,44 @@ fn column_type(type_name: &TypeName) -> Result<DataType> {
         "text" => Ok(DataType::Text),
         // 语法树里 `CHAR` 的实名是 `bpchar`
         "bpchar" | "char" => Ok(DataType::Char(match mods.first() {
-            // SQL 标准：裸 `CHAR` 就是 `CHAR(1)`
+            // SQL 标准:裸 `CHAR` 就是 `CHAR(1)`
             None => 1,
             Some(n) => *n,
         })),
         "varchar" => Ok(DataType::VarChar(need("VARCHAR", 0)?)),
-        // `DATE` 没有参数：PostgreSQL 的 `date` 也不带 typmod
+        // `DATE` 没有参数:PostgreSQL 的 `date` 也不带 typmod
         "date" => Ok(DataType::Date),
         "timestamp" | "timestamptz" => Ok(DataType::Timestamp(match mods.first() {
             None => DEFAULT_TIMESTAMP_PRECISION,
             Some(n) if *n <= MAX_TIMESTAMP_PRECISION => *n,
             Some(n) => {
-                return Err(unsupported(format!(
-                    "TIMESTAMP({})：小数秒上限是 {}",
-                    n, MAX_TIMESTAMP_PRECISION
-                )))
+                return Err(unsupported(format!("{}", tr!("ir.irgen.073", arg0 = 
+                    n, arg1 =  MAX_TIMESTAMP_PRECISION
+                ))))
             }
         })),
         "numeric" | "decimal" => match (mods.first(), mods.get(1)) {
             // `NUMERIC(N, M)`
             (Some(p), Some(s)) => Ok(DataType::Numeric(*p, *s)),
-            // `NUMERIC(N)`：与 PostgreSQL 一致，等于标度 0
+            // `NUMERIC(N)`:与 PostgreSQL 一致,等于标度 0
             (Some(p), None) => Ok(DataType::Numeric(*p, 0)),
-            // 裸 `NUMERIC`：精度与标度都不限
+            // 裸 `NUMERIC`:精度与标度都不限
             _ => Ok(DataType::NumericAny),
         },
-        other => Err(unsupported(format!("类型 `{}`", other))),
+        other => Err(unsupported(format!("{}", tr!("ir.irgen.074", arg0 =  other)))),
     }
 }
 
-/// 取出 `TypeName.typmods` 里的整数字面量。
+/// 取出 `TypeName.typmods` 里的整数字面量.
 fn type_mods(type_name: &TypeName) -> Result<Vec<u32>> {
     let mut out = Vec::with_capacity(type_name.typmods.len());
     for m in &type_name.typmods {
         match &m.node {
             Some(node::Node::AConst(c)) => match &c.val {
                 Some(Val::Ival(i)) if i.ival >= 0 => out.push(i.ival as u32),
-                _ => return Err(unsupported("类型参数不是非负整数")),
+                _ => return Err(unsupported(tr!("ir.irgen.075").into_owned())),
             },
-            _ => return Err(unsupported("类型参数不是常量")),
+            _ => return Err(unsupported(tr!("ir.irgen.076").into_owned())),
         }
     }
     Ok(out)
@@ -890,13 +937,13 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
         return Err(unsupported("RETURNING"));
     }
     if insert.with_clause.is_some() {
-        return Err(unsupported("WITH（公共表表达式）"));
+        return Err(unsupported(tr!("ir.irgen.077").into_owned()));
     }
 
     let relation = insert
         .relation
         .as_ref()
-        .ok_or_else(|| unsupported("没有表名"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.078").into_owned()))?;
     let table = qualified_name(relation)?;
 
     let target = symbols
@@ -904,11 +951,11 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
         .ok_or_else(|| DbError::UnknownSymbol { name: table.clone() })?
         .to_vec();
 
-    // 行数据在 select_stmt 里：`VALUES (...), (...)` 会变成带 values_lists 的
-    // SelectStmt，而 `INSERT ... SELECT` 的 values_lists 是空的。
+    // 行数据在 select_stmt 里:`VALUES (...), (...)` 会变成带 values_lists 的
+    // SelectStmt,而 `INSERT ... SELECT` 的 values_lists 是空的.
     let select = match insert.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
         Some(node::Node::SelectStmt(select)) => select,
-        _ => return Err(unsupported("INSERT 后面的这种来源（本版只支持 VALUES）")),
+        _ => return Err(unsupported(tr!("ir.irgen.079").into_owned())),
     };
     if select.values_lists.is_empty() {
         if select.target_list.is_empty() {
@@ -917,42 +964,41 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
         return Err(unsupported("INSERT ... SELECT"));
     }
 
-    // 列名表 → 「表的第 i 列的值在行内第几个位置」；`None` = 这一列没给值，
-    // 要补 `DEFAULT`（没有默认值就补 NULL，与 PostgreSQL 一致）
+    // 列名表 → "表的第 i 列的值在行内第几个位置";`None` = 这一列没给值,
+    // 要补 `DEFAULT`(没有默认值就补 NULL,与 PostgreSQL 一致)
     let permutation = column_permutation(insert, &target)?;
 
     let mut rows = Vec::with_capacity(select.values_lists.len());
     for values in &select.values_lists {
         let items = match &values.node {
             Some(node::Node::List(list)) => &list.items,
-            _ => return Err(unsupported("VALUES 里的这种项")),
+            _ => return Err(unsupported(tr!("ir.irgen.080").into_owned())),
         };
-        // 写全列时值个数必须与列数相同；写了列名表时与列名表的长度相同
+        // 写全列时值个数必须与列数相同;写了列名表时与列名表的长度相同
         let wanted = if insert.cols.is_empty() {
             target.len()
         } else {
             insert.cols.len()
         };
         if items.len() != wanted {
-            return Err(unsupported(format!(
-                "每一行要给 {} 个值，实际给了 {} 个",
-                wanted,
+            return Err(unsupported(format!("{}", tr!("ir.irgen.081", arg0 = 
+                wanted, arg1 = 
                 items.len()
-            )));
+            ))));
         }
 
-        // 按表列序重排。值表达式没有输入行，所以作用域是空的——
-        // 一旦里面出现列引用，Prog::verify 就会以「列下标越界」把它挡下来。
+        // 按表列序重排.值表达式没有输入行,所以作用域是空的--
+        // 一旦里面出现列引用,Prog::verify 就会以"列下标越界"把它挡下来.
         let scope = Scope::empty(symbols);
         let mut row = Vec::with_capacity(target.len());
         for (index, source) in permutation.iter().enumerate() {
             let column = &target[index];
             let mut p = ProgBuilder::new();
             let reg = match source {
-                // 用目标列的类型给这个值定型（`'Alice'` → TEXT、`'2024-01-15'` →
-                // TIMESTAMP、`1.5` → NUMERIC）。不做这一步，新类型基本插不进数据。
+                // 用目标列的类型给这个值定型(`'Alice'` → TEXT,`'2024-01-15'` →
+                // TIMESTAMP,`1.5` → NUMERIC).不做这一步,新类型基本插不进数据.
                 Some(source) => lower_expr_typed(&items[*source], &scope, Some(&column.ty), &mut p)?,
-                // 省略的列：有 `DEFAULT` 就补它，否则补 NULL
+                // 省略的列:有 `DEFAULT` 就补它,否则补 NULL
                 None => {
                     let value = default_value(column)?;
                     p.value(value)
@@ -960,9 +1006,9 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
             };
             row.push(p.finish(reg));
         }
-        // 值程序是不建计划直接 `eval` 的：子查询在这里没有求值环境，显式拒绝
+        // 值程序是不建计划直接 `eval` 的:子查询在这里没有求值环境,显式拒绝
         for program in &row {
-            reject_subqueries(program, "INSERT 的值")?;
+            reject_subqueries(program, &tr!("ir.irgen.082").into_owned())?;
         }
         rows.push(row);
     }
@@ -970,10 +1016,10 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
     Ok(Stmt::Insert { table, rows })
 }
 
-/// 一条省略列的补值：`DEFAULT`（存的是 CSV 字段形式）或 NULL。
+/// 一条省略列的补值:`DEFAULT`(存的是 CSV 字段形式)或 NULL.
 fn default_value(column: &Column) -> Result<Value> {
     match column.default_text() {
-        // CSV 字段形式 → 值：`\N` 是 NULL、以 `\` 开头的文本要反转义
+        // CSV 字段形式 → 值:`\N` 是 NULL,以 `\` 开头的文本要反转义
         Some(text) => column.ty.from_csv_field(text).map_err(|e| match e {
             DbError::BadValue {
                 ty, value, reason, ..
@@ -981,7 +1027,7 @@ fn default_value(column: &Column) -> Result<Value> {
                 column: Some(column.name.clone()),
                 ty,
                 value,
-                reason: format!("{}（列的 DEFAULT）", reason),
+                reason: format!("{}", tr!("ir.irgen.083", arg0 =  reason)),
             },
             other => other,
         }),
@@ -989,9 +1035,9 @@ fn default_value(column: &Column) -> Result<Value> {
     }
 }
 
-/// 算出「表的第 i 列，值应该从行内第几个位置取」；`None` 表示这一列被省略了。
+/// 算出"表的第 i 列,值应该从行内第几个位置取";`None` 表示这一列被省略了.
 fn column_permutation(insert: &InsertStmt, target: &[Column]) -> Result<Vec<Option<usize>>> {
-    // 没写列名表：值就按表的列序
+    // 没写列名表:值就按表的列序
     if insert.cols.is_empty() {
         return Ok((0..target.len()).map(Some).collect());
     }
@@ -1000,16 +1046,16 @@ fn column_permutation(insert: &InsertStmt, target: &[Column]) -> Result<Vec<Opti
     for (position, col) in insert.cols.iter().enumerate() {
         let name = match &col.node {
             Some(node::Node::ResTarget(rt)) => rt.name.clone(),
-            _ => return Err(unsupported("列名表里的这种项")),
+            _ => return Err(unsupported(tr!("ir.irgen.084").into_owned())),
         };
         if wanted.insert(name.clone(), position).is_some() {
-            return Err(unsupported(format!("列 `{}` 在列名表里出现了两次", name)));
+            return Err(unsupported(format!("{}", tr!("ir.irgen.085", arg0 =  name))));
         }
     }
 
-    // **先**查"表上根本没有这一列"。顺序很重要：若先按表列找，用户把列名写错时
-    // 会先撞上"某一列没被覆盖"，于是收到"你省略了那一列"——完全误导。实测就是
-    // 这样，被测试逮住了。
+    // **先**查"表上根本没有这一列".顺序很重要:若先按表列找,用户把列名写错时
+    // 会先撞上"某一列没被覆盖",于是收到"你省略了那一列"--完全误导.实测就是
+    // 这样,被测试逮住了.
     let table_names: BTreeSet<&str> = target.iter().map(|c| c.name.as_str()).collect();
     let unknown: Vec<String> = wanted
         .keys()
@@ -1023,8 +1069,8 @@ fn column_permutation(insert: &InsertStmt, target: &[Column]) -> Result<Vec<Opti
         });
     }
 
-    // 到这里 wanted 里的名字都是真列名；没被点到的列就是**省略**的列
-    // （补 `DEFAULT`，没有默认值就补 NULL——PostgreSQL 就是这么定的）。
+    // 到这里 wanted 里的名字都是真列名;没被点到的列就是**省略**的列
+    // (补 `DEFAULT`,没有默认值就补 NULL--PostgreSQL 就是这么定的).
     let mut permutation = Vec::with_capacity(target.len());
     for column in target {
         permutation.push(wanted.get(&column.name).copied());
@@ -1035,21 +1081,21 @@ fn column_permutation(insert: &InsertStmt, target: &[Column]) -> Result<Vec<Opti
 
 // ------------------------------------------------------------------- UPDATE
 
-/// 降级 `UPDATE ... SET ... [WHERE ...]`。
+/// 降级 `UPDATE ... SET ... [WHERE ...]`.
 ///
-/// 值与 `WHERE` 都是**按整张表**的扁平 schema 编的 `Prog`，两者都在**旧行**上求值
-/// （与 PostgreSQL 一致：`SET a = b, b = a` 换的是两列原本的值）。执行是"顺序扫一
-/// 遍、逐行改"（见 [`Stmt::Update`]）——没有 JOIN、没有 `RETURNING`、没有事务。
+/// 值与 `WHERE` 都是**按整张表**的扁平 schema 编的 `Prog`,两者都在**旧行**上求值
+/// (与 PostgreSQL 一致:`SET a = b, b = a` 换的是两列原本的值).执行是"顺序扫一
+/// 遍,逐行改"(见 [`Stmt::Update`])--没有 JOIN,没有 `RETURNING`.
 ///
-/// 这里显式拒绝的写法：`WITH`、`UPDATE ... FROM`、`RETURNING`、下标/字段赋值、
-/// 同一列赋值两次，以及值与 `WHERE` 里的**子查询**（那里没有求值环境：整条语句
-/// 不建计划，程序直接在整行上 `eval`）。
+/// 这里显式拒绝的写法:`WITH`,`UPDATE ... FROM`,`RETURNING`,下标/字段赋值,
+/// 同一列赋值两次,以及值与 `WHERE` 里的**子查询**(那里没有求值环境:整条语句
+/// 不建计划,程序直接在整行上 `eval`).
 fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
     if update.with_clause.is_some() {
-        return Err(unsupported("WITH（公共表表达式）"));
+        return Err(unsupported(tr!("ir.irgen.086").into_owned()));
     }
     if !update.from_clause.is_empty() {
-        return Err(unsupported("UPDATE ... FROM（多表更新）"));
+        return Err(unsupported(tr!("ir.irgen.087").into_owned()));
     }
     if !update.returning_list.is_empty() {
         return Err(unsupported("RETURNING"));
@@ -1058,7 +1104,7 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
     let relation = update
         .relation
         .as_ref()
-        .ok_or_else(|| unsupported("没有表名"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.088").into_owned()))?;
     let table = qualified_name(relation)?;
     let alias = relation
         .alias
@@ -1067,7 +1113,7 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
         .filter(|s| !s.is_empty());
     if let Some(a) = &relation.alias {
         if !a.colnames.is_empty() {
-            return Err(unsupported("UPDATE 的表别名后面带列名表"));
+            return Err(unsupported(tr!("ir.irgen.089").into_owned()));
         }
     }
 
@@ -1075,20 +1121,20 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
         .columns(&table)
         .ok_or_else(|| DbError::UnknownSymbol { name: table.clone() })?
         .to_vec();
-    // `scan: None`：`UPDATE` 不建计划，所以这一项既不下推也不走索引
+    // `scan: None`:`UPDATE` 不建计划,所以这一项既不下推也不走索引
     let scope = Scope::from_range(table.clone(), alias, columns.clone(), None, symbols);
 
     let mut sets: Vec<(usize, Prog)> = Vec::with_capacity(update.target_list.len());
     for target in &update.target_list {
         let rt = match &target.node {
             Some(node::Node::ResTarget(rt)) => rt,
-            _ => return Err(unsupported("SET 列表里的这种项")),
+            _ => return Err(unsupported(tr!("ir.irgen.090").into_owned())),
         };
         if !rt.indirection.is_empty() {
-            return Err(unsupported("下标 / 字段赋值（例如 `SET a[1] = …`）"));
+            return Err(unsupported(tr!("ir.irgen.091").into_owned()));
         }
         if rt.name.is_empty() {
-            return Err(unsupported("SET 少了列名"));
+            return Err(unsupported(tr!("ir.irgen.092").into_owned()));
         }
 
         let index = columns
@@ -1099,26 +1145,25 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
                 available: columns.iter().map(|c| c.name.clone()).collect(),
             })?;
         if sets.iter().any(|(at, _)| *at == index) {
-            return Err(unsupported(format!("列 `{}` 被赋值了两次", rt.name)));
+            return Err(unsupported(format!("{}", tr!("ir.irgen.093", arg0 =  rt.name))));
         }
 
-        let value = rt.val.as_deref().ok_or_else(|| unsupported("SET 少了值"))?;
+        let value = rt.val.as_deref().ok_or_else(|| unsupported(tr!("ir.irgen.094").into_owned()))?;
         let mut p = ProgBuilder::new();
-        // 用目标列的类型给字面量定型（与 INSERT 一样）
+        // 用目标列的类型给字面量定型(与 INSERT 一样)
         let reg = lower_expr_typed(value, &scope, Some(&columns[index].ty), &mut p)?;
         let program = p.finish(reg);
-        reject_subqueries(&program, "UPDATE 的值")?;
+        reject_subqueries(&program, &tr!("ir.irgen.095").into_owned())?;
         if program.verify(&columns)? == ScalarType::Bool {
-            return Err(unsupported(format!(
-                "列 `{}` 不能赋一个真值（布尔不是可存储的值）",
+            return Err(unsupported(format!("{}", tr!("ir.irgen.096", arg0 = 
                 rt.name
-            )));
+            ))));
         }
         sets.push((index, program));
     }
 
     if sets.is_empty() {
-        return Err(unsupported("空的 SET 列表"));
+        return Err(unsupported(tr!("ir.irgen.097").into_owned()));
     }
 
     let filter = match &update.where_clause {
@@ -1126,9 +1171,9 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
             let mut p = ProgBuilder::new();
             let reg = lower_expr(expr, &scope, &mut p)?;
             let program = p.finish(reg);
-            reject_subqueries(&program, "UPDATE 的 WHERE")?;
+            reject_subqueries(&program, &tr!("ir.irgen.098").into_owned())?;
             if program.verify(&columns)? != ScalarType::Bool {
-                return Err(unsupported("UPDATE 的 WHERE 必须是布尔表达式"));
+                return Err(unsupported(tr!("ir.irgen.099").into_owned()));
             }
             Some(program)
         }
@@ -1142,14 +1187,14 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
     })
 }
 
-/// 这个程序里有子查询 / 外层引用吗；有就拒绝。
+/// 这个程序里有子查询 / 外层引用吗;有就拒绝.
 ///
-/// `INSERT` 的值、`UPDATE` 的值与 `WHERE`、`CHECK` 都是**不建计划**直接 `eval` 的
-/// 程序，没有 [`crate::ir::exec`] 的求值环境——宁可在这里显式拒绝，也不要等执行
-/// 时报"需要求值环境"。
+/// `INSERT` 的值,`UPDATE` 的值与 `WHERE`,`CHECK` 都是**不建计划**直接 `eval` 的
+/// 程序,没有 [`crate::ir::exec`] 的求值环境--宁可在这里显式拒绝,也不要等执行
+/// 时报"需要求值环境".
 fn reject_subqueries(program: &Prog, what: &str) -> Result<()> {
     if program.has_subquery() || program.has_outer() {
-        return Err(unsupported(format!("{} 里的子查询 / 外层引用", what)));
+        return Err(unsupported(format!("{}", tr!("ir.irgen.100", arg0 =  what))));
     }
     Ok(())
 }
@@ -1157,21 +1202,21 @@ fn reject_subqueries(program: &Prog, what: &str) -> Result<()> {
 // ------------------------------------------------------------------ SELECT
 
 fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]) -> Result<Plan> {
-    // ---- 守卫：本版表达不了的 SELECT 形态，一律显式拒绝
+    // ---- 守卫:本版表达不了的 SELECT 形态,一律显式拒绝
     let set_op = SetOperation::try_from(select.op).unwrap_or(SetOperation::Undefined);
     if set_op != SetOperation::SetopNone {
-        // `SELECT … UNION SELECT …`：两支各自降级，再用 `Op::Union` 接起来
+        // `SELECT ... UNION SELECT ...`:两支各自降级,再用 `Op::Union` 接起来
         return lower_setop(select, set_op, symbols, outers);
     }
     if select.with_clause.is_some() {
-        return Err(unsupported("WITH（公共表表达式）"));
+        return Err(unsupported(tr!("ir.irgen.101").into_owned()));
     }
     let distinct = select_distinct(select)?;
     if !select.window_clause.is_empty() {
-        return Err(unsupported("窗口函数（OVER）"));
+        return Err(unsupported(tr!("ir.irgen.102").into_owned()));
     }
     if !select.values_lists.is_empty() {
-        return Err(unsupported("VALUES 列表"));
+        return Err(unsupported(tr!("ir.irgen.103").into_owned()));
     }
     if select.into_clause.is_some() {
         return Err(unsupported("SELECT INTO"));
@@ -1185,7 +1230,7 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]
     if select.target_list.is_empty() {
         return Err(DbError::IrInvalid {
             node: None,
-            message: "SELECT 没有任何输出列".to_string(),
+            message: tr!("ir.irgen.104").into_owned(),
         });
     }
 
@@ -1193,14 +1238,14 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]
 
     // ---- FROM
     //
-    // 外层链在这一步就挂上去：`WHERE` / 输出列表 / `ORDER BY` 里的相关子查询都要
-    // 沿着它往外解名字。
+    // 外层链在这一步就挂上去:`WHERE` / 输出列表 / `ORDER BY` 里的相关子查询都要
+    // 沿着它往外解名字.
     let (from_id, scope) = lower_from(&select.from_clause, &mut b, symbols, outers)?;
     let schema = scope.schema();
 
-    // ---- WHERE（Filter 不改变 schema，所以后面几个都还按同一个 scope 解）
+    // ---- WHERE(Filter 不改变 schema,所以后面几个都还按同一个 scope 解)
     //
-    // 能推到单表的合取项就推（见 `opt::pushdown`），推不动的留在 `Filter` 里。
+    // 能推到单表的合取项就推(见 `opt::pushdown`),推不动的留在 `Filter` 里.
     let filtered = match &select.where_clause {
         Some(expr) => opt::pushdown::plan_where(expr, from_id, &scope, &mut b)?,
         None => from_id,
@@ -1208,8 +1253,8 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]
 
     // ---- 是分组查询吗
     //
-    // 三种情况都算：写了 GROUP BY；写了 HAVING；输出列表或 ORDER BY 里出现了聚合。
-    // 最后一种正是 `SELECT COUNT(*) FROM t`（整表一组）。
+    // 三种情况都算:写了 GROUP BY;写了 HAVING;输出列表或 ORDER BY 里出现了聚合.
+    // 最后一种正是 `SELECT COUNT(*) FROM t`(整表一组).
     let grouped = !select.group_clause.is_empty()
         || select.having_clause.is_some()
         || select.target_list.iter().any(contains_aggregate)
@@ -1225,15 +1270,15 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]
 
     // ---- ORDER BY
     //
-    // SQL 里 `ORDER BY` 既能用输出列的别名、输出列序号，也能用输入列，两者解析规则
-    // 不同。做法是**两遍**：
+    // SQL 里 `ORDER BY` 既能用输出列的别名,输出列序号,也能用输入列,两者解析规则
+    // 不同.做法是**两遍**:
     //
-    // 1. 先按**输出 schema** 解（序号在这里才认），解得动就把 Sort 放在 Project 之上；
-    // 2. 解不动再按**输入 schema** 解：这一遍会把输出别名与序号换成目标项自己的
-    //    表达式（`p.surname` 这种限定列名只能在输入作用域解），Sort 放在 Project 之下。
+    // 1. 先按**输出 schema** 解(序号在这里才认),解得动就把 Sort 放在 Project 之上;
+    // 2. 解不动再按**输入 schema** 解:这一遍会把输出别名与序号换成目标项自己的
+    //    表达式(`p.surname` 这种限定列名只能在输入作用域解),Sort 放在 Project 之下.
     //
-    // 但**只要出现了输出列序号，就不许走第 2 遍**：序号退回输入作用域会被当成
-    // 常量，排出来的是"常量序"——那正是 TODO 0.1 要修掉的那个假通过。
+    // 但**只要出现了输出列序号,就不许走第 2 遍**:序号退回输入作用域会被当成
+    // 常量,排出来的是"常量序"--那正是 TODO 0.1 要修掉的那个假通过.
     let output_columns: Vec<Column> = progs
         .iter()
         .zip(names.iter())
@@ -1259,11 +1304,11 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]
         }
     };
 
-    // ---- 拼装：Sort(下) → Project → Sort(上) → Limit
+    // ---- 拼装:Sort(下) → Project → Sort(上) → Limit
     let mut current = filtered;
 
-    // 没有 ORDER BY 时 sort_keys 为空，**不生成 Sort 节点**
-    // （空排序键是非法计划，analyze 会拒绝）。
+    // 没有 ORDER BY 时 sort_keys 为空,**不生成 Sort 节点**
+    // (空排序键是非法计划,analyze 会拒绝).
     if sort_below_project && !sort_keys.is_empty() {
         current = b.sort(current, sort_keys.clone())?;
     }
@@ -1272,7 +1317,7 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]
         current = b.project(current, progs, names.clone())?;
     }
 
-    // `SELECT DISTINCT`：去的是**输出行**，所以 Distinct 挂在 Project 之上
+    // `SELECT DISTINCT`:去的是**输出行**,所以 Distinct 挂在 Project 之上
     if distinct {
         current = b.distinct(current)?;
     }
@@ -1289,14 +1334,14 @@ fn lower_select(select: &SelectStmt, symbols: &SymbolTable, outers: &[Scope<'_>]
     b.finish(current)
 }
 
-/// 分组查询的管道：
+/// 分组查询的管道:
 ///
 /// ```text
 /// Limit( Sort( Project( Filter(HAVING)( Aggregate( 输入 ) ) ) ) )
 /// ```
 ///
-/// 顺序上有一处**不能动**：`SELECT` 列表与 `HAVING` 都要在**建 Aggregate 节点之前**
-/// 降级完，因为 `HAVING` 里可能第一次出现某个聚合，后建节点才能把它的规格收全。
+/// 顺序上有一处**不能动**:`SELECT` 列表与 `HAVING` 都要在**建 Aggregate 节点之前**
+/// 降级完,因为 `HAVING` 里可能第一次出现某个聚合,后建节点才能把它的规格收全.
 fn lower_grouped(
     select: &SelectStmt,
     input: NodeId,
@@ -1306,7 +1351,7 @@ fn lower_grouped(
 ) -> Result<Plan> {
     let mut agg = AggLowering::default();
 
-    // ---- GROUP BY 的分组键（按输入行求值）
+    // ---- GROUP BY 的分组键(按输入行求值)
     for group in &select.group_clause {
         if matches!(group.node, Some(node::Node::GroupingSet(_))) {
             return Err(unsupported("GROUPING SETS / ROLLUP / CUBE"));
@@ -1317,7 +1362,7 @@ fn lower_grouped(
         agg.group_names.push(derived_name(group));
     }
 
-    // ---- SELECT 列表与 HAVING（外层），都先降级，把聚合收齐
+    // ---- SELECT 列表与 HAVING(外层),都先降级,把聚合收齐
     let (progs, names) = lower_target_list_agg(&select.target_list, scope, &mut agg)?;
 
     let having = match &select.having_clause {
@@ -1329,8 +1374,8 @@ fn lower_grouped(
         None => None,
     };
 
-    // ---- ORDER BY 的排序键（也要在**建 Aggregate 之前**降级：排序键里可能
-    //      第一次出现某个聚合，例如 `ORDER BY AVG(x)`）
+    // ---- ORDER BY 的排序键(也要在**建 Aggregate 之前**降级:排序键里可能
+    //      第一次出现某个聚合,例如 `ORDER BY AVG(x)`)
     let mut sort_keys = Vec::with_capacity(select.sort_clause.len());
     for item in &select.sort_clause {
         let sb = sort_by(item)?;
@@ -1339,8 +1384,8 @@ fn lower_grouped(
         let expr = sb
             .node
             .as_deref()
-            .ok_or_else(|| unsupported("空的排序键"))?;
-        // 输出列序号或输出别名都先换成目标项的表达式，于是所有键都按分组降级、
+            .ok_or_else(|| unsupported(tr!("ir.irgen.105").into_owned()))?;
+        // 输出列序号或输出别名都先换成目标项的表达式,于是所有键都按分组降级,
         // 统一索引聚合输出
         let expr = match sort_ordinal_literal(expr) {
             Some(n) => target_expr(&select.target_list, n)?,
@@ -1356,13 +1401,13 @@ fn lower_grouped(
         });
     }
 
-    // ---- 现在聚合规格齐了，建 Aggregate
+    // ---- 现在聚合规格齐了,建 Aggregate
     let agg_names: Vec<String> = agg
         .specs
         .iter()
         .map(|spec| spec.func.name().to_lowercase())
         .collect();
-    // 这里只为数量对得上做一次校验；`analyze` 才是权威
+    // 这里只为数量对得上做一次校验;`analyze` 才是权威
     let _ = aggregate_schema(
         &agg.groups,
         &agg.group_names,
@@ -1383,12 +1428,12 @@ fn lower_grouped(
         vec![input],
     )?;
 
-    // ---- HAVING：在 Aggregate 之上、Project 之下（所以用不了输出别名，与 PG 一致）
+    // ---- HAVING:在 Aggregate 之上,Project 之下(所以用不了输出别名,与 PG 一致)
     if let Some(having) = having {
         current = b.filter(current, having)?;
     }
 
-    // ---- ORDER BY：排序键索引的是**聚合输出**，所以 Sort 必须在 Project 之下
+    // ---- ORDER BY:排序键索引的是**聚合输出**,所以 Sort 必须在 Project 之下
     if !sort_keys.is_empty() {
         current = b.sort(current, sort_keys)?;
     }
@@ -1396,7 +1441,7 @@ fn lower_grouped(
     // ---- 投影
     current = b.project(current, progs, names.clone())?;
 
-    // `SELECT DISTINCT`：去的是**输出行**，所以 Distinct 挂在 Project 之上
+    // `SELECT DISTINCT`:去的是**输出行**,所以 Distinct 挂在 Project 之上
     if select_distinct(select)? {
         current = b.distinct(current)?;
     }
@@ -1409,11 +1454,11 @@ fn lower_grouped(
     b.finish(current)
 }
 
-/// `SELECT DISTINCT` 吗。
+/// `SELECT DISTINCT` 吗.
 ///
-/// 语法树里裸 `DISTINCT` 是 **`list_make1(NIL)`**——一个"空节点"的列表（实测；
-/// 不是 `A_Star`）。`DISTINCT ON (…)` 则是实打实的表达式列表，本版的扁平 schema
-/// 表达不了"每组留一行"，所以明确拒绝。
+/// 语法树里裸 `DISTINCT` 是 **`list_make1(NIL)`**--一个"空节点"的列表(实测;
+/// 不是 `A_Star`).`DISTINCT ON (...)` 则是实打实的表达式列表,本版的扁平 schema
+/// 表达不了"每组留一行",所以明确拒绝.
 fn select_distinct(select: &SelectStmt) -> Result<bool> {
     match select.distinct_clause.as_slice() {
         [] => Ok(false),
@@ -1444,10 +1489,10 @@ fn const_u64(node: &Node, what: &str) -> Result<u64> {
             Some(Val::Fval(f)) => f
                 .fval
                 .parse::<u64>()
-                .map_err(|_| unsupported(format!("{} 必须是常量整数", what))),
-            _ => Err(unsupported(format!("{} 必须是常量整数", what))),
+                .map_err(|_| unsupported(format!("{}", tr!("ir.irgen.106", arg0 =  what)))),
+            _ => Err(unsupported(format!("{}", tr!("ir.irgen.107", arg0 =  what)))),
         },
-        _ => Err(unsupported(format!("{} 必须是常量整数", what))),
+        _ => Err(unsupported(format!("{}", tr!("ir.irgen.108", arg0 =  what)))),
     }
 }
 
@@ -1459,7 +1504,7 @@ fn lower_from<'s>(
     symbols: &'s SymbolTable,
     outers: &[Scope<'s>],
 ) -> Result<(NodeId, Scope<'s>)> {
-    // 没有 FROM：`SELECT 1 + 1` 这种，底座是单行零列。
+    // 没有 FROM:`SELECT 1 + 1` 这种,底座是单行零列.
     if from.is_empty() {
         return Ok((
             b.single_row(),
@@ -1468,11 +1513,11 @@ fn lower_from<'s>(
     }
 
     let mut iter = from.iter();
-    let first = iter.next().expect("from 非空");
+    let first = iter.next().expect(&tr!("ir.irgen.109").into_owned());
     let (mut id, mut scope) = lower_from_item(first, b, symbols, outers)?;
 
-    // `FROM a, b`：pg_query 给的是两个元素、**没有 JoinExpr**。
-    // 左深折叠成无条件内连接（笛卡尔积），过滤条件由 WHERE 提供。
+    // `FROM a, b`:pg_query 给的是两个元素,**没有 JoinExpr**.
+    // 左深折叠成无条件内连接(笛卡尔积),过滤条件由 WHERE 提供.
     for item in iter {
         let (right_id, right_scope) = lower_from_item(item, b, symbols, outers)?;
         id = b.join(
@@ -1509,13 +1554,13 @@ fn lower_from_item<'s>(
                 .filter(|s| !s.is_empty());
             if let Some(a) = &rv.alias {
                 if !a.colnames.is_empty() {
-                    return Err(unsupported("AS 后面带列名表（AS t(a, b)）"));
+                    return Err(unsupported(tr!("ir.irgen.110").into_owned()));
                 }
             }
 
             let id = b.scan(&name);
-            // 别名只用于限定名匹配（`t.x`），**不改列名**——列名保持表自己的，
-            // 这样 Scope 的 schema 才与 `Plan::analyze` 推出来的一致。
+            // 别名只用于限定名匹配(`t.x`),**不改列名**--列名保持表自己的,
+            // 这样 Scope 的 schema 才与 `Plan::analyze` 推出来的一致.
             Ok((
                 id,
                 Scope::from_range(name, alias, columns, Some(id), symbols)
@@ -1531,21 +1576,21 @@ fn lower_from_item<'s>(
             }
             let inner = match sub.subquery.as_deref().and_then(|n| n.node.as_ref()) {
                 Some(node::Node::SelectStmt(select)) => select,
-                _ => return Err(unsupported("派生表里的这种语句")),
+                _ => return Err(unsupported(tr!("ir.irgen.111").into_owned())),
             };
             let alias = sub
                 .alias
                 .as_ref()
-                .ok_or_else(|| unsupported("派生表必须有别名（`FROM (...) AS t`）"))?;
+                .ok_or_else(|| unsupported(tr!("ir.irgen.112").into_owned()))?;
             if !alias.colnames.is_empty() {
-                return Err(unsupported("派生表的列名表（`AS t(a, b)`）"));
+                return Err(unsupported(tr!("ir.irgen.113").into_owned()));
             }
 
-            // 派生表**看不到**同一个查询里的兄弟项（那是 `LATERAL` 的事），所以它的
-            // 外层链就是**当前查询的外层链**，不含本层。
+            // 派生表**看不到**同一个查询里的兄弟项(那是 `LATERAL` 的事),所以它的
+            // 外层链就是**当前查询的外层链**,不含本层.
             let plan = lower_select(inner, symbols, outers)?;
-            // 用浅层分析问 schema：这个计划马上要被接进外层，它的外层引用还等着
-            // 外层 `analyze` 校验（那时候外边是什么已经完全确定）。
+            // 用浅层分析问 schema:这个计划马上要被接进外层,它的外层引用还等着
+            // 外层 `analyze` 校验(那时候外边是什么已经完全确定).
             let columns = plan.analyze_shallow(symbols)?.schemas[plan.root].clone();
 
             let id = b.splice(plan)?;
@@ -1556,8 +1601,8 @@ fn lower_from_item<'s>(
                     .nested_in(outers.to_vec()),
             ))
         }
-        Some(node::Node::RangeFunction(_)) => Err(unsupported("FROM 里的函数调用")),
-        _ => Err(unsupported("FROM 里的这种项")),
+        Some(node::Node::RangeFunction(_)) => Err(unsupported(tr!("ir.irgen.114").into_owned())),
+        _ => Err(unsupported(tr!("ir.irgen.115").into_owned())),
     }
 }
 
@@ -1571,37 +1616,38 @@ fn lower_join<'s>(
         return Err(unsupported("NATURAL JOIN"));
     }
     if !j.using_clause.is_empty() {
-        // USING 会把连接列**并成一列**，本版的输出 schema 表达不了这个合并，
-        // 所以宁可拒绝，也不给一个列重复出现的错误结果。
+        // USING 会把连接列**并成一列**,本版的输出 schema 表达不了这个合并,
+        // 所以宁可拒绝,也不给一个列重复出现的错误结果.
         return Err(unsupported(
-            "JOIN ... USING（它会把连接列并成一列，本版的扁平 schema 表达不了；请改用 ON）",
+            tr!("ir.irgen.116").into_owned(),
         ));
     }
     if j.join_using_alias.is_some() {
-        return Err(unsupported("USING 后面的别名"));
+        return Err(unsupported(tr!("ir.irgen.117").into_owned()));
     }
 
     let join_kind = match JoinType::try_from(j.jointype).unwrap_or(JoinType::Undefined) {
         JoinType::JoinInner => JoinKind::Inner,
         JoinType::JoinLeft => JoinKind::Left,
         other => {
-            return Err(unsupported(match other {
-                JoinType::JoinRight => "RIGHT JOIN",
-                JoinType::JoinFull => "FULL JOIN",
-                JoinType::JoinSemi => "SEMI JOIN",
-                JoinType::JoinAnti => "ANTI JOIN",
-                _ => "这种连接类型",
-            }))
+            let what = match other {
+                JoinType::JoinRight => "RIGHT JOIN".to_string(),
+                JoinType::JoinFull => "FULL JOIN".to_string(),
+                JoinType::JoinSemi => "SEMI JOIN".to_string(),
+                JoinType::JoinAnti => "ANTI JOIN".to_string(),
+                _ => tr!("ir.irgen.118").into_owned(),
+            };
+            return Err(unsupported(what))
         }
     };
 
-    let larg = j.larg.as_deref().ok_or_else(|| unsupported("连接缺左支"))?;
-    let rarg = j.rarg.as_deref().ok_or_else(|| unsupported("连接缺右支"))?;
+    let larg = j.larg.as_deref().ok_or_else(|| unsupported(tr!("ir.irgen.119").into_owned()))?;
+    let rarg = j.rarg.as_deref().ok_or_else(|| unsupported(tr!("ir.irgen.120").into_owned()))?;
 
     let (left_id, left_scope) = lower_from_item(larg, b, symbols, outers)?;
     let (right_id, mut right_scope) = lower_from_item(rarg, b, symbols, outers)?;
 
-    // 左外连接：右支是**可空侧**，它的 FROM 项不下推谓词（见 `Range::nullable`）
+    // 左外连接:右支是**可空侧**,它的 FROM 项不下推谓词(见 `Range::nullable`)
     if join_kind == JoinKind::Left {
         right_scope.mark_nullable();
     }
@@ -1609,7 +1655,7 @@ fn lower_join<'s>(
     let left_width = left_scope.schema().len();
     let scope = Scope::concat(left_scope, right_scope);
 
-    // `ON` 整条降级成**一个**程序：等值键只用来缩小候选集，候选对不对仍由它复核
+    // `ON` 整条降级成**一个**程序:等值键只用来缩小候选集,候选对不对仍由它复核
     let on = match &j.quals {
         Some(expr) => {
             let mut p = ProgBuilder::new();
@@ -1619,16 +1665,16 @@ fn lower_join<'s>(
         None => None,
     };
 
-    // 挑执行策略：先认等值键，再看内侧能不能建索引
+    // 挑执行策略:先认等值键,再看内侧能不能建索引
     let strategy = match &j.quals {
         Some(expr) => {
             let mut items = Vec::new();
             opt::conjuncts(expr, &mut items);
             let keys = opt::join::equi_keys(&items, &scope, left_width);
-            let inner = b.op(right_id).expect("右支刚压进去");
+            let inner = b.op(right_id).expect(&tr!("ir.irgen.121").into_owned());
             opt::join::join_strategy(keys, inner, scope.symbols())
         }
-        // 没有 `ON`（`JOIN ... ON` 之外只在 `FROM a, b` 的叉积里出现）就没有键
+        // 没有 `ON`(`JOIN ... ON` 之外只在 `FROM a, b` 的叉积里出现)就没有键
         None => JoinStrategy::NestedLoop,
     };
 
@@ -1638,10 +1684,9 @@ fn lower_join<'s>(
 
 fn qualified_name(rv: &RangeVar) -> Result<String> {
     if !rv.catalogname.is_empty() {
-        return Err(unsupported(format!(
-            "跨库引用 `{}.{}`",
-            rv.catalogname, rv.relname
-        )));
+        return Err(unsupported(format!("{}", tr!("ir.irgen.122", arg0 = 
+            rv.catalogname, arg1 =  rv.relname
+        ))));
     }
     if rv.schemaname.is_empty() {
         Ok(rv.relname.clone())
@@ -1659,12 +1704,12 @@ fn lower_target_list(targets: &[Node], scope: &Scope<'_>) -> Result<(Vec<Prog>, 
     for target in targets {
         let rt = match &target.node {
             Some(node::Node::ResTarget(rt)) => rt,
-            _ => return Err(unsupported("SELECT 列表里的这种元素")),
+            _ => return Err(unsupported(tr!("ir.irgen.123").into_owned())),
         };
         let value = rt
             .val
             .as_deref()
-            .ok_or_else(|| unsupported("空的输出列"))?;
+            .ok_or_else(|| unsupported(tr!("ir.irgen.124").into_owned()))?;
 
         // `*` 与 `t.*`
         if let Some(node::Node::ColumnRef(c)) = &value.node {
@@ -1707,7 +1752,7 @@ fn lower_target_list(targets: &[Node], scope: &Scope<'_>) -> Result<(Vec<Prog>, 
     Ok((progs, names))
 }
 
-/// 没有 `AS` 时，列名的推导规则：列引用用列名，其它用 `?column?`（跟 PostgreSQL 一致）。
+/// 没有 `AS` 时,列名的推导规则:列引用用列名,其它用 `?column?`(跟 PostgreSQL 一致).
 fn derived_name(value: &Node) -> String {
     if let Some(node::Node::ColumnRef(c)) = &value.node {
         if let Some(parts) = ref_parts(&c.fields) {
@@ -1719,7 +1764,7 @@ fn derived_name(value: &Node) -> String {
     "?column?".to_string()
 }
 
-/// 这个程序是不是「原样取第 i 列」。用来省掉恒等的 `Project`。
+/// 这个程序是不是"原样取第 i 列".用来省掉恒等的 `Project`.
 fn is_identity(progs: &[Prog], names: &[String], schema: &[Column]) -> bool {
     progs.len() == schema.len()
         && progs
@@ -1741,10 +1786,10 @@ fn lower_sort_keys(sort_clause: &[Node], scope: &Scope<'_>, ordinals: bool) -> R
         let expr = sb
             .node
             .as_deref()
-            .ok_or_else(|| unsupported("空的排序键"))?;
+            .ok_or_else(|| unsupported(tr!("ir.irgen.125").into_owned()))?;
 
         let mut p = ProgBuilder::new();
-        // `ORDER BY 3` 在**输出作用域**里指的是第 3 个输出列，不是常量 3
+        // `ORDER BY 3` 在**输出作用域**里指的是第 3 个输出列,不是常量 3
         let reg = match (ordinals, sort_ordinal_literal(expr)) {
             (true, Some(n)) => ordinal_column(n, scope, &mut p)?,
             _ => lower_expr(expr, scope, &mut p)?,
@@ -1759,11 +1804,11 @@ fn lower_sort_keys(sort_clause: &[Node], scope: &Scope<'_>, ordinals: bool) -> R
     Ok(keys)
 }
 
-/// `ORDER BY` 的第二遍：全部按**输入作用域**解。
+/// `ORDER BY` 的第二遍:全部按**输入作用域**解.
 ///
-/// 输出别名与输出列序号都要先换成"目标项自己的表达式"——它们只在输出作用域里
-/// 有意义，而这一遍面对的是输入 schema（`p.surname`、`m1.title` 这类限定列名
-/// 只有在输入作用域才解得动，测试 11.1 / 12.1 就是这个形状）。
+/// 输出别名与输出列序号都要先换成"目标项自己的表达式"--它们只在输出作用域里
+/// 有意义,而这一遍面对的是输入 schema(`p.surname`,`m1.title` 这类限定列名
+/// 只有在输入作用域才解得动,测试 11.1 / 12.1 就是这个形状).
 fn lower_sort_keys_below(
     sort_clause: &[Node],
     targets: &[Node],
@@ -1778,7 +1823,7 @@ fn lower_sort_keys_below(
         let expr = sb
             .node
             .as_deref()
-            .ok_or_else(|| unsupported("空的排序键"))?;
+            .ok_or_else(|| unsupported(tr!("ir.irgen.126").into_owned()))?;
 
         let expr = match sort_ordinal_literal(expr) {
             Some(n) => target_expr(targets, n)?,
@@ -1797,7 +1842,7 @@ fn lower_sort_keys_below(
     Ok(keys)
 }
 
-/// 排序键是不是一个**整数常量**（`ORDER BY 3`）；是就返回它的字面值。
+/// 排序键是不是一个**整数常量**(`ORDER BY 3`);是就返回它的字面值.
 fn sort_ordinal_literal(node: &Node) -> Option<i64> {
     match &node.node {
         Some(node::Node::AConst(c)) => match &c.val {
@@ -1809,7 +1854,7 @@ fn sort_ordinal_literal(node: &Node) -> Option<i64> {
     }
 }
 
-/// 排序子句里有没有输出列序号。
+/// 排序子句里有没有输出列序号.
 fn sort_clause_has_ordinal(sort_clause: &[Node]) -> bool {
     sort_clause.iter().any(|item| {
         sort_by(item)
@@ -1820,44 +1865,44 @@ fn sort_clause_has_ordinal(sort_clause: &[Node]) -> bool {
     })
 }
 
-/// 输出列序号 → 输出作用域里的那一列（1 起）。越界在这里就报错。
+/// 输出列序号 → 输出作用域里的那一列(1 起).越界在这里就报错.
 fn ordinal_column(n: i64, scope: &Scope<'_>, p: &mut ProgBuilder) -> Result<Reg> {
     let width = scope.ranges.first().map(|r| r.columns.len()).unwrap_or(0);
     if n < 1 || n as usize > width {
         return Err(DbError::UnknownColumn {
-            name: format!("ORDER BY 序号 {}", n),
+            name: format!("{}", tr!("ir.irgen.127", arg0 =  n)),
             available: scope.column_names(),
         });
     }
     Ok(p.col(n as usize - 1))
 }
 
-/// 输出列序号 → 输出列表里那一项的表达式（1 起）。
+/// 输出列序号 → 输出列表里那一项的表达式(1 起).
 ///
-/// `SELECT *` 展不开（一个 `ResTarget` 对应好几列），所以那时只能报错。
+/// `SELECT *` 展不开(一个 `ResTarget` 对应好几列),所以那时只能报错.
 fn target_expr<'a>(targets: &'a [Node], n: i64) -> Result<&'a Node> {
     let index = match usize::try_from(n) {
         Ok(n) if n >= 1 => n - 1,
         _ => 0,
     };
     let target = targets.get(index).ok_or_else(|| DbError::UnknownColumn {
-        name: format!("ORDER BY 序号 {}", n),
+        name: format!("{}", tr!("ir.irgen.128", arg0 =  n)),
         available: (1..=targets.len()).map(|i| i.to_string()).collect(),
     })?;
 
     let rt = match &target.node {
         Some(node::Node::ResTarget(rt)) => rt,
-        _ => return Err(unsupported("ORDER BY 里的这种输出项")),
+        _ => return Err(unsupported(tr!("ir.irgen.129").into_owned())),
     };
     let value = rt
         .val
         .as_deref()
-        .ok_or_else(|| unsupported("空的输出项"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.130").into_owned()))?;
 
     if let Some(node::Node::ColumnRef(c)) = &value.node {
         if star_ref(&c.fields).is_some() {
             return Err(unsupported(
-                "`SELECT *` 上的 `ORDER BY <序号>`：星号展不开，请写列名",
+                tr!("ir.irgen.131").into_owned(),
             ));
         }
     }
@@ -1868,14 +1913,14 @@ fn target_expr<'a>(targets: &'a [Node], n: i64) -> Result<&'a Node> {
 fn sort_by(item: &Node) -> Result<&SortBy> {
     match &item.node {
         Some(node::Node::SortBy(sb)) => Ok(sb),
-        _ => Err(unsupported("ORDER BY 里的这种项")),
+        _ => Err(unsupported(tr!("ir.irgen.132").into_owned())),
     }
 }
 
-/// `(是否降序, NULL 是否排最前)`。
+/// `(是否降序, NULL 是否排最前)`.
 ///
-/// NULL 的位置是**绝对**的，PostgreSQL 的默认是 ASC → NULLS LAST、
-/// DESC → NULLS FIRST。
+/// NULL 的位置是**绝对**的,PostgreSQL 的默认是 ASC → NULLS LAST,
+/// DESC → NULLS FIRST.
 fn sort_direction(sb: &SortBy) -> Result<(bool, bool)> {
     let desc = match SortByDir::try_from(sb.sortby_dir).unwrap_or(SortByDir::Undefined) {
         SortByDir::SortbyAsc | SortByDir::SortbyDefault => false,
@@ -1893,15 +1938,15 @@ fn sort_direction(sb: &SortBy) -> Result<(bool, bool)> {
     Ok((desc, nulls_first))
 }
 
-/// `ORDER BY` 里的裸标识符如果是**显式输出别名**，就换成它对应的表达式。
+/// `ORDER BY` 里的裸标识符如果是**显式输出别名**,就换成它对应的表达式.
 ///
-/// 这一步必须在降级**之前**做：换完以后所有排序键都按「分组」降级，于是它们统一
-/// 索引 `Aggregate` 的输出 schema，`Sort` 就能干净地放在 `Project` 之下。
-/// 不然一个子句里混着别名（索引输出）与分组列（索引聚合输出），一个 `Sort`
-/// 节点没法同时满足两种下标。
+/// 这一步必须在降级**之前**做:换完以后所有排序键都按"分组"降级,于是它们统一
+/// 索引 `Aggregate` 的输出 schema,`Sort` 就能干净地放在 `Project` 之下.
+/// 不然一个子句里混着别名(索引输出)与分组列(索引聚合输出),一个 `Sort`
+/// 节点没法同时满足两种下标.
 ///
-/// 注意 `ResTarget.name` **只有写了 `AS` 才有值**，所以这里只会命中真别名，
-/// 不会把 `ORDER BY s.student_id` 误当成别名。
+/// 注意 `ResTarget.name` **只有写了 `AS` 才有值**,所以这里只会命中真别名,
+/// 不会把 `ORDER BY s.student_id` 误当成别名.
 fn substitute_alias<'a>(expr: &'a Node, targets: &'a [Node]) -> &'a Node {
     let name = match &expr.node {
         Some(node::Node::ColumnRef(c)) => match ref_parts(&c.fields) {
@@ -1926,20 +1971,20 @@ fn substitute_alias<'a>(expr: &'a Node, targets: &'a [Node]) -> &'a Node {
 
 // ----------------------------------------------------------------- 表达式
 
-/// 降级一个表达式，不允许用上下文定型字面量。
+/// 降级一个表达式,不允许用上下文定型字面量.
 pub(crate) fn lower_expr(node: &Node, scope: &Scope<'_>, p: &mut ProgBuilder) -> Result<Reg> {
     lower_expr_in(node, scope, None, None, p)
 }
 
-/// 分组查询的外层：表达式按「每个分组算一次」降级。
+/// 分组查询的外层:表达式按"每个分组算一次"降级.
 fn lower_expr_agg(node: &Node, scope: &Scope<'_>, agg: &mut AggLowering, p: &mut ProgBuilder) -> Result<Reg> {
     lower_expr_in(node, scope, None, Some(agg), p)
 }
 
-/// 降级一个表达式，并用 `expected` 解释**无类型字面量**。
+/// 降级一个表达式,并用 `expected` 解释**无类型字面量**.
 ///
-/// 为什么需要这个：语法树里的 `'2024-01-15'` 只是个字符串，而 `WHERE ts = '...'`
-/// 里的 `ts` 是 TIMESTAMP。没有上下文定型，新类型根本没法用。
+/// 为什么需要这个:语法树里的 `'2024-01-15'` 只是个字符串,而 `WHERE ts = '...'`
+/// 里的 `ts` 是 TIMESTAMP.没有上下文定型,新类型根本没法用.
 fn lower_expr_typed(
     node: &Node,
     scope: &Scope<'_>,
@@ -1949,8 +1994,8 @@ fn lower_expr_typed(
     lower_expr_in(node, scope, expected, None, p)
 }
 
-/// 真正的实现。`agg` 为 `Some` 时是**分组查询的外层**：
-/// 聚合调用变成对聚合输出的列引用、裸列引用去 `GROUP BY` 列表里找。
+/// 真正的实现.`agg` 为 `Some` 时是**分组查询的外层**:
+/// 聚合调用变成对聚合输出的列引用,裸列引用去 `GROUP BY` 列表里找.
 fn lower_expr_in(
     node: &Node,
     scope: &Scope<'_>,
@@ -1963,14 +2008,14 @@ fn lower_expr_in(
         if let Some(func) = aggregate_func(call) {
             let agg = agg
                 .as_deref_mut()
-                .ok_or_else(|| unsupported("聚合函数出现在了不能出现的位置（只能在 SELECT、HAVING、ORDER BY 里）"))?;
+                .ok_or_else(|| unsupported(tr!("ir.irgen.133").into_owned()))?;
             let slot = agg.slot_for(node, call, func, scope)?;
             // 聚合输出 schema = [分组键...] ++ [聚合结果...]
             return Ok(p.col(agg.groups.len() + slot));
         }
     }
 
-    // 2) 整个表达式就是某个分组键？
+    // 2) 整个表达式就是某个分组键?
     if let Some(agg) = agg.as_deref() {
         if let Some(index) = agg.match_group(node, scope) {
             return Ok(p.col(index));
@@ -1980,24 +2025,22 @@ fn lower_expr_in(
     match &node.node {
         Some(node::Node::ColumnRef(c)) => {
             let parts = ref_parts(&c.fields)
-                .ok_or_else(|| unsupported("`*` 只能用在输出列表里，不能出现在表达式中"))?;
+                .ok_or_else(|| unsupported(tr!("ir.irgen.134").into_owned()))?;
             let resolved = scope.resolve(&parts)?;
-            // 分组模式下能走到这里，说明这一列既不是分组键、也没被聚合包住
+            // 分组模式下能走到这里,说明这一列既不是分组键,也没被聚合包住
             if agg.is_some() {
-                return Err(unsupported(format!(
-                    "分组查询里的列 `{}` 必须出现在 GROUP BY 里，或者被用在聚合函数里",
+                return Err(unsupported(format!("{}", tr!("ir.irgen.135", arg0 = 
                     parts.join(".")
-                )));
+                ))));
             }
             match resolved {
                 Resolved::Local(index) => Ok(p.col(index)),
-                // 相关子查询：读外层那一行的那一列
+                // 相关子查询:读外层那一行的那一列
                 Resolved::Outer { depth, index } => {
                     let ty = scope.outer_type_at(depth, index).ok_or_else(|| {
-                        unsupported(format!(
-                            "外层列 `{}` 的类型查不到（作用域链对不上）",
+                        unsupported(format!("{}", tr!("ir.irgen.136", arg0 = 
                             parts.join(".")
-                        ))
+                        )))
                     })?;
                     Ok(p.outer(depth, index, ScalarType::Value(ty.family())))
                 }
@@ -2007,22 +2050,22 @@ fn lower_expr_in(
         Some(node::Node::AConst(c)) => lower_const(c, expected, p),
 
         Some(node::Node::TypeCast(tc)) => {
-            // `TYPE 'literal'` / `'literal'::TYPE` 是「给字面量定型」：直接按目标类型
-            // 解析那个字面量，与过去完全一样。
+            // `TYPE 'literal'` / `'literal'::TYPE` 是"给字面量定型":直接按目标类型
+            // 解析那个字面量,与过去完全一样.
             //
-            // 别的表达式（`x::numeric`）走 `Step::Cast`：只有值模型里真有意义的几组
-            // 转换会通过（同族恒等、`INT → NUMERIC`、`NULL`），别的在验证期就被
-            // `cast_type` 拒绝。
+            // 别的表达式(`x::numeric`)走 `Step::Cast`:只有值模型里真有意义的几组
+            // 转换会通过(同族恒等,`INT → NUMERIC`,`NULL`),别的在验证期就被
+            // `cast_type` 拒绝.
             let target = column_type(
                 tc.type_name
                     .as_ref()
-                    .ok_or_else(|| unsupported("没有目标类型的转换"))?,
+                    .ok_or_else(|| unsupported(tr!("ir.irgen.137").into_owned()))?,
             )?;
             match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
                 Some(node::Node::AConst(c)) => lower_const(c, Some(&target), p),
                 Some(_) => {
                     let value = lower_expr_in(
-                        tc.arg.as_deref().expect("上面已经确认有参数"),
+                        tc.arg.as_deref().expect(&tr!("ir.irgen.138").into_owned()),
                         scope,
                         None,
                         agg.as_deref_mut(),
@@ -2030,11 +2073,11 @@ fn lower_expr_in(
                     )?;
                     Ok(p.cast(value, target))
                 }
-                None => Err(unsupported("没有参数的转换")),
+                None => Err(unsupported(tr!("ir.irgen.139").into_owned())),
             }
         }
 
-        // `CURRENT_DATE` 之类的 SQL 内建值（PostgreSQL 解析成 `SQLValueFunction`）
+        // `CURRENT_DATE` 之类的 SQL 内建值(PostgreSQL 解析成 `SQLValueFunction`)
         Some(node::Node::SqlvalueFunction(value)) => lower_sql_value_function(value, p),
 
         Some(node::Node::AExpr(a)) => lower_aexpr(a, scope, agg.as_deref_mut(), p),
@@ -2043,19 +2086,19 @@ fn lower_expr_in(
 
         Some(node::Node::NullTest(nt)) => {
             if nt.argisrow {
-                return Err(unsupported("行级的 IS NULL（IS NULL 用在 ROW 上）"));
+                return Err(unsupported(tr!("ir.irgen.140").into_owned()));
             }
             let negated = match NullTestType::try_from(nt.nulltesttype)
                 .unwrap_or(NullTestType::Undefined)
             {
                 NullTestType::IsNull => false,
                 NullTestType::IsNotNull => true,
-                _ => return Err(unsupported("这种 NULL 测试")),
+                _ => return Err(unsupported(tr!("ir.irgen.141").into_owned())),
             };
             let arg = nt
                 .arg
                 .as_deref()
-                .ok_or_else(|| unsupported("IS NULL 没有参数"))?;
+                .ok_or_else(|| unsupported(tr!("ir.irgen.142").into_owned()))?;
             let src = lower_expr(arg, scope, p)?;
             Ok(p.is_null(src, negated))
         }
@@ -2064,36 +2107,36 @@ fn lower_expr_in(
         }
         Some(node::Node::SubLink(link)) => lower_sublink(link, scope, agg.as_deref_mut(), p),
         Some(node::Node::CaseExpr(case)) => lower_case(case, scope, agg.as_deref_mut(), p),
-        Some(node::Node::Param(_)) => Err(unsupported("参数占位符（$1）")),
-        Some(node::Node::SetToDefault(_)) => Err(unsupported("DEFAULT（例如 `SET c = DEFAULT`）")),
-        Some(node::Node::AStar(_)) => Err(unsupported("`*` 只能用在输出列表里")),
-        _ => Err(unsupported("这种表达式")),
+        Some(node::Node::Param(_)) => Err(unsupported(tr!("ir.irgen.143").into_owned())),
+        Some(node::Node::SetToDefault(_)) => Err(unsupported(tr!("ir.irgen.144").into_owned())),
+        Some(node::Node::AStar(_)) => Err(unsupported(tr!("ir.irgen.145").into_owned())),
+        _ => Err(unsupported(tr!("ir.irgen.146").into_owned())),
     }
 }
 
-/// 内层查询的**外层链**：本层在前，然后一层层往外。
+/// 内层查询的**外层链**:本层在前,然后一层层往外.
 ///
-/// 这就是相关子查询的全部"绑定"：内层降级时解名字会沿着它往外走，解到的每一层都
-/// 记成一个 `Step::Outer { depth, index }`（`depth` 是这里的位置）。
+/// 这就是相关子查询的全部"绑定":内层降级时解名字会沿着它往外走,解到的每一层都
+/// 记成一个 `Step::Outer { depth, index }`(`depth` 是这里的位置).
 fn outer_chain<'s>(scope: &Scope<'s>) -> Vec<Scope<'s>> {
     std::iter::once(scope.clone())
         .chain(scope.outers.iter().cloned())
         .collect()
 }
 
-/// `SubLink`：标量子查询、`EXISTS`、`IN`/`= ANY`/`= ALL (子查询)`。
+/// `SubLink`:标量子查询,`EXISTS`,`IN`/`= ANY`/`= ALL (子查询)`.
 ///
-/// 内层查询降级成一份**自足**的 `Plan`（它自己的 `nodes`/`root`），连同"它引用外层
-/// 哪些 schema"一起装进 [`SubPlan`]。执行时外层每来一行，内层就重开一份源——拉取式
-/// 之下这只是多调一次构建（见 `ir/exec.rs` 的 `ExecCtx`）。
+/// 内层查询降级成一份**自足**的 `Plan`(它自己的 `nodes`/`root`),连同"它引用外层
+/// 哪些 schema"一起装进 [`SubPlan`].执行时外层每来一行,内层就重开一份源--拉取式
+/// 之下这只是多调一次构建(见 `ir/exec.rs` 的 `ExecCtx`).
 ///
-/// 实测过的语法树形状：
+/// 实测过的语法树形状:
 ///
-/// * `EXISTS` → `EXISTS_SUBLINK`，没有 `testexpr`；
-/// * `(SELECT …)` → `EXPR_SUBLINK`；
-/// * `x IN (SELECT …)` → `ANY_SUBLINK`，`operName` 是**空的**（这正是它与
-///   `= ANY` 的区别）；`NOT IN` 会在外面套一个 `NOT`；
-/// * `x <op> ANY/ALL (SELECT …)` → `ANY_SUBLINK`/`ALL_SUBLINK` + `operName`。
+/// * `EXISTS` → `EXISTS_SUBLINK`,没有 `testexpr`;
+/// * `(SELECT ...)` → `EXPR_SUBLINK`;
+/// * `x IN (SELECT ...)` → `ANY_SUBLINK`,`operName` 是**空的**(这正是它与
+///   `= ANY` 的区别);`NOT IN` 会在外面套一个 `NOT`;
+/// * `x <op> ANY/ALL (SELECT ...)` → `ANY_SUBLINK`/`ALL_SUBLINK` + `operName`.
 fn lower_sublink(
     link: &SubLink,
     scope: &Scope<'_>,
@@ -2107,13 +2150,13 @@ fn lower_sublink(
         .subselect
         .as_deref()
         .and_then(|node| node.node.as_ref())
-        .ok_or_else(|| unsupported("空的子查询"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.147").into_owned()))?;
     let select = match subselect {
         node::Node::SelectStmt(select) => select,
-        _ => return Err(unsupported("子查询里的这种语句")),
+        _ => return Err(unsupported(tr!("ir.irgen.148").into_owned())),
     };
 
-    // 模式；`ANY` / `ALL` 还要把左边的表达式降级出来
+    // 模式;`ANY` / `ALL` 还要把左边的表达式降级出来
     let mode = match kind {
         SubLinkType::ExistsSublink => SubMode::Exists,
         SubLinkType::ExprSublink => SubMode::Scalar,
@@ -2121,9 +2164,9 @@ fn lower_sublink(
             let test_node = link
                 .testexpr
                 .as_deref()
-                .ok_or_else(|| unsupported("ANY / ALL 没有左边的表达式"))?;
+                .ok_or_else(|| unsupported(tr!("ir.irgen.149").into_owned()))?;
             let op = match single_string(&link.oper_name).as_deref() {
-                // `IN`（operName 为空）与 `= ANY` 是同一件事
+                // `IN`(operName 为空)与 `= ANY` 是同一件事
                 None | Some("=") => BinOp::Eq,
                 Some(other) => binop_of(other)?,
             };
@@ -2136,30 +2179,29 @@ fn lower_sublink(
             }
         }
         other => {
-            return Err(unsupported(format!("子查询 {}", other.as_str_name())))
+            return Err(unsupported(format!("{}", tr!("ir.irgen.150", arg0 =  other.as_str_name()))))
         }
     };
 
-    // 内层的外层链。
+    // 内层的外层链.
     //
-    // 分组查询里**不做相关子查询**：那种写法在 PostgreSQL 里也要求相关列出现在
-    // `GROUP BY` 里，本版没有那套检查，与其猜，不如让外层链为空——内层一旦引用外层
-    // 就会以"找不到这一列"报错（响的、不是安静的）。
+    // 分组查询里**不做相关子查询**:那种写法在 PostgreSQL 里也要求相关列出现在
+    // `GROUP BY` 里,本版没有那套检查,与其猜,不如让外层链为空--内层一旦引用外层
+    // 就会以"找不到这一列"报错(响的,不是安静的).
     let chain = match grouped {
         true => Vec::new(),
         false => outer_chain(scope),
     };
 
     let plan = lower_select(select, scope.symbols, &chain)?;
-    // 浅层分析：只要 schema（深一层的外层引用等着外层 `analyze` 校验）
+    // 浅层分析:只要 schema(深一层的外层引用等着外层 `analyze` 校验)
     let schema = plan.analyze_shallow(scope.symbols)?.schemas[plan.root].clone();
     let arity = schema.len();
 
     if matches!(mode, SubMode::Scalar | SubMode::Quantified { .. }) && arity != 1 {
-        return Err(unsupported(format!(
-            "这个子查询必须只输出一列，实际有 {} 列",
+        return Err(unsupported(format!("{}", tr!("ir.irgen.151", arg0 = 
             arity
-        )));
+        ))));
     }
 
     let inner = match schema.first() {
@@ -2180,23 +2222,23 @@ fn lower_sublink(
     Ok(p.subquery(spec))
 }
 
-/// `CASE WHEN ... THEN ... ELSE ... END`。
+/// `CASE WHEN ... THEN ... ELSE ... END`.
 ///
-/// 叠成一条**嵌套的 [`Step::Case`](super::expr::Step::Case) 链**，每一层一个分支：
+/// 叠成一条**嵌套的 [`Step::Case`](super::expr::Step::Case) 链**,每一层一个分支:
 ///
 /// ```text
 /// p:      [cond_1]  Case{ then_1, else = P_2 }
 /// P_2:    [cond_2]  Case{ then_2, else = P_3 }
-/// …
+/// ...
 /// P_n:    [cond_n]  Case{ then_n, else = 自足程序 }
 /// ```
 ///
-/// 于是惰性成立：`cond_i` 只在前 i-1 个条件都不成立时才求值，`THEN`/`ELSE` 的值
-/// 只在被选中时才求值——**死分支一行都不算**（`CASE WHEN 1 = 0 THEN 1/0 ELSE 42
-/// END` 是 42）。最外层那一层直接压进调用方的 `p`，其余各层是新开的子程序。
+/// 于是惰性成立:`cond_i` 只在前 i-1 个条件都不成立时才求值,`THEN`/`ELSE` 的值
+/// 只在被选中时才求值--**死分支一行都不算**(`CASE WHEN 1 = 0 THEN 1/0 ELSE 42
+/// END` 是 42).最外层那一层直接压进调用方的 `p`,其余各层是新开的子程序.
 ///
-/// 每一层还要回答一个问题：**统一后的类型是 `NUMERIC` 吗**（`INT` 分支要真的
-/// 放大）。见 [`widen_flag`]。
+/// 每一层还要回答一个问题:**统一后的类型是 `NUMERIC` 吗**(`INT` 分支要真的
+/// 放大).见 [`widen_flag`].
 fn lower_case(
     case: &CaseExpr,
     scope: &Scope<'_>,
@@ -2205,11 +2247,11 @@ fn lower_case(
 ) -> Result<Reg> {
     if case.arg.is_some() {
         return Err(unsupported(
-            "简单 CASE（`CASE x WHEN ...`）——请写成 `CASE WHEN x = ... THEN ...` 形式",
+            tr!("ir.irgen.152").into_owned(),
         ));
     }
 
-    // 没有 WHEN 分支时整个 `CASE` 就是 ELSE（语法上不该出现，防一手）
+    // 没有 WHEN 分支时整个 `CASE` 就是 ELSE(语法上不该出现,防一手)
     if case.args.is_empty() {
         return match &case.defresult {
             Some(default) => lower_expr_in(default, scope, None, agg.as_deref_mut(), p),
@@ -2217,32 +2259,32 @@ fn lower_case(
         };
     }
 
-    // 起点：ELSE 那一段（本身就是一个自足程序）
+    // 起点:ELSE 那一段(本身就是一个自足程序)
     let mut else_prog = match &case.defresult {
         Some(default) => branch_prog(default, scope, agg.as_deref_mut())?,
         None => value_prog(Value::Null),
     };
 
-    // 从最后一支往前叠。`i == 0` 那一层落在调用方的 `p` 上，其余各层各自开程序。
+    // 从最后一支往前叠.`i == 0` 那一层落在调用方的 `p` 上,其余各层各自开程序.
     for (i, when) in case.args.iter().enumerate().rev() {
         let arm = match &when.node {
             Some(node::Node::CaseWhen(arm)) => arm,
-            _ => return Err(unsupported("CASE 里的这种项")),
+            _ => return Err(unsupported(tr!("ir.irgen.153").into_owned())),
         };
         let cond_node = arm
             .expr
             .as_deref()
-            .ok_or_else(|| unsupported("CASE WHEN 没有条件"))?;
+            .ok_or_else(|| unsupported(tr!("ir.irgen.154").into_owned()))?;
         let value_node = arm
             .result
             .as_deref()
-            .ok_or_else(|| unsupported("CASE THEN 没有结果"))?;
+            .ok_or_else(|| unsupported(tr!("ir.irgen.155").into_owned()))?;
 
         if i == 0 {
-            // 外层：条件与 `Case` 都写在调用方的程序里
+            // 外层:条件与 `Case` 都写在调用方的程序里
             let cond = lower_expr_in(cond_node, scope, None, agg.as_deref_mut(), p)?;
             let then_prog = branch_prog(value_node, scope, agg.as_deref_mut())?;
-            // 探针必须在这两支都降级完之后：它们用到的聚合都已经登记了
+            // 探针必须在这两支都降级完之后:它们用到的聚合都已经登记了
             let widen = widen_flag(&then_prog, &else_prog, scope, agg.as_deref());
             return Ok(p.case(cond, then_prog, else_prog, widen));
         }
@@ -2255,11 +2297,11 @@ fn lower_case(
         else_prog = inner.finish(dst);
     }
 
-    // 循环一定会从 `i == 0` 那一层 return；走到这里说明 `args` 是空的
-    unreachable!("上面已经挡掉了空的 CASE")
+    // 循环一定会从 `i == 0` 那一层 return;走到这里说明 `args` 是空的
+    unreachable!("{}", tr!("ir.irgen.156"))
 }
 
-/// 把一个表达式降级成**自足的子程序**（`CASE` 的分支、`AND`/`OR` 的右侧）。
+/// 把一个表达式降级成**自足的子程序**(`CASE` 的分支,`AND`/`OR` 的右侧).
 fn branch_prog(
     node: &Node,
     scope: &Scope<'_>,
@@ -2270,26 +2312,26 @@ fn branch_prog(
     Ok(p.finish(reg))
 }
 
-/// 一个常量值构成的程序。
+/// 一个常量值构成的程序.
 fn value_prog(value: Value) -> Prog {
     let mut p = ProgBuilder::new();
     let reg = p.value(value);
     p.finish(reg)
 }
 
-/// 这一层 `CASE` 要不要放大：`INT` 与 `NUMERIC` 两个分支统一成 `NUMERIC`。
+/// 这一层 `CASE` 要不要放大:`INT` 与 `NUMERIC` 两个分支统一成 `NUMERIC`.
 ///
-/// 类型探针面对的程序输入 schema 与 `Plan::analyze` 用的是同一个：
+/// 类型探针面对的程序输入 schema 与 `Plan::analyze` 用的是同一个:
 ///
-/// * 普通情况就是**当前作用域的扁平 schema**（[`Scope::schema`]）；
-/// * 分组查询（`agg` 是 `Some`）里，程序面对的是 `Aggregate` 的**输出** schema
-///   （`[分组键...] ++ [聚合结果...]`），用 [`aggregate_schema`] 现算一份。
-///   探针在分支降级**之后**才跑，所以分支用到的聚合都已经登记，这一份 schema 与
-///   `analyze` 推出来的在那些下标上逐位相同。
+/// * 普通情况就是**当前作用域的扁平 schema**([`Scope::schema`]);
+/// * 分组查询(`agg` 是 `Some`)里,程序面对的是 `Aggregate` 的**输出** schema
+///   (`[分组键...] ++ [聚合结果...]`),用 [`aggregate_schema`] 现算一份.
+///   探针在分支降级**之后**才跑,所以分支用到的聚合都已经登记,这一份 schema 与
+///   `analyze` 推出来的在那些下标上逐位相同.
 ///
-/// 探针拿不到类型就给 `false`：那种程序本来就过不了 `analyze`（同一套规则），
-/// 而 [`Prog::verify`](super::expr::Prog::verify) 还会核对这个标志——
-/// 对不上就报 `IrInvalid`，不会静默少转。
+/// 探针拿不到类型就给 `false`:那种程序本来就过不了 `analyze`(同一套规则),
+/// 而 [`Prog::verify`](super::expr::Prog::verify) 还会核对这个标志--
+/// 对不上就报 `IrInvalid`,不会静默少转.
 fn widen_flag(
     then_prog: &Prog,
     else_prog: &Prog,
@@ -2326,7 +2368,7 @@ fn widen_flag(
     )
 }
 
-/// 标量函数调用。目前只认 `ROUND`。
+/// 标量函数调用.目前只认 `ROUND`.
 fn lower_func_call(
     call: &FuncCall,
     scope: &Scope<'_>,
@@ -2340,21 +2382,20 @@ fn lower_func_call(
             Some(node::Node::String(s)) => Some(s.sval.clone()),
             _ => None,
         })
-        .ok_or_else(|| unsupported("看不懂的函数名"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.157").into_owned()))?;
 
-    // 聚合函数：只有当整个查询是分组查询时才会被 `lower_expr_agg` 接走；
-    // 走到这里说明它出现在了不该出现的地方（例如 WHERE 里）。
+    // 聚合函数:只有当整个查询是分组查询时才会被 `lower_expr_agg` 接走;
+    // 走到这里说明它出现在了不该出现的地方(例如 WHERE 里).
     if aggregate_func(call).is_some() {
         if call.over.is_some() {
-            return Err(unsupported("窗口函数（OVER）"));
+            return Err(unsupported(tr!("ir.irgen.158").into_owned()));
         }
-        return Err(unsupported(format!(
-            "聚合函数 `{}` 出现在了不能出现的位置（只能在 SELECT、HAVING、ORDER BY 里）",
+        return Err(unsupported(format!("{}", tr!("ir.irgen.159", arg0 = 
             name
-        )));
+        ))));
     }
     if call.over.is_some() {
-        return Err(unsupported("窗口函数（OVER）"));
+        return Err(unsupported(tr!("ir.irgen.160").into_owned()));
     }
 
     match name.as_str() {
@@ -2371,7 +2412,7 @@ fn lower_func_call(
                     let zero = p.int(0);
                     vec![v, zero]
                 }
-                _ => return Err(unsupported("ROUND 的参数个数（要 1 个或 2 个）")),
+                _ => return Err(unsupported(tr!("ir.irgen.161").into_owned())),
             };
             Ok(p.call(ScalarFunc::Round, args))
         }
@@ -2379,7 +2420,7 @@ fn lower_func_call(
         "upper" => {
             let args = match call.args.as_slice() {
                 [value] => vec![lower_expr_in(value, scope, None, agg.as_deref_mut(), p)?],
-                _ => return Err(unsupported("UPPER 的参数个数（要 1 个）")),
+                _ => return Err(unsupported(tr!("ir.irgen.162").into_owned())),
             };
             Ok(p.call(ScalarFunc::Upper, args))
         }
@@ -2387,7 +2428,7 @@ fn lower_func_call(
         "length" => {
             let args = match call.args.as_slice() {
                 [text] => vec![lower_expr_in(text, scope, None, agg.as_deref_mut(), p)?],
-                _ => return Err(unsupported("LENGTH 的参数个数（要 1 个）")),
+                _ => return Err(unsupported(tr!("ir.irgen.163").into_owned())),
             };
             Ok(p.call(ScalarFunc::Length, args))
         }
@@ -2398,15 +2439,15 @@ fn lower_func_call(
                     lower_expr_in(text, scope, None, agg.as_deref_mut(), p)?,
                     lower_expr_in(count, scope, None, agg.as_deref_mut(), p)?,
                 ],
-                _ => return Err(unsupported("LEFT 的参数个数（要 2 个）")),
+                _ => return Err(unsupported(tr!("ir.irgen.164").into_owned())),
             };
             Ok(p.call(ScalarFunc::Left, args))
         }
 
-        // `CONCAT_WS(sep, a, b, …)`：变参，逐个数降级
+        // `CONCAT_WS(sep, a, b, ...)`:变参,逐个数降级
         "concat_ws" => {
             if call.args.is_empty() {
-                return Err(unsupported("CONCAT_WS 至少要给分隔符"));
+                return Err(unsupported(tr!("ir.irgen.165").into_owned()));
             }
             let mut args = Vec::with_capacity(call.args.len());
             for arg in &call.args {
@@ -2415,51 +2456,49 @@ fn lower_func_call(
             Ok(p.call(ScalarFunc::ConcatWs, args))
         }
 
-        // `EXTRACT(YEAR FROM ts)`：语法树里是 `FuncCall("extract", [字段, 值])`，
-        // 字段是 `A_Const` 的字符串（`makeStringConst`）。
+        // `EXTRACT(YEAR FROM ts)`:语法树里是 `FuncCall("extract", [字段, 值])`,
+        // 字段是 `A_Const` 的字符串(`makeStringConst`).
         "extract" => {
             let (field, value) = match call.args.as_slice() {
                 [field, value] => (field, value),
                 _ => {
                     return Err(unsupported(
-                        "EXTRACT 的参数个数（要写成 `EXTRACT(field FROM x)`）",
+                        tr!("ir.irgen.166").into_owned(),
                     ))
                 }
             };
             let field = const_string(field)
-                .ok_or_else(|| unsupported("EXTRACT 的字段必须是常量（例如 YEAR）"))?;
+                .ok_or_else(|| unsupported(tr!("ir.irgen.167").into_owned()))?;
             if !field.eq_ignore_ascii_case("year") {
-                return Err(unsupported(format!(
-                    "EXTRACT 的字段 `{}`（本版只支持 YEAR）",
+                return Err(unsupported(format!("{}", tr!("ir.irgen.168", arg0 = 
                     field
-                )));
+                ))));
             }
             let value = lower_expr_in(value, scope, None, agg.as_deref_mut(), p)?;
             Ok(p.call(ScalarFunc::ExtractYear, vec![value]))
         }
 
-        other => Err(unsupported(format!("函数 `{}`", other))),
+        other => Err(unsupported(format!("{}", tr!("ir.irgen.169", arg0 =  other)))),
     }
 }
 
-/// `CURRENT_DATE` 之类的 SQL 内建值。
+/// `CURRENT_DATE` 之类的 SQL 内建值.
 ///
-/// 本版只认 `CURRENT_DATE`，产出一个 `DATE`（定宽的 `YYYY-MM-DD` 规范文本，于是
-/// 字典序就是时间序）。本版没有任何日期运算，所以它只用来当值取出来、或用
-/// `EXTRACT(YEAR FROM …)` 取年份。
+/// 本版只认 `CURRENT_DATE`,产出一个 `DATE`(定宽的 `YYYY-MM-DD` 规范文本,于是
+/// 字典序就是时间序).本版没有任何日期运算,所以它只用来当值取出来,或用
+/// `EXTRACT(YEAR FROM ...)` 取年份.
 fn lower_sql_value_function(f: &SqlValueFunction, p: &mut ProgBuilder) -> Result<Reg> {
     let op =
         SqlValueFunctionOp::try_from(f.op).unwrap_or(SqlValueFunctionOp::SqlvalueFunctionOpUndefined);
     match op {
         SqlValueFunctionOp::SvfopCurrentDate => Ok(p.value(Value::Date(current_date()))),
-        other => Err(unsupported(format!(
-            "`{}`（本版只支持 CURRENT_DATE）",
+        other => Err(unsupported(format!("{}", tr!("ir.irgen.170", arg0 = 
             other.as_str_name()
-        ))),
+        )))),
     }
 }
 
-/// 今天的日期，规范成 `YYYY-MM-DD`（本地时钟；由 [`civil_date_from_days`] 换算）。
+/// 今天的日期,规范成 `YYYY-MM-DD`(本地时钟;由 [`civil_date_from_days`] 换算).
 fn current_date() -> String {
     let days = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2469,19 +2508,19 @@ fn current_date() -> String {
     format!("{:04}-{:02}-{:02}", year, month, day)
 }
 
-/// 从 Unix 纪元起的天数算出公历 `(年, 月, 日)`（Howard Hinnant 的 `civil_from_days`）。
+/// 从 Unix 纪元起的天数算出公历 `(年, 月, 日)`(Howard Hinnant 的 `civil_from_days`).
 ///
-/// 只要"今天是几号"这一件事，不值得引入日期库；推导过程全是整数运算，与
-/// `1970-01-01` 对应 0 的约定一起构成可单测的事实。
+/// 只要"今天是几号"这一件事,不值得引入日期库;推导过程全是整数运算,与
+/// `1970-01-01` 对应 0 的约定一起构成可单测的事实.
 pub fn civil_date_from_days(days: i64) -> (i32, u32, u32) {
-    // 把纪元挪到 0000-03-01（这样闰年规则落在同一年内的末尾）
+    // 把纪元挪到 0000-03-01(这样闰年规则落在同一年内的末尾)
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]，3 月是 0
+    let mp = (5 * doy + 2) / 153; // [0, 11],3 月是 0
     let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     (
@@ -2491,7 +2530,7 @@ pub fn civil_date_from_days(days: i64) -> (i32, u32, u32) {
     )
 }
 
-/// 这是个聚合函数调用吗。窗口函数（带 `OVER`）**不算**——那是另一回事。
+/// 这是个聚合函数调用吗.窗口函数(带 `OVER`)**不算**--那是另一回事.
 fn aggregate_func(call: &FuncCall) -> Option<AggFunc> {
     if call.over.is_some() {
         return None;
@@ -2510,7 +2549,7 @@ fn aggregate_func(call: &FuncCall) -> Option<AggFunc> {
     }
 }
 
-/// 这棵表达式子树里有没有聚合调用。
+/// 这棵表达式子树里有没有聚合调用.
 fn contains_aggregate(node: &Node) -> bool {
     match &node.node {
         Some(node::Node::FuncCall(call)) => {
@@ -2527,9 +2566,9 @@ fn contains_aggregate(node: &Node) -> bool {
             c.args.iter().any(contains_aggregate)
                 || c.defresult.as_deref().is_some_and(contains_aggregate)
         }
-        // `CASE WHEN <条件> THEN <值>` 的**条件和值都可能是聚合**：
-        // `CASE WHEN COUNT(*) > 0 THEN …` 就是一个分组查询。漏掉这一支会让"是不是
-        // 分组查询"判错，于是聚合被当成"出现在了不能出现的位置"。
+        // `CASE WHEN <条件> THEN <值>` 的**条件和值都可能是聚合**:
+        // `CASE WHEN COUNT(*) > 0 THEN ...` 就是一个分组查询.漏掉这一支会让"是不是
+        // 分组查询"判错,于是聚合被当成"出现在了不能出现的位置".
         Some(node::Node::CaseWhen(arm)) => {
             arm.expr.as_deref().is_some_and(contains_aggregate)
                 || arm.result.as_deref().is_some_and(contains_aggregate)
@@ -2537,31 +2576,31 @@ fn contains_aggregate(node: &Node) -> bool {
         Some(node::Node::NullTest(n)) => n.arg.as_deref().is_some_and(contains_aggregate),
         Some(node::Node::TypeCast(t)) => t.arg.as_deref().is_some_and(contains_aggregate),
         Some(node::Node::ResTarget(r)) => r.val.as_deref().is_some_and(contains_aggregate),
-        // `ORDER BY COUNT(*)` 同样是分组查询（排序键也是"外层"表达式）
+        // `ORDER BY COUNT(*)` 同样是分组查询(排序键也是"外层"表达式)
         Some(node::Node::SortBy(s)) => s.node.as_deref().is_some_and(contains_aggregate),
         _ => false,
     }
 }
 
-/// 分组查询降级时的状态。
+/// 分组查询降级时的状态.
 ///
-/// **一趟到底**：外层的表达式边降级边登记聚合，而不是先走一遍收集再走一遍改写。
-/// 两趟写法要求两次遍历的访问顺序完全一致，错了就会**静默串位**；用 AST 节点地址
-/// 认同一个聚合，一趟就够，也不会重复登记同一个 `COUNT(*)`。
+/// **一趟到底**:外层的表达式边降级边登记聚合,而不是先走一遍收集再走一遍改写.
+/// 两趟写法要求两次遍历的访问顺序完全一致,错了就会**静默串位**;用 AST 节点地址
+/// 认同一个聚合,一趟就够,也不会重复登记同一个 `COUNT(*)`.
 #[derive(Default)]
 struct AggLowering {
-    /// `GROUP BY` 的表达式，按输入行求值。
+    /// `GROUP BY` 的表达式,按输入行求值.
     groups: Vec<Prog>,
-    /// 分组键的输出列名（仅用于展示／给聚合节点起名）。
+    /// 分组键的输出列名(仅用于展示/给聚合节点起名).
     group_names: Vec<String>,
-    /// 已登记的聚合。
+    /// 已登记的聚合.
     specs: Vec<AggSpec>,
-    /// 哪个 AST 聚合调用节点对应哪个槽位（按节点地址认）。
+    /// 哪个 AST 聚合调用节点对应哪个槽位(按节点地址认).
     slots: Vec<(*const Node, usize)>,
 }
 
 impl AggLowering {
-    /// 登记一个聚合，返回它的槽位。同一个 AST 节点只登记一次。
+    /// 登记一个聚合,返回它的槽位.同一个 AST 节点只登记一次.
     fn slot_for(
         &mut self,
         node: &Node,
@@ -2575,11 +2614,11 @@ impl AggLowering {
         }
 
         if !call.agg_order.is_empty() {
-            return Err(unsupported("聚合函数里的 ORDER BY"));
+            return Err(unsupported(tr!("ir.irgen.171").into_owned()));
         }
 
-        // `FILTER (WHERE …)` 按**输入行**求值（不是分组外层），所以走 `lower_expr`：
-        // 里面的聚合调用因此也会被挡在"不能出现的位置"上，与 PostgreSQL 一致。
+        // `FILTER (WHERE ...)` 按**输入行**求值(不是分组外层),所以走 `lower_expr`:
+        // 里面的聚合调用因此也会被挡在"不能出现的位置"上,与 PostgreSQL 一致.
         let filter = match call.agg_filter.as_deref() {
             Some(node) => {
                 let mut p = ProgBuilder::new();
@@ -2598,12 +2637,11 @@ impl AggLowering {
                     let reg = lower_expr(only, scope, &mut p)?;
                     Some(p.finish(reg))
                 }
-                [] => return Err(unsupported(format!("{}() 需要参数", func.name()))),
+                [] => return Err(unsupported(format!("{}", tr!("ir.irgen.172", arg0 =  func.name())))),
                 _ => {
-                    return Err(unsupported(format!(
-                        "{}(...) 只接受一个参数",
+                    return Err(unsupported(format!("{}", tr!("ir.irgen.173", arg0 = 
                         func.name()
-                    )))
+                    ))))
                 }
             }
         };
@@ -2619,12 +2657,12 @@ impl AggLowering {
         Ok(slot)
     }
 
-    /// 这个表达式整体是不是某个分组键；是就返回它的下标。
+    /// 这个表达式整体是不是某个分组键;是就返回它的下标.
     fn match_group(&self, node: &Node, scope: &Scope<'_>) -> Option<usize> {
         if self.groups.is_empty() {
             return None;
         }
-        // 按输入行降级一次再比程序。含聚合的表达式这里会失败，于是"不算分组键"。
+        // 按输入行降级一次再比程序.含聚合的表达式这里会失败,于是"不算分组键".
         let mut p = ProgBuilder::new();
         let reg = lower_expr(node, scope, &mut p).ok()?;
         let prog = p.finish(reg);
@@ -2632,7 +2670,7 @@ impl AggLowering {
     }
 }
 
-/// 算 `Aggregate` 节点的输出 schema（与 `Op::Aggregate` 的 analyze 规则一致）。
+/// 算 `Aggregate` 节点的输出 schema(与 `Op::Aggregate` 的 analyze 规则一致).
 fn aggregate_schema(
     groups: &[Prog],
     group_names: &[String],
@@ -2661,7 +2699,7 @@ fn aggregate_schema(
     Ok(columns)
 }
 
-/// `SELECT` 列表，按**分组**求值。
+/// `SELECT` 列表,按**分组**求值.
 fn lower_target_list_agg(
     targets: &[Node],
     scope: &Scope<'_>,
@@ -2673,19 +2711,19 @@ fn lower_target_list_agg(
     for target in targets {
         let rt = match &target.node {
             Some(node::Node::ResTarget(rt)) => rt,
-            _ => return Err(unsupported("输出列表里的这种项")),
+            _ => return Err(unsupported(tr!("ir.irgen.174").into_owned())),
         };
         let value = rt
             .val
             .as_deref()
-            .ok_or_else(|| unsupported("空的输出项"))?;
+            .ok_or_else(|| unsupported(tr!("ir.irgen.175").into_owned()))?;
 
-        // 分组查询里 `*` 没法一般化地展开（要靠 GROUP BY 判断哪些列合法），
-        // 与其猜，不如明说
+        // 分组查询里 `*` 没法一般化地展开(要靠 GROUP BY 判断哪些列合法),
+        // 与其猜,不如明说
         if let Some(node::Node::ColumnRef(c)) = &value.node {
             if star_ref(&c.fields).is_some() {
                 return Err(unsupported(
-                    "分组查询里的 `*`（请把每一列都写进 GROUP BY 或聚合函数里）",
+                    tr!("ir.irgen.176").into_owned(),
                 ));
             }
         }
@@ -2703,26 +2741,26 @@ fn lower_target_list_agg(
     Ok((progs, names))
 }
 
-/// 降级一个字面量。
+/// 降级一个字面量.
 ///
-/// `expected` 是上下文给出的目标类型：`'Alice'` 在没有上下文时默认 TEXT，在
-/// `WHERE name = 'Alice'` 里则按 `name` 的类型解释。
+/// `expected` 是上下文给出的目标类型:`'Alice'` 在没有上下文时默认 TEXT,在
+/// `WHERE name = 'Alice'` 里则按 `name` 的类型解释.
 fn lower_const(c: &AConst, expected: Option<&DataType>, p: &mut ProgBuilder) -> Result<Reg> {
     if c.isnull {
-        // `NULL` 关键字：无类型，靠上下文定型（比较、INSERT 的目标列等）
+        // `NULL` 关键字:无类型,靠上下文定型(比较,INSERT 的目标列等)
         return Ok(p.value(Value::Null));
     }
 
-    // 有上下文时，按**隐式转换规则**把字面量定成目标类型：
+    // 有上下文时,按**隐式转换规则**把字面量定成目标类型:
     //
-    // * 字符串字面量是 PostgreSQL 说的"未知类型"，可以定成任何类型
-    //   （`name = 'Alice'`、`ts > '2000-01-01'`、`'5'::int` 都靠这条）；
-    // * 整数只能落到 INT 或 NUMERIC（int → numeric 是隐式转换）；
-    // * 小数只能落到 NUMERIC。
+    // * 字符串字面量是 PostgreSQL 说的"未知类型",可以定成任何类型
+    //   (`name = 'Alice'`,`ts > '2000-01-01'`,`'5'::int` 都靠这条);
+    // * 整数只能落到 INT 或 NUMERIC(int → numeric 是隐式转换);
+    // * 小数只能落到 NUMERIC.
     //
-    // 落不下去的（例如 `text_col = 5`）**不硬塞**，让它按本来类型去比，
-    // 于是 `verify` 会报出"两侧类型不同"——这正是 PostgreSQL 的行为
-    // （`operator does not exist: text = integer`）。
+    // 落不下去的(例如 `text_col = 5`)**不硬塞**,让它按本来类型去比,
+    // 于是 `verify` 会报出"两侧类型不同"--这正是 PostgreSQL 的行为
+    // (`operator does not exist: text = integer`).
     if let Some(ty) = expected {
         let family = ty.family();
         let coercible = match &c.val {
@@ -2746,13 +2784,13 @@ fn lower_const(c: &AConst, expected: Option<&DataType>, p: &mut ProgBuilder) -> 
     match &c.val {
         Some(Val::Ival(i)) => Ok(p.int(i.ival)),
 
-        // 没有上下文时，pg_query 把**超出 i32 的整数也塞进 Fval**：`SELECT
-        // -2147483648` 是合法的 i32 却落在 Fval 里，而 `SELECT 2147483648` 才是真
-        // 超范围。所以先按整数试一次——直接「见 Fval 就拒」会误杀 i32::MIN。
+        // 没有上下文时,pg_query 把**超出 i32 的整数也塞进 Fval**:`SELECT
+        // -2147483648` 是合法的 i32 却落在 Fval 里,而 `SELECT 2147483648` 才是真
+        // 超范围.所以先按整数试一次--直接"见 Fval 就拒"会误杀 i32::MIN.
         Some(Val::Fval(f)) => match f.fval.parse::<i32>() {
             Ok(v) => Ok(p.int(v)),
-            // 落不进 i32 的裸小数就是 NUMERIC —— 与 PostgreSQL 一致
-            // （`SELECT 2.65` 的类型就是 numeric）。
+            // 落不进 i32 的裸小数就是 NUMERIC -- 与 PostgreSQL 一致
+            // (`SELECT 2.65` 的类型就是 numeric).
             Err(_) => {
                 // 落不进 i32 的裸小数就是**不限定**的 NUMERIC
                 let value = DataType::NumericAny
@@ -2769,12 +2807,12 @@ fn lower_const(c: &AConst, expected: Option<&DataType>, p: &mut ProgBuilder) -> 
         }
 
         Some(Val::Boolval(b)) => Ok(p.boolean(b.boolval)),
-        Some(Val::Bsval(_)) => Err(unsupported("位串字面量")),
-        None => Err(unsupported("空常量")),
+        Some(Val::Bsval(_)) => Err(unsupported(tr!("ir.irgen.177").into_owned())),
+        None => Err(unsupported(tr!("ir.irgen.178").into_owned())),
     }
 }
 
-/// 字面量的文本形式（整数也转成文本，好统一按目标类型再解析一次）。
+/// 字面量的文本形式(整数也转成文本,好统一按目标类型再解析一次).
 fn literal_text(c: &AConst) -> Option<String> {
     match &c.val {
         Some(Val::Ival(i)) => Some(i.ival.to_string()),
@@ -2784,20 +2822,20 @@ fn literal_text(c: &AConst) -> Option<String> {
     }
 }
 
-/// 给字面量的解析失败补上"这是字面量"的上下文。
+/// 给字面量的解析失败补上"这是字面量"的上下文.
 fn at_value(text: &str, e: DbError) -> DbError {
     match e {
         DbError::BadValue { ty, reason, .. } => DbError::BadValue {
             column: None,
             ty,
-            value: format!("字面量 {}", text),
+            value: format!("{}", tr!("ir.irgen.179", arg0 =  text)),
             reason,
         },
         other => other,
     }
 }
 
-/// 如果这个节点是个能解析的裸列引用，返回它的列类型。上下文定型要用。
+/// 如果这个节点是个能解析的裸列引用,返回它的列类型.上下文定型要用.
 fn bare_column_type(node: &Node, scope: &Scope<'_>) -> Option<DataType> {
     let c = match &node.node {
         Some(node::Node::ColumnRef(c)) => c,
@@ -2818,13 +2856,13 @@ fn lower_aexpr(
 ) -> Result<Reg> {
     let kind = AExprKind::try_from(a.kind).unwrap_or(AExprKind::Undefined);
 
-    // `IN` 与 `BETWEEN` 的右边是一个 `List`（不是普通二元运算），单独走
+    // `IN` 与 `BETWEEN` 的右边是一个 `List`(不是普通二元运算),单独走
     match kind {
         AExprKind::AexprIn => return lower_in(a, scope, agg.as_deref_mut(), p),
         AExprKind::AexprBetween | AExprKind::AexprNotBetween => {
             return lower_between(a, kind, scope, agg.as_deref_mut(), p)
         }
-        // `LIKE` / `ILIKE` 与正则一样是"二元运算符"，只是运算符名不同
+        // `LIKE` / `ILIKE` 与正则一样是"二元运算符",只是运算符名不同
         AExprKind::AexprOp | AExprKind::AexprLike | AExprKind::AexprIlike => {}
         other => {
             return Err(unsupported(match other {
@@ -2834,26 +2872,25 @@ fn lower_aexpr(
                     "IS [NOT] DISTINCT FROM".to_string()
                 }
                 AExprKind::AexprOpAny | AExprKind::AexprOpAll => {
-                    "= ANY / = ALL （只支持子查询形式）".to_string()
+                    tr!("ir.irgen.180").into_owned()
                 }
-                _ => format!(
-                    "运算符 `{}` 的这种用法",
+                _ => format!("{}", tr!("ir.irgen.181", arg0 = 
                     single_string(&a.name).unwrap_or_default()
-                ),
+                )),
             }))
         }
     }
 
-    let op_name = single_string(&a.name).ok_or_else(|| unsupported("这种运算符"))?;
+    let op_name = single_string(&a.name).ok_or_else(|| unsupported(tr!("ir.irgen.182").into_owned()))?;
 
     match (a.lexpr.as_deref(), a.rexpr.as_deref()) {
         // 二元
         (Some(l), Some(r)) => {
             let op = binop_of(&op_name)?;
 
-            // 比较运算：一侧是裸列引用时，用**它的列类型**给另一侧的字面量定型。
-            // 没有这一步，`WHERE ts = '2024-01-15'` 里的字面量会默认成 TEXT，
-            // 与 TIMESTAMP 列比较时报类型不符。
+            // 比较运算:一侧是裸列引用时,用**它的列类型**给另一侧的字面量定型.
+            // 没有这一步,`WHERE ts = '2024-01-15'` 里的字面量会默认成 TEXT,
+            // 与 TIMESTAMP 列比较时报类型不符.
             let (left, right) = if op.is_comparison() {
                 match (bare_column_type(l, scope), bare_column_type(r, scope)) {
                     (Some(ty), None) => {
@@ -2886,23 +2923,23 @@ fn lower_aexpr(
             match op_name.as_str() {
                 "-" => Ok(p.unary(UnOp::Neg, operand)),
                 "+" => Ok(operand),
-                other => Err(unsupported(format!("一元运算符 `{}`", other))),
+                other => Err(unsupported(format!("{}", tr!("ir.irgen.183", arg0 =  other)))),
             }
         }
-        _ => Err(unsupported(format!("运算符 `{}` 的这种用法", op_name))),
+        _ => Err(unsupported(format!("{}", tr!("ir.irgen.184", arg0 =  op_name)))),
     }
 }
 
-/// `x IN (a, b, c)` 与 `x NOT IN (a, b, c)`。
+/// `x IN (a, b, c)` 与 `x NOT IN (a, b, c)`.
 ///
-/// 语法树里这是一个 [`AExpr`]（`kind = AexprIn`，`name` 是 `=` 或 `<>`），右边是
-/// `List`。折成 `x = a OR x = b …`（`NOT IN` 折成 `<> … AND …`）：Kleene 三值
-/// 逻辑下这与 PostgreSQL **完全等价**——`x NOT IN (1, NULL)` 也该是 UNKNOWN。
+/// 语法树里这是一个 [`AExpr`] (`kind = AexprIn`,`name` 是 `=` 或 `<>`),右边是
+/// `List`.折成 `x = a OR x = b ...`(`NOT IN` 折成 `<> ... AND ...`):Kleene 三值
+/// 逻辑下这与 PostgreSQL **完全等价**--`x NOT IN (1, NULL)` 也该是 UNKNOWN.
 ///
-/// 第 2 项起都放进**自足子程序**，用 [`Step::Or`](super::expr::Step::Or) /
-/// `And` 串起来，于是与 `AND`/`OR` 一样短路：`x IN (1, 1/0)` 只要第一项就命中。
+/// 第 2 项起都放进**自足子程序**,用 [`Step::Or`](super::expr::Step::Or) /
+/// `And` 串起来,于是与 `AND`/`OR` 一样短路:`x IN (1, 1/0)` 只要第一项就命中.
 ///
-/// `x IN (SELECT …)` 是 `SubLink`，不走这里。
+/// `x IN (SELECT ...)` 是 `SubLink`,不走这里.
 fn lower_in(
     a: &AExpr,
     scope: &Scope<'_>,
@@ -2913,30 +2950,29 @@ fn lower_in(
         Some("=") => false,
         Some("<>") => true,
         other => {
-            return Err(unsupported(format!(
-                "IN 的运算符 `{}`",
+            return Err(unsupported(format!("{}", tr!("ir.irgen.185", arg0 = 
                 other.unwrap_or("?")
-            )))
+            ))))
         }
     };
 
-    let lhs = a.lexpr.as_deref().ok_or_else(|| unsupported("IN 没有左边"))?;
+    let lhs = a.lexpr.as_deref().ok_or_else(|| unsupported(tr!("ir.irgen.186").into_owned()))?;
     let items = match a.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
         Some(node::Node::List(list)) => &list.items,
-        _ => return Err(unsupported("IN 右边的这种写法（本版只支持常量列表）")),
+        _ => return Err(unsupported(tr!("ir.irgen.187").into_owned())),
     };
     if items.is_empty() {
-        return Err(unsupported("空的 IN 列表"));
+        return Err(unsupported(tr!("ir.irgen.188").into_owned()));
     }
 
-    // 用左边的列类型给列表元素定型（`ts IN ('2024-01-15')`）
+    // 用左边的列类型给列表元素定型(`ts IN ('2024-01-15')`)
     let expected = bare_column_type(lhs, scope);
 
     let cmp = if negated { BinOp::Ne } else { BinOp::Eq };
 
-    // 第一项直接写在 `p` 里（它总要被算），其余各项各成一个子程序
+    // 第一项直接写在 `p` 里(它总要被算),其余各项各成一个子程序
     let mut iter = items.iter();
-    let first = iter.next().expect("列表非空");
+    let first = iter.next().expect(&tr!("ir.irgen.189").into_owned());
     let left = lower_expr_in(lhs, scope, None, agg.as_deref_mut(), p)?;
     let right = lower_expr_in(first, scope, expected.as_ref(), agg.as_deref_mut(), p)?;
     let mut acc = p.binary(cmp, left, right);
@@ -2957,12 +2993,12 @@ fn lower_in(
     Ok(acc)
 }
 
-/// `x BETWEEN lo AND hi` / `x NOT BETWEEN lo AND hi`。
+/// `x BETWEEN lo AND hi` / `x NOT BETWEEN lo AND hi`.
 ///
-/// 语法树里是 [`AExpr`]（`kind = AexprBetween`/`AexprNotBetween`），右边是
-/// `List[lo, hi]`。折成 `(x >= lo) AND (x <= hi)`；`NOT BETWEEN` 折成
-/// `(x < lo) OR (x > hi)`——三值逻辑下与 PostgreSQL 一样，短路也一样（下界就能
-/// 定胜负时上界不求值）。
+/// 语法树里是 [`AExpr`] (`kind = AexprBetween`/`AexprNotBetween`),右边是
+/// `List[lo, hi]`.折成 `(x >= lo) AND (x <= hi)`;`NOT BETWEEN` 折成
+/// `(x < lo) OR (x > hi)`--三值逻辑下与 PostgreSQL 一样,短路也一样(下界就能
+/// 定胜负时上界不求值).
 fn lower_between(
     a: &AExpr,
     kind: AExprKind,
@@ -2975,10 +3011,10 @@ fn lower_between(
     let lhs = a
         .lexpr
         .as_deref()
-        .ok_or_else(|| unsupported("BETWEEN 没有左边"))?;
+        .ok_or_else(|| unsupported(tr!("ir.irgen.190").into_owned()))?;
     let bounds = match a.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
         Some(node::Node::List(list)) if list.items.len() == 2 => &list.items,
-        _ => return Err(unsupported("BETWEEN 右边的这种写法（要 `BETWEEN a AND b`）")),
+        _ => return Err(unsupported(tr!("ir.irgen.191").into_owned())),
     };
 
     let expected = bare_column_type(lhs, scope);
@@ -2986,7 +3022,7 @@ fn lower_between(
     let low_op = if negated { BinOp::Lt } else { BinOp::Ge };
     let high_op = if negated { BinOp::Gt } else { BinOp::Le };
 
-    // 下界直接写在 `p` 里；上界是一个自足子程序（下界已经不成立时不必算它）
+    // 下界直接写在 `p` 里;上界是一个自足子程序(下界已经不成立时不必算它)
     let low = {
         let left = lower_expr_in(lhs, scope, None, agg.as_deref_mut(), p)?;
         let right = lower_expr_in(&bounds[0], scope, expected.as_ref(), agg.as_deref_mut(), p)?;
@@ -3016,12 +3052,12 @@ fn lower_boolexpr(
     let kind = BoolExprType::try_from(b.boolop).unwrap_or(BoolExprType::Undefined);
 
     match kind {
-        // `AND`/`OR` 走 `Step::And`/`Step::Or`：左侧能定胜负时右侧**不求值**。
-        // 第 1 个参数留在 `p` 里，其余每个都是自足子程序。
+        // `AND`/`OR` 走 `Step::And`/`Step::Or`:左侧能定胜负时右侧**不求值**.
+        // 第 1 个参数留在 `p` 里,其余每个都是自足子程序.
         BoolExprType::AndExpr | BoolExprType::OrExpr => {
             let is_and = kind == BoolExprType::AndExpr;
             let mut iter = b.args.iter();
-            let first = iter.next().ok_or_else(|| unsupported("空的 AND / OR"))?;
+            let first = iter.next().ok_or_else(|| unsupported(tr!("ir.irgen.192").into_owned()))?;
             let mut acc = lower_expr_in(first, scope, None, agg.as_deref_mut(), p)?;
 
             for arg in iter {
@@ -3038,13 +3074,13 @@ fn lower_boolexpr(
 
         BoolExprType::NotExpr => {
             if b.args.len() != 1 {
-                return Err(unsupported("NOT 的参数个数不是 1"));
+                return Err(unsupported(tr!("ir.irgen.193").into_owned()));
             }
             let inner = lower_expr_in(&b.args[0], scope, None, agg.as_deref_mut(), p)?;
             Ok(p.unary(UnOp::Not, inner))
         }
 
-        _ => Err(unsupported("这种布尔表达式")),
+        _ => Err(unsupported(tr!("ir.irgen.194").into_owned())),
     }
 }
 
@@ -3060,8 +3096,8 @@ fn binop_of(op: &str) -> Result<BinOp> {
         "-" => BinOp::Sub,
         "*" => BinOp::Mul,
         "/" => BinOp::Div,
-        // `LIKE` 族在语法树里是这几个内部运算符名（pg_query 的 `AexprLike` /
-        // `AexprIlike` 分支）
+        // `LIKE` 族在语法树里是这几个内部运算符名(pg_query 的 `AexprLike` /
+        // `AexprIlike` 分支)
         "~~" => BinOp::Like,
         "!~~" => BinOp::NotLike,
         "~~*" => BinOp::ILike,
@@ -3071,11 +3107,11 @@ fn binop_of(op: &str) -> Result<BinOp> {
         "!~" => BinOp::NotRegex,
         "~*" => BinOp::IRegex,
         "!~*" => BinOp::NotIRegex,
-        other => return Err(unsupported(format!("运算符 `{}`", other))),
+        other => return Err(unsupported(format!("{}", tr!("ir.irgen.195", arg0 =  other)))),
     })
 }
 
-/// `ColumnRef.fields` → 一串字符串；含 `A_Star` 或别的节点则 `None`。
+/// `ColumnRef.fields` → 一串字符串;含 `A_Star` 或别的节点则 `None`.
 pub(crate) fn ref_parts(fields: &[Node]) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(fields.len());
     for field in fields {
@@ -3087,7 +3123,7 @@ pub(crate) fn ref_parts(fields: &[Node]) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// 识别 `*`（返回 `Some(None)`）与 `t.*`（返回 `Some(Some("t"))`）。
+/// 识别 `*`(返回 `Some(None)`)与 `t.*`(返回 `Some(Some("t"))`).
 fn star_ref(fields: &[Node]) -> Option<Option<String>> {
     match fields.last().and_then(|f| f.node.as_ref()) {
         Some(node::Node::AStar(_)) => match fields.len() {
@@ -3112,10 +3148,10 @@ pub(crate) fn single_string(items: &[Node]) -> Option<String> {
     }
 }
 
-/// 一个"常量字符串"节点 → 它的文本。
+/// 一个"常量字符串"节点 → 它的文本.
 ///
-/// `EXTRACT(YEAR FROM x)` 的字段是 `makeStringConst` 造出来的 `A_Const`（`Sval`），
-/// 但语法树里也可能直接是 `String` 节点，两种都认。
+/// `EXTRACT(YEAR FROM x)` 的字段是 `makeStringConst` 造出来的 `A_Const`(`Sval`),
+/// 但语法树里也可能直接是 `String` 节点,两种都认.
 fn const_string(node: &Node) -> Option<String> {
     match &node.node {
         Some(node::Node::AConst(c)) => match &c.val {
@@ -3135,50 +3171,50 @@ fn unsupported(feature: impl Into<String>) -> DbError {
 
 // ------------------------------------------------------------------ 作用域
 
-/// 一个列引用解出来的位置。
+/// 一个列引用解出来的位置.
 ///
-/// 相关子查询的机制就落在这一个枚举上：解到 [`Resolved::Outer`] 说明这个引用
-/// **不是本查询的行**，而是外面某一层——降级时它变成一个 `Step::Outer`，执行时从
-/// 外层行栈里取（栈由 [`crate::ir::exec`] 在求值子查询时压入）。
+/// 相关子查询的机制就落在这一个枚举上:解到 [`Resolved::Outer`] 说明这个引用
+/// **不是本查询的行**,而是外面某一层--降级时它变成一个 `Step::Outer`,执行时从
+/// 外层行栈里取(栈由 [`crate::ir::exec`] 在求值子查询时压入).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Resolved {
-    /// 本查询 FROM 的扁平 schema 里的下标。
+    /// 本查询 FROM 的扁平 schema 里的下标.
     Local(usize),
-    /// 外层：隔了几层（`1` 是直接外层）+ 那一层的扁平下标。
+    /// 外层:隔了几层(`1` 是直接外层)+ 那一层的扁平下标.
     Outer {
-        /// 隔了几层，从 1 开始。
+        /// 隔了几层,从 1 开始.
         depth: u16,
-        /// 那一层的扁平下标。
+        /// 那一层的扁平下标.
         index: usize,
     },
 }
 
-/// 一个 FROM 项：名字、别名，以及它的列在扁平 schema 里的位置。
+/// 一个 FROM 项:名字,别名,以及它的列在扁平 schema 里的位置.
 #[derive(Debug, Clone)]
 pub(crate) struct Range {
-    /// 限定名（`study.people` 或 `f`）。
+    /// 限定名(`study.people` 或 `f`).
     pub(crate) name: String,
-    /// 别名（`AS t`）。
+    /// 别名(`AS t`).
     alias: Option<String>,
-    /// 这一项的列在扁平 schema 里的起始下标。
+    /// 这一项的列在扁平 schema 里的起始下标.
     pub(crate) offset: usize,
-    /// 列定义。
+    /// 列定义.
     pub(crate) columns: Vec<Column>,
-    /// 这一项对应的基表 `Scan` 节点。
+    /// 这一项对应的基表 `Scan` 节点.
     ///
-    /// `None` 表示「不是 FROM 项」——现在只有 `ORDER BY` 的输出作用域是这种
-    /// （它只是拿来解名字的，没有基表）。
+    /// `None` 表示"不是 FROM 项"--现在只有 `ORDER BY` 的输出作用域是这种
+    /// (它只是拿来解名字的,没有基表).
     pub(crate) scan: Option<NodeId>,
-    /// 这一项落在某个 `LEFT JOIN` 的**可空侧**吗。
+    /// 这一项落在某个 `LEFT JOIN` 的**可空侧**吗.
     ///
-    /// 可空侧的列会被外连接补出来的 NULL 污染，于是「把只引用这一项的谓词推到它的
-    /// 基表 `Scan`」不再保语义：`WHERE b.y IS NULL` 就是反例——补出来的 NULL 也满足
-    /// 它，推下去那些行就没了。所以这些项一律不下推：宁可少优化，也不改语义。
+    /// 可空侧的列会被外连接补出来的 NULL 污染,于是"把只引用这一项的谓词推到它的
+    /// 基表 `Scan`"不再保语义:`WHERE b.y IS NULL` 就是反例--补出来的 NULL 也满足
+    /// 它,推下去那些行就没了.所以这些项一律不下推:宁可少优化,也不改语义.
     pub(crate) nullable: bool,
 }
 
 impl Range {
-    /// 查询里写的 `qualifier` 能不能指向这一项。
+    /// 查询里写的 `qualifier` 能不能指向这一项.
     fn matches(&self, qualifier: &str) -> bool {
         if self.alias.as_deref() == Some(qualifier) {
             return true;
@@ -3186,38 +3222,38 @@ impl Range {
         if self.name == qualifier {
             return true;
         }
-        // `study.people.surname` 这种三段引用：用表名的最后一段匹配
+        // `study.people.surname` 这种三段引用:用表名的最后一段匹配
         self.name.rsplit('.').next() == Some(qualifier)
     }
 
-    /// 用于报错的限定名。
+    /// 用于报错的限定名.
     fn qualified(&self) -> String {
         self.alias.clone().unwrap_or_else(|| self.name.clone())
     }
 
-    /// 扁平下标是这一项的列吗。
+    /// 扁平下标是这一项的列吗.
     pub(crate) fn contains(&self, index: usize) -> bool {
         index >= self.offset && index < self.offset + self.columns.len()
     }
 }
 
-/// 降级期的名字作用域。顺序必须与 [`Plan::analyze`] 推导的 schema 一致。
+/// 降级期的名字作用域.顺序必须与 [`Plan::analyze`] 推导的 schema 一致.
 ///
 /// # 外层链与符号表
 ///
-/// 子查询就是"再开一个查询"，所以降级一个查询时还需要两样东西：
+/// 子查询就是"再开一个查询",所以降级一个查询时还需要两样东西:
 ///
-/// * `outers`：外面的查询作用域（`outers[0]` 是**直接外层**）——相关子查询里的
-///   列名从这里解，解出来的是 [`Resolved::Outer`]（隔了几层 + 那一层的下标）；
-/// * `symbols`：符号表——内层子查询里的表名还得查它。
+/// * `outers`:外面的查询作用域(`outers[0]` 是**直接外层**)--相关子查询里的
+///   列名从这里解,解出来的是 [`Resolved::Outer`] (隔了几层 + 那一层的下标);
+/// * `symbols`:符号表--内层子查询里的表名还得查它.
 ///
-/// 两者都跟着作用域走：作用域本来就是"降级一个查询时要的那些上下文"。
+/// 两者都跟着作用域走:作用域本来就是"降级一个查询时要的那些上下文".
 #[derive(Debug, Clone)]
 pub(crate) struct Scope<'s> {
     pub(crate) ranges: Vec<Range>,
-    /// 外面的查询作用域，一层层往外。
+    /// 外面的查询作用域,一层层往外.
     outers: Vec<Scope<'s>>,
-    /// 符号表。
+    /// 符号表.
     symbols: &'s SymbolTable,
 }
 
@@ -3243,7 +3279,7 @@ impl<'s> Scope<'s> {
         }
     }
 
-    /// 没有 FROM 项的作用域：`SELECT 1 + 1`、`INSERT` 的值表达式用它。
+    /// 没有 FROM 项的作用域:`SELECT 1 + 1`,`INSERT` 的值表达式用它.
     fn empty(symbols: &'s SymbolTable) -> Self {
         Scope {
             ranges: Vec::new(),
@@ -3252,13 +3288,13 @@ impl<'s> Scope<'s> {
         }
     }
 
-    /// 把这个作用域当成"某一层外层"挂上（降级内层查询前用）。
+    /// 把这个作用域当成"某一层外层"挂上(降级内层查询前用).
     fn nested_in(mut self, outers: Vec<Scope<'s>>) -> Self {
         self.outers = outers;
         self
     }
 
-    /// 把另一个作用域接在后面（连接的输出 = 左 ++ 右）。
+    /// 把另一个作用域接在后面(连接的输出 = 左 ++ 右).
     fn concat(mut self, other: Scope<'s>) -> Self {
         for range in other.ranges {
             let offset = self.ranges.iter().map(|r| r.columns.len()).sum();
@@ -3267,25 +3303,25 @@ impl<'s> Scope<'s> {
         self
     }
 
-    /// 把**现在**这些项都标成可空侧（`LEFT JOIN` 的右支用它，见 [`Range::nullable`]）。
+    /// 把**现在**这些项都标成可空侧(`LEFT JOIN` 的右支用它,见 [`Range::nullable`]).
     fn mark_nullable(&mut self) {
         for range in &mut self.ranges {
             range.nullable = true;
         }
     }
 
-    /// `cols` 全部落在**一个可以下推的** FROM 项里吗；是就返回那一项的下标。
+    /// `cols` 全部落在**一个可以下推的** FROM 项里吗;是就返回那一项的下标.
     ///
-    /// 这几种情况都给 `None`（谓词留在 `Filter` 里）：
+    /// 这几种情况都给 `None`(谓词留在 `Filter` 里):
     ///
-    /// * 空集合（常量谓词，`WHERE 1 = 1`）——推下去也没收益；
-    /// * 列横跨多个 FROM 项——那只有连接本身判得了；
-    /// * 压根不是基表；落在 `LEFT JOIN` 的可空侧而 `allow_nullable` 又是假。
+    /// * 空集合(常量谓词,`WHERE 1 = 1`)--推下去也没收益;
+    /// * 列横跨多个 FROM 项--那只有连接本身判得了;
+    /// * 压根不是基表;落在 `LEFT JOIN` 的可空侧而 `allow_nullable` 又是假.
     ///
-    /// `allow_nullable` 由 `opt` 按 **null-rejecting** 判定：可空侧会被外连接补出
-    /// NULL，于是只有"遇到 NULL 必不成立"的谓词（`b.y = 5`、`b.y IS NOT NULL`）
-    /// 才敢推——`b.y IS NULL` 那种不行（补出来的 NULL 也满足它，推下去那些行就没了，
-    /// 见 [`Range::nullable`]）。
+    /// `allow_nullable` 由 `opt` 按 **null-rejecting** 判定:可空侧会被外连接补出
+    /// NULL,于是只有"遇到 NULL 必不成立"的谓词(`b.y = 5`,`b.y IS NOT NULL`)
+    /// 才敢推--`b.y IS NULL` 那种不行(补出来的 NULL 也满足它,推下去那些行就没了,
+    /// 见 [`Range::nullable`]).
     pub(crate) fn pushable_range(
         &self,
         cols: &BTreeSet<usize>,
@@ -3304,12 +3340,12 @@ impl<'s> Scope<'s> {
         Some(ri)
     }
 
-    /// 符号表（`opt` 要拿它查目录里有没有索引）。
+    /// 符号表(`opt` 要拿它查目录里有没有索引).
     pub(crate) fn symbols(&self) -> &'s SymbolTable {
         self.symbols
     }
 
-    /// 扁平 schema。
+    /// 扁平 schema.
     fn schema(&self) -> Vec<Column> {
         self.ranges
             .iter()
@@ -3317,7 +3353,7 @@ impl<'s> Scope<'s> {
             .collect()
     }
 
-    /// 扁平下标 → 那一列的类型。上下文定型要用。
+    /// 扁平下标 → 那一列的类型.上下文定型要用.
     pub(crate) fn column_type_at(&self, index: usize) -> Option<DataType> {
         for range in &self.ranges {
             if index >= range.offset && index < range.offset + range.columns.len() {
@@ -3334,14 +3370,14 @@ impl<'s> Scope<'s> {
             .collect()
     }
 
-    /// 解一个列引用，返回**扁平下标**。
+    /// 解一个列引用,返回**扁平下标**.
     pub(crate) fn resolve(&self, parts: &[String]) -> Result<Resolved> {
-        // 先本层：SQL 的作用域规则就是"就近"
+        // 先本层:SQL 的作用域规则就是"就近"
         if let Some(index) = self.local_index(parts)? {
             return Ok(Resolved::Local(index));
         }
 
-        // 再一层层往外找（相关子查询就是从这里来的）
+        // 再一层层往外找(相关子查询就是从这里来的)
         let mut current = self;
         let mut depth = 1u16;
         while let Some(outer) = current.outers.first() {
@@ -3358,7 +3394,7 @@ impl<'s> Scope<'s> {
         })
     }
 
-    /// 在**本层**解一个列引用；找不到给 `None`（好让调用方往外走）。
+    /// 在**本层**解一个列引用;找不到给 `None`(好让调用方往外走).
     fn local_index(&self, parts: &[String]) -> Result<Option<usize>> {
         let (qualifier, name) = match parts {
             [] => {
@@ -3401,7 +3437,7 @@ impl<'s> Scope<'s> {
         }
     }
 
-    /// 外层某一层的第 `index` 列的类型。
+    /// 外层某一层的第 `index` 列的类型.
     fn outer_type_at(&self, depth: u16, index: usize) -> Option<DataType> {
         let mut current = self;
         for _ in 1..depth {

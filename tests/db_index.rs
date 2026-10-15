@@ -1,11 +1,11 @@
-//! 索引结构层的 testbench：[`Index`] 与 [`IndexSource`] 自己。
+//! 索引结构层的 testbench:[`Index`] 与 [`IndexSource`] 自己.
 //!
-//! 这里不经过 SQL，直接观察三件事：**键 → 行号**分得对不对（重复键按行号升序）、
-//! 把它当 [`RowSource`] 用是不是一行一行吐、以及**建索引只读一列**——最后一条用
-//! 一张会分别数 `row()` 与 `value()` 的表来盯。
+//! 这里不经过 SQL,直接观察三件事:**键 → 行号**分得对不对(重复键按行号升序),
+//! 把它当 [`RowSource`] 用是不是一行一行吐,以及**建索引只读一列**--最后一条用
+//! 一张会分别数 `row()` 与 `value()` 的表来盯.
 //!
-//! 「建索引只读一列」不是风格问题：索引只存键与行号。如果建它的过程要把整行搬来
-//! 搬去，「内侧不必物化」这条收益就不成立了。
+//! "建索引只读一列"不是风格问题:索引只存键与行号.如果建它的过程要把整行搬来
+//! 搬去,"内侧不必物化"这条收益就不成立了.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -15,9 +15,9 @@ use ydbms::db::source::RowSource;
 use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Table, TabShape, Value};
 use ydbms::db::PhysTab;
 
-/// 一张会分别数 `row()`（整行）与 `value()`（单格）的表。
+/// 一张会分别数 `row()`(整行)与 `value()`(单格)的表.
 ///
-/// 形状是 `x INT, label INT`，`label = x * 10`。
+/// 形状是 `x INT, label INT`,`label = x * 10`.
 struct CountingTable {
     shape: ColumnsShape,
     rows: Vec<Vec<Value>>,
@@ -41,12 +41,12 @@ impl CountingTable {
         }
     }
 
-    /// 被整行读过几次。
+    /// 被整行读过几次.
     fn rows_read(&self) -> usize {
         self.rows_read.get()
     }
 
-    /// 被单格读过几次。
+    /// 被单格读过几次.
     fn cells_read(&self) -> usize {
         self.cells_read.get()
     }
@@ -72,14 +72,14 @@ impl Table for CountingTable {
         self.rows.get(r).cloned()
     }
 
-    /// 覆盖默认实现（默认实现走 `row()`、整行克隆）：这里只碰一格。
+    /// 覆盖默认实现(默认实现走 `row()`,整行克隆):这里只碰一格.
     fn value(&self, r: usize, c: usize) -> Option<Value> {
         self.cells_read.set(self.cells_read.get() + 1);
         self.rows.get(r).and_then(|row| row.get(c)).cloned()
     }
 }
 
-/// 一张 `nrows()` 说大话的表：说有三行，一行都给不出来。
+/// 一张 `nrows()` 说大话的表:说有三行,一行都给不出来.
 struct ShortTable {
     shape: ColumnsShape,
 }
@@ -112,10 +112,10 @@ fn an_index_groups_rows_by_key() {
     let index = Index::build(&table, 0).unwrap();
 
     assert_eq!(index.column(), 0);
-    // 重复键的行号按**升序**（也就是表顺序）
+    // 重复键的行号按**升序**(也就是表顺序)
     assert_eq!(index.lookup(&Value::Int(1)), &[1, 3]);
     assert_eq!(index.lookup(&Value::Int(3)), &[0]);
-    // 查不到的键是空切片，不是错误
+    // 查不到的键是空切片,不是错误
     assert_eq!(index.lookup(&Value::Int(99)), &[] as &[usize]);
     assert_eq!(index.nkeys(), 3);
 }
@@ -125,7 +125,7 @@ fn building_an_index_reads_only_the_indexed_column() {
     let table = CountingTable::new(&[3, 1, 2, 1]);
     let index = Index::build(&table, 1).unwrap();
 
-    // 4 行 = 4 次单格读（**只读第 1 列**），一次整行读都没有
+    // 4 行 = 4 次单格读(**只读第 1 列**),一次整行读都没有
     assert_eq!(table.cells_read(), 4);
     assert_eq!(table.rows_read(), 0);
     assert_eq!(index.lookup(&Value::Int(10)), &[1, 3]);
@@ -155,7 +155,7 @@ fn a_short_read_during_the_build_is_an_error() {
 
 #[test]
 fn numeric_keys_use_the_canonical_text() {
-    // `1.5` 与 `1.50` 是**同一个** `NUMERIC`（规范文本去掉尾随零），所以同一个桶
+    // `1.5` 与 `1.50` 是**同一个** `NUMERIC`(规范文本去掉尾随零),所以同一个桶
     let shape = ColumnsShape::new(vec![Column::new("n", DataType::NumericAny)]);
     let mut table = PhysTab::new("n", &shape);
     table.insert(vec![Value::numeric("1.5").unwrap()]).unwrap();
@@ -175,7 +175,7 @@ fn numeric_keys_use_the_canonical_text() {
 fn an_index_source_is_a_row_source_over_one_key() {
     let table = CountingTable::new(&[1, 2, 1, 3, 1]);
 
-    // 建索引是**惰性**的：光造游标一行都不读（`LIMIT 0` 之下连索引都不建）
+    // 建索引是**惰性**的:光造游标一行都不读(`LIMIT 0` 之下连索引都不建)
     let slot = Rc::new(IndexSlot::new(0));
     let mut source = IndexSource::new(&table, slot, Value::Int(1));
     assert_eq!(table.cells_read(), 0);
@@ -184,7 +184,7 @@ fn an_index_source_is_a_row_source_over_one_key() {
     assert_eq!(source.name(), "t");
     assert_eq!(source.columns(), table.columns());
 
-    // 三行命中，按表顺序；只有**命中的行**被整行读过
+    // 三行命中,按表顺序;只有**命中的行**被整行读过
     assert_eq!(source.next(), Some(vec![Value::Int(1), Value::Int(10)]));
     assert_eq!(source.next(), Some(vec![Value::Int(1), Value::Int(10)]));
     assert_eq!(source.next(), Some(vec![Value::Int(1), Value::Int(10)]));

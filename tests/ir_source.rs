@@ -1,11 +1,11 @@
-//! 拉取式执行模型：**惰性**、错误传播、共享节点。
+//! 拉取式执行模型:**惰性**,错误传播,共享节点.
 //!
-//! 这些测试不从内部结构出发，而是从**外面观察**「一行一行拉」这件事：
+//! 这些测试不从内部结构出发,而是从**外面观察**"一行一行拉"这件事:
 //!
-//! * 用一张会数自己被读了几次的表，看 `LIMIT` 是否真的少读了行；
-//! * 看满足 `LIMIT` 之后的行是否**根本没被求值**（那里的除零不该冒出来）；
-//! * 看深层源里的错误是否仍然能被报出来；
-//! * 看同一个节点被两个父节点引用时只物化一次。
+//! * 用一张会数自己被读了几次的表,看 `LIMIT` 是否真的少读了行;
+//! * 看满足 `LIMIT` 之后的行是否**根本没被求值**(那里的除零不该冒出来);
+//! * 看深层源里的错误是否仍然能被报出来;
+//! * 看同一个节点被两个父节点引用时只物化一次.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -18,9 +18,9 @@ use ydbms::ir::{
     SymbolTable,
 };
 
-/// 一张会数自己 `row()` 被调过几次的表。
+/// 一张会数自己 `row()` 被调过几次的表.
 ///
-/// 读数放在 `Rc<Cell<_>>` 里，测试才拿得到——符号表把表的所有权收走了。
+/// 读数放在 `Rc<Cell<_>>` 里,测试才拿得到--符号表把表的所有权收走了.
 struct CountingTable {
     name: String,
     shape: ColumnsShape,
@@ -29,7 +29,7 @@ struct CountingTable {
 }
 
 impl CountingTable {
-    /// 一张 `x INT` 的表，`x` 取 `values`。
+    /// 一张 `x INT` 的表,`x` 取 `values`.
     fn new(values: &[i32], reads: Rc<Cell<usize>>) -> Self {
         let shape = ColumnsShape::new(vec![Column::new("x", DataType::Int)]);
         let rows = values.iter().map(|v| vec![Value::Int(*v)]).collect();
@@ -63,7 +63,7 @@ impl Table for CountingTable {
     }
 }
 
-/// 一张装了 `t(x INT)` 的符号表，外加它的读数。
+/// 一张装了 `t(x INT)` 的符号表,外加它的读数.
 fn counting(values: &[i32]) -> (SymbolTable, Rc<Cell<usize>>) {
     let reads = Rc::new(Cell::new(0));
     let mut symbols = SymbolTable::new();
@@ -73,12 +73,12 @@ fn counting(values: &[i32]) -> (SymbolTable, Rc<Cell<usize>>) {
     (symbols, reads)
 }
 
-/// `1..=n`。
+/// `1..=n`.
 fn series(n: i32) -> Vec<i32> {
     (1..=n).collect()
 }
 
-/// 造一个 `1 / x` 的程序：`x = 0` 那一行会除以零。
+/// 造一个 `1 / x` 的程序:`x = 0` 那一行会除以零.
 fn one_over_x() -> ydbms::ir::Prog {
     let mut p = ProgBuilder::new();
     let one = p.int(1);
@@ -87,7 +87,7 @@ fn one_over_x() -> ydbms::ir::Prog {
     p.finish(q)
 }
 
-// ------------------------------------------------------------ 惰性：拉多少，读多少
+// ------------------------------------------------------------ 惰性:拉多少,读多少
 
 #[test]
 fn limit_pulls_only_what_it_needs() {
@@ -102,7 +102,7 @@ fn limit_pulls_only_what_it_needs() {
 
     assert_eq!(out.nrows(), 1);
     assert_eq!(out.value(0, 0), Some(Value::Int(1)));
-    assert_eq!(reads.get(), 1, "LIMIT 之下的行不该被读（全物化的老模型会读 100 行）");
+    assert_eq!(reads.get(), 1, "LIMIT 之下的行不该被读(全物化的老模型会读 100 行)");
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn offset_and_limit_pull_exactly_that_many() {
 
     let out = execute(&plan, &symbols).unwrap();
 
-    // 跳 1、2，取 3、4
+    // 跳 1,2,取 3,4
     assert_eq!(out.value(0, 0), Some(Value::Int(3)));
     assert_eq!(out.value(1, 0), Some(Value::Int(4)));
     assert_eq!(out.nrows(), 2);
@@ -135,7 +135,7 @@ fn limit_zero_pulls_nothing_not_even_the_offset() {
     let out = execute(&plan, &symbols).unwrap();
 
     assert_eq!(out.nrows(), 0);
-    assert_eq!(reads.get(), 0, "LIMIT 0 的结果是空，连 offset 都不用跳");
+    assert_eq!(reads.get(), 0, "LIMIT 0 的结果是空,连 offset 都不用跳");
 }
 
 #[test]
@@ -146,7 +146,7 @@ fn a_caller_can_stop_pulling() {
     let s = b.scan("t");
     let plan = b.finish(s).unwrap();
 
-    // `execute_source` 把「拉多少」交给调用方
+    // `execute_source` 把"拉多少"交给调用方
     let mut source = execute_source(&plan, &symbols).unwrap();
     assert_eq!(source.next(), Some(vec![Value::Int(1)]));
     assert_eq!(source.next(), Some(vec![Value::Int(2)]));
@@ -176,7 +176,7 @@ fn sort_must_see_every_row_even_under_a_limit() {
     let out = execute(&plan, &symbols).unwrap();
 
     assert_eq!(out.value(0, 0), Some(Value::Int(1)));
-    assert_eq!(reads.get(), 3, "排序要随机访问，必须看完全部输入——LIMIT 省不掉它");
+    assert_eq!(reads.get(), 3, "排序要随机访问,必须看完全部输入--LIMIT 省不掉它");
 }
 
 // ---------------------------------------------------------------- 错误传播
@@ -193,8 +193,8 @@ fn an_error_behind_a_satisfied_limit_is_not_evaluated() {
     let root = b.limit(pr, Some(1), 0).unwrap();
     let plan = b.finish(root).unwrap();
 
-    // 第一行算得出来；第二行 `x = 0` 落在 LIMIT 之后，**根本不会被求值**
-    // （PostgreSQL 也是这样：`LIMIT` 拉够就不再往下要行了）
+    // 第一行算得出来;第二行 `x = 0` 落在 LIMIT 之后,**根本不会被求值**
+    // (PostgreSQL 也是这样:`LIMIT` 拉够就不再往下要行了)
     let out = execute(&plan, &symbols).unwrap();
 
     assert_eq!(out.nrows(), 1);
@@ -212,7 +212,7 @@ fn an_error_in_the_stream_surfaces() {
         .unwrap();
     let plan = b.finish(pr).unwrap();
 
-    // 没有 LIMIT 挡住，第二行就会被求值，错误必须冒出来
+    // 没有 LIMIT 挡住,第二行就会被求值,错误必须冒出来
     let err = execute(&plan, &symbols).unwrap_err();
 
     assert!(matches!(err, DbError::IrRuntime { .. }), "got {err:?}");
@@ -223,7 +223,7 @@ fn an_error_in_the_stream_surfaces() {
 fn an_error_inside_a_scan_filter_surfaces() {
     let (symbols, _) = counting(&[1, 2, 3]);
 
-    // 谓词是 `(x / 0) = 0`：类型上没问题（两边都是 INT），取值时除零
+    // 谓词是 `(x / 0) = 0`:类型上没问题(两边都是 INT),取值时除零
     let mut p = ProgBuilder::new();
     let x = p.col(0);
     let zero = p.int(0);
@@ -248,14 +248,14 @@ fn a_node_with_two_consumers_is_materialized_once() {
 
     let mut b = PlanBuilder::new();
     let s = b.scan("t");
-    // **同一个**节点当左右两支：它有两个消费者
+    // **同一个**节点当左右两支:它有两个消费者
     let j = b.join(s, s, JoinKind::Inner, None, JoinStrategy::NestedLoop).unwrap();
     let plan = b.finish(j).unwrap();
 
     let out = execute(&plan, &symbols).unwrap();
 
     assert_eq!(out.nrows(), 9, "3 × 3 的笛卡尔积");
-    assert_eq!(reads.get(), 3, "共享节点只物化一次，不是每个消费者各扫一遍");
+    assert_eq!(reads.get(), 3, "共享节点只物化一次,不是每个消费者各扫一遍");
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn two_separate_scans_read_the_table_twice() {
     let (symbols, reads) = counting(&[1, 2, 3]);
 
     let mut b = PlanBuilder::new();
-    // 两个**各自独立**的 Scan 节点：没有共享，各自拉各自的
+    // 两个**各自独立**的 Scan 节点:没有共享,各自拉各自的
     let left = b.scan("t");
     let right = b.scan("t");
     let j = b.join(left, right, JoinKind::Inner, None, JoinStrategy::NestedLoop).unwrap();
@@ -291,7 +291,7 @@ fn table_cursor_walks_a_base_table() {
     assert_eq!(cursor.next(), Some(vec![Value::Int(1)]));
     assert_eq!(cursor.next(), Some(vec![Value::Int(2)]));
     assert_eq!(cursor.next(), None);
-    // 结束之后一直结束（`drain` 与 `Limit` 的跳过循环都依赖这一点）
+    // 结束之后一直结束(`drain` 与 `Limit` 的跳过循环都依赖这一点)
     assert_eq!(cursor.next(), None);
     assert!(cursor.error().is_none(), "正常结束不是错误");
 }

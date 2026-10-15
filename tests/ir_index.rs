@@ -1,13 +1,13 @@
-//! TODO 3.6 的 testbench：索引是**目录对象**（`CREATE INDEX` / `DROP INDEX`）。
+//! TODO 3.6 的 testbench:索引是**目录对象**(`CREATE INDEX` / `DROP INDEX`).
 //!
-//! 三件事要盯住：
+//! 三件事要盯住:
 //!
-//! 1. **只建一次**：`CREATE INDEX` 扫一遍那一列把索引建出来，之后每条查询都用它，
-//!    不再重建（用一张会数数的表看得见）；
-//! 2. **写得对**：`INSERT` 把新键追加进去（不重建），`UPDATE` 之后索引失效、
-//!    下次用时只重建一次——**绝不能**拿旧行号回答新键（那是安静的错答案）；
-//! 3. **该拒绝的拒绝**：唯一索引、部分索引、多列/表达式键、`CONCURRENTLY` 一律显式
-//!    报错；`IF NOT EXISTS` / `IF EXISTS` 幂等。
+//! 1. **只建一次**:`CREATE INDEX` 扫一遍那一列把索引建出来,之后每条查询都用它,
+//!    不再重建(用一张会数数的表看得见);
+//! 2. **写得对**:`INSERT` 把新键追加进去(不重建),`UPDATE` 之后索引失效,
+//!    下次用时只重建一次--**绝不能**拿旧行号回答新键(那是安静的错答案);
+//! 3. **该拒绝的拒绝**:唯一索引,部分索引,多列/表达式键,`CONCURRENTLY` 一律显式
+//!    报错;`IF NOT EXISTS` / `IF EXISTS` 幂等.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -15,14 +15,14 @@ use std::rc::Rc;
 use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Result as DbResult, Table, TabShape, Value};
 use ydbms::ir::{compile, execute, run_script, Outcome, SymbolTable};
 
-/// 分开数 `row()`（整行）与 `value()`（单格）的次数——建索引只该读**一列**。
+/// 分开数 `row()`(整行)与 `value()`(单格)的次数--建索引只该读**一列**.
 #[derive(Default)]
 struct Counts {
     rows: Cell<usize>,
     cells: Cell<usize>,
 }
 
-/// 一张会数数的 `t(x INT)`。
+/// 一张会数数的 `t(x INT)`.
 struct CountingTable {
     shape: ColumnsShape,
     rows: Vec<Vec<Value>>,
@@ -80,7 +80,7 @@ impl Table for CountingTable {
     }
 }
 
-/// 装着 `t(x INT)` 的库，外加它的计数器。
+/// 装着 `t(x INT)` 的库,外加它的计数器.
 fn counting(values: &[i32]) -> (SymbolTable, Rc<Counts>) {
     let counts = Rc::new(Counts::default());
     let mut symbols = SymbolTable::new();
@@ -90,32 +90,32 @@ fn counting(values: &[i32]) -> (SymbolTable, Rc<Counts>) {
     (symbols, counts)
 }
 
-/// 跑一段 SQL，要求全部成功。
+/// 跑一段 SQL,要求全部成功.
 fn ok(db: &mut SymbolTable, sql: &str) {
     let results = run_script(sql, db).expect("应当能解析");
     for r in &results {
-        assert!(r.outcome.is_ok(), "第 {} 条失败了：{:?}", r.index, r.outcome);
+        assert!(r.outcome.is_ok(), "第 {} 条失败了:{:?}", r.index, r.outcome);
     }
 }
 
-/// 跑一条语句并要求失败。
+/// 跑一条语句并要求失败.
 fn failure(db: &mut SymbolTable, sql: &str) -> DbError {
     let mut results = run_script(sql, db).expect("应当能解析");
     assert_eq!(results.len(), 1, "期望恰好一条语句");
     results.remove(0).outcome.expect_err("本应失败")
 }
 
-/// 一条查询的行数。
+/// 一条查询的行数.
 fn rows(db: &SymbolTable, sql: &str) -> usize {
-    let plan = compile(sql, db).unwrap_or_else(|e| panic!("降级失败：{e}"));
-    execute(&plan, db).unwrap_or_else(|e| panic!("执行失败：{e}")).nrows()
+    let plan = compile(sql, db).unwrap_or_else(|e| panic!("降级失败:{e}"));
+    execute(&plan, db).unwrap_or_else(|e| panic!("执行失败:{e}")).nrows()
 }
 
-/// 计划文本。
+/// 计划文本.
 fn explain(db: &SymbolTable, sql: &str) -> String {
     compile(sql, db)
         .and_then(|plan| plan.explain(db))
-        .unwrap_or_else(|e| panic!("降级失败：{e}"))
+        .unwrap_or_else(|e| panic!("降级失败:{e}"))
 }
 
 // -------------------------------------------------------------- 只建一次
@@ -129,7 +129,7 @@ fn an_index_is_built_once_and_reused_by_later_queries() {
     assert_eq!(counts.cells.get(), 5, "CREATE INDEX 读一列");
     let after_create = counts.cells.get();
 
-    // 连着两条查询：都走索引，都**不**重建
+    // 连着两条查询:都走索引,都**不**重建
     for round in 1..=2 {
         assert_eq!(rows(&db, "SELECT x FROM t WHERE x = 3"), 1, "第 {round} 条");
         assert_eq!(
@@ -146,7 +146,7 @@ fn an_index_is_built_once_and_reused_by_later_queries() {
 fn explain_only_shows_an_index_path_when_the_catalogue_has_one() {
     let (mut db, _) = counting(&[1, 2, 3]);
 
-    // 没建索引：顺序扫描（本版不为"也许有用"先扫一遍表）
+    // 没建索引:顺序扫描(本版不为"也许有用"先扫一遍表)
     assert_eq!(explain(&db, "SELECT x FROM t WHERE x = 2"), "Scan(t, filter=[x = 2])\n");
 
     ok(&mut db, "CREATE INDEX t_x ON t (x)");
@@ -167,7 +167,7 @@ fn insert_maintains_the_index_without_a_rescan() {
     ok(&mut db, "INSERT INTO t VALUES (4)");
     assert_eq!(counts.cells.get(), after_create, "维护索引不扫表");
 
-    // 新行查得到，而且索引仍然有效（不再重建）
+    // 新行查得到,而且索引仍然有效(不再重建)
     assert_eq!(rows(&db, "SELECT x FROM t WHERE x = 4"), 1);
     assert_eq!(counts.cells.get(), after_create);
 }
@@ -180,13 +180,13 @@ fn update_invalidates_the_index_and_it_is_rebuilt_once() {
     ok(&mut db, "UPDATE t SET x = 30 WHERE x = 3");
     let after_update = counts.cells.get();
 
-    // **绝不能用旧行号回答新键**：旧键查不到、新键查得到
+    // **绝不能用旧行号回答新键**:旧键查不到,新键查得到
     assert_eq!(rows(&db, "SELECT x FROM t WHERE x = 3"), 0, "旧键不该命中");
     assert_eq!(rows(&db, "SELECT x FROM t WHERE x = 30"), 1, "新键要命中");
     assert_eq!(
         counts.cells.get(),
         after_update + 3,
-        "第一次用到时重建一遍（只读一列 3 格）"
+        "第一次用到时重建一遍(只读一列 3 格)"
     );
 
     // 第二条查询不再重建
@@ -204,7 +204,7 @@ fn dropping_an_index_takes_the_access_path_away() {
     ok(&mut db, "DROP INDEX t_x");
     assert!(!explain(&db, "SELECT x FROM t WHERE x = 2").contains("index="));
 
-    // 结果不变，但现在是顺序扫描（不再读那一列去建索引）
+    // 结果不变,但现在是顺序扫描(不再读那一列去建索引)
     assert_eq!(rows(&db, "SELECT x FROM t WHERE x = 2"), 1);
     assert_eq!(counts.cells.get(), after_create, "没有索引就不该再读那一列");
 }
@@ -219,10 +219,10 @@ fn create_index_is_recorded_in_the_catalogue() {
     assert_eq!(
         db.indexes(),
         vec![("t_x".to_string(), "t".to_string(), 0)],
-        "索引名、表名、列都要记下来"
+        "索引名,表名,列都要记下来"
     );
 
-    // 名字与表/别名在**同一个名单**里：重名报错（PostgreSQL 也是这么定的）
+    // 名字与表/别名在**同一个名单**里:重名报错(PostgreSQL 也是这么定的)
     let err = failure(&mut db, "CREATE INDEX t ON t (x)");
     assert!(matches!(err, DbError::DuplicateSymbol { .. }), "got {err:?}");
 
@@ -230,8 +230,8 @@ fn create_index_is_recorded_in_the_catalogue() {
     ok(&mut db, "CREATE INDEX IF NOT EXISTS t_x ON t (x)");
     assert_eq!(db.indexes().len(), 1);
 
-    // 但表名/列名仍然要先解出来才谈得上"命中"（与 PostgreSQL 的一处记录在案的差异：
-    // PG 命中名字之后连表列都不看，我们宁可把错字报出来）
+    // 但表名/列名仍然要先解出来才谈得上"命中"(与 PostgreSQL 的一处记录在案的差异:
+    // PG 命中名字之后连表列都不看,我们宁可把错字报出来)
     let err = failure(&mut db, "CREATE INDEX IF NOT EXISTS t_x ON t (zzz)");
     assert!(matches!(err, DbError::UnknownColumn { .. }), "got {err:?}");
 
@@ -284,7 +284,7 @@ fn drop_schema_cascade_also_drops_the_indexes() {
         "CREATE SCHEMA study; SET search_path TO study; CREATE TABLE m (a INT); \
          CREATE INDEX m_a ON m (a)",
     );
-    // 索引的生效名跟着 `search_path` 走，与建表同一套规则
+    // 索引的生效名跟着 `search_path` 走,与建表同一套规则
     assert_eq!(db.indexes(), vec![("study.m_a".to_string(), "study.m".to_string(), 0)]);
 
     // 不写 CASCADE 时如实报出"名下还有东西"

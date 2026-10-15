@@ -1,13 +1,13 @@
-//! 聚合、`GROUP BY`、`HAVING`、`CASE WHEN`、`ROUND`、NUMERIC 算术。
+//! 聚合,`GROUP BY`,`HAVING`,`CASE WHEN`,`ROUND`,NUMERIC 算术.
 //!
-//! 全部用**小合成表**，期望值是手算的——这样断言的是"算得对不对"，而不是
-//! "和我们自己的实现一致"。
+//! 全部用**小合成表**,期望值是手算的--这样断言的是"算得对不对",而不是
+//! "和我们自己的实现一致".
 
 use ydbms::db::table::{DataType, DbError, TabShape, Table, Value};
 use ydbms::db::PhysTab;
 use ydbms::ir::{run_script, Outcome, SymbolTable};
 
-/// 两张键 + 五个值，够覆盖每个聚合的分组行为。
+/// 两张键 + 五个值,够覆盖每个聚合的分组行为.
 ///
 /// ```text
 /// g | v
@@ -22,7 +22,7 @@ const FIXTURE: &str = "
 fn ok(db: &mut SymbolTable, sql: &str) {
     let results = run_script(sql, db).expect("应当能解析");
     for r in &results {
-        assert!(r.outcome.is_ok(), "第 {} 条失败了：{:?}", r.index, r.outcome);
+        assert!(r.outcome.is_ok(), "第 {} 条失败了:{:?}", r.index, r.outcome);
     }
 }
 
@@ -37,7 +37,7 @@ fn q(db: &mut SymbolTable, sql: &str) -> PhysTab {
     assert_eq!(results.len(), 1, "期望恰好一条语句");
     match results.remove(0).outcome.expect("应当成功") {
         Outcome::Rows(table) => table,
-        other => panic!("期望 Rows，得到 {other:?}"),
+        other => panic!("期望 Rows,得到 {other:?}"),
     }
 }
 
@@ -47,7 +47,7 @@ fn failure(db: &mut SymbolTable, sql: &str) -> DbError {
     results.remove(0).outcome.expect_err("本应失败")
 }
 
-/// 取一列，拼成 `g=值` 的样子方便断言。
+/// 取一列,拼成 `g=值` 的样子方便断言.
 fn pairs(table: &PhysTab, key: usize, value: usize) -> Vec<String> {
     (0..table.nrows())
         .map(|r| {
@@ -60,7 +60,7 @@ fn pairs(table: &PhysTab, key: usize, value: usize) -> Vec<String> {
         .collect()
 }
 
-/// 单个格子（无 GROUP BY 的整表聚合）。
+/// 单个格子(无 GROUP BY 的整表聚合).
 fn one(db: &mut SymbolTable, sql: &str) -> String {
     let table = q(db, sql);
     assert_eq!(table.nrows(), 1, "整表聚合应当只有一行");
@@ -91,18 +91,18 @@ fn sum_min_max_per_group() {
 #[test]
 fn avg_is_exact_numeric_division() {
     let mut db = db(FIXTURE);
-    // a = 6/3 = 2；b = 30/2 = 15
+    // a = 6/3 = 2;b = 30/2 = 15
     let out = q(&mut db, "SELECT g, AVG(v) AS m FROM t GROUP BY g ORDER BY g");
     assert_eq!(pairs(&out, 0, 1), vec!["a=2", "b=15"]);
 }
 
 #[test]
 fn avg_returns_numeric_even_for_int_input() {
-    // 与 PostgreSQL 一致：整数求平均返回 numeric
+    // 与 PostgreSQL 一致:整数求平均返回 numeric
     let mut db = db("CREATE TABLE e (v INT); INSERT INTO e VALUES (1), (2)");
     let out = q(&mut db, "SELECT AVG(v) AS m FROM e");
 
-    // 计算结果是不限定的 `NUMERIC`（与 PostgreSQL 的 `avg(numeric)` 一致）
+    // 计算结果是不限定的 `NUMERIC`(与 PostgreSQL 的 `avg(numeric)` 一致)
     assert_eq!(out.columns()[0].ty, DataType::NumericAny);
     assert_eq!(out.value(0, 0), Some(Value::Numeric("1.5".to_string())));
 }
@@ -177,7 +177,7 @@ fn aggregating_an_empty_table_still_yields_one_row() {
     let mut db = db("CREATE TABLE e (v INT)");
     let out = q(&mut db, "SELECT COUNT(*) AS n, SUM(v) AS s, AVG(v) AS m, MIN(v) AS lo FROM e");
 
-    assert_eq!(out.nrows(), 1, "没有 GROUP BY 时，空输入也要出一行");
+    assert_eq!(out.nrows(), 1, "没有 GROUP BY 时,空输入也要出一行");
     assert_eq!(out.value(0, 0), Some(Value::Int(0)), "COUNT(*) 是 0");
     assert_eq!(out.value(0, 1), Some(Value::Null), "SUM 是 NULL");
     assert_eq!(out.value(0, 2), Some(Value::Null), "AVG 是 NULL");
@@ -197,8 +197,8 @@ fn nulls_form_their_own_group_in_first_appearance_order() {
     let mut db = db("CREATE TABLE e (v INT); INSERT INTO e VALUES (1), (NULL), (1)");
     let out = q(&mut db, "SELECT v, COUNT(*) AS n FROM e GROUP BY v");
 
-    // 两行 NULL 会被归成**一组**（NULL 不等于 NULL，但分组把它们算一起），
-    // 顺序是分组键首次出现的顺序：先 1 后 NULL
+    // 两行 NULL 会被归成**一组**(NULL 不等于 NULL,但分组把它们算一起),
+    // 顺序是分组键首次出现的顺序:先 1 后 NULL
     assert_eq!(out.nrows(), 2);
     assert_eq!(out.value(0, 0), Some(Value::Int(1)));
     assert_eq!(out.value(0, 1), Some(Value::Int(2)));
@@ -222,7 +222,7 @@ fn having_filters_groups() {
 
 #[test]
 fn having_can_introduce_an_aggregate_not_in_the_select_list() {
-    // HAVING 里第一次出现的聚合也要被收进 Aggregate 节点——这就是为什么
+    // HAVING 里第一次出现的聚合也要被收进 Aggregate 节点--这就是为什么
     // SELECT 列表与 HAVING 都必须在建节点**之前**降级完
     let mut db = db(FIXTURE);
     let out = q(
@@ -237,7 +237,7 @@ fn having_can_introduce_an_aggregate_not_in_the_select_list() {
 #[test]
 fn having_on_a_computed_ratio() {
     let mut db = db(FIXTURE);
-    // a: 3/3 全 > 0 的只有 0 个 → 0%；b: 2/2 → 100%
+    // a: 3/3 全 > 0 的只有 0 个 → 0%;b: 2/2 → 100%
     let out = q(
         &mut db,
         "SELECT g FROM t GROUP BY g \
@@ -278,7 +278,7 @@ fn case_when_classifies_rows() {
         "SELECT g, SUM(CASE WHEN v >= 2 THEN 1 ELSE 0 END) AS big FROM t GROUP BY g ORDER BY g",
     );
 
-    // a: 2,3 两个 >= 2 → 2；b: 10,20 两个 → 2
+    // a: 2,3 两个 >= 2 → 2;b: 10,20 两个 → 2
     assert_eq!(pairs(&out, 0, 1), vec!["a=2", "b=2"]);
 }
 
@@ -327,10 +327,10 @@ fn numeric_add_sub_mul() {
 
 #[test]
 fn division_scale_matches_postgresql() {
-    // 每个期望值都是在临时起的 **PostgreSQL 18.6** 上实测出来的，不是照文档推的。
+    // 每个期望值都是在临时起的 **PostgreSQL 18.6** 上实测出来的,不是照文档推的.
     //
-    // 标度由 `select_div_scale` 决定，其中「领头数字组更小就把 qweight 再减一」
-    // 那一步最容易漏——漏了会给少 4 位的结果，而 `=` 的真假会因此**反过来**。
+    // 标度由 `select_div_scale` 决定,其中"领头数字组更小就把 qweight 再减一"
+    // 那一步最容易漏--漏了会给少 4 位的结果,而 `=` 的真假会因此**反过来**.
     let mut db = SymbolTable::new();
     for (expr, want) in [
         // 领头组 1 < 3 → 修正 → 20 位
@@ -341,7 +341,7 @@ fn division_scale_matches_postgresql() {
         // 领头组 100 >= 28 → 不修正 → 16 位
         ("100.0 / 28", "3.5714285714285714"),
         ("2500.0 / 28", "89.2857142857142857"),
-        // 领头组 1 < 7 → 修正，把 qweight 从 1 拉回 0 → 16 位（漏掉会给 12 位）
+        // 领头组 1 < 7 → 修正,把 qweight 从 1 拉回 0 → 16 位(漏掉会给 12 位)
         ("12345.0 / 7", "1763.5714285714285714"),
         ("1.0 / 300", "0.00333333333333333333"),
         ("1.0 / 0.3", "3.3333333333333333"),
@@ -371,9 +371,9 @@ fn int_arithmetic_stays_int() {
 
 #[test]
 fn an_extreme_scale_division_is_correct_rather_than_zero() {
-    // 历史：这段曾经返回**安静的 0**——`pow10` 溢出返回 0，`checked_mul(0)` 是
-    // `Some(0)`，于是溢出被吞掉、除法的分子变成 0。标度 34 把 `10^40` 推过了 i128。
-    // 换成 bigdecimal 之后这条溢出路径没有了，但断言要留着钉住"不再是 0"。
+    // 历史:这段曾经返回**安静的 0**--`pow10` 溢出返回 0,`checked_mul(0)` 是
+    // `Some(0)`,于是溢出被吞掉,除法的分子变成 0.标度 34 把 `10^40` 推过了 i128.
+    // 换成 bigdecimal 之后这条溢出路径没有了,但断言要留着钉住"不再是 0".
     let mut db = db(
         "CREATE TABLE t (a NUMERIC(38,34), b NUMERIC(38,34));
          INSERT INTO t VALUES (0.1234567890123456789012345678901234,
@@ -382,11 +382,11 @@ fn an_extreme_scale_division_is_correct_rather_than_zero() {
 
     let out = q(&mut db, "SELECT a / b AS x FROM t");
     let text = out.value(0, 0).expect("值").to_string();
-    let value: f64 = text.parse().unwrap_or_else(|_| panic!("不是数：{text}"));
+    let value: f64 = text.parse().unwrap_or_else(|_| panic!("不是数:{text}"));
 
     assert!(
         (0.124..0.126).contains(&value),
-        "应当约等于 0.125，实际 {text}"
+        "应当约等于 0.125,实际 {text}"
     );
 }
 
@@ -413,7 +413,7 @@ fn the_query3_pass_rate_shape_end_to_end() {
 #[test]
 fn rounded_division_matches_hand_computation() {
     let mut db = SymbolTable::new();
-    // 100.0 * 25 / 28 = 89.285714… → 89.3
+    // 100.0 * 25 / 28 = 89.285714... → 89.3
     assert_eq!(one(&mut db, "SELECT ROUND(100.0 * 25 / 28, 1) AS x"), "89.3");
 }
 
@@ -438,19 +438,19 @@ fn round_supports_negative_digits() {
 
 #[test]
 fn a_bare_numeric_holds_far_more_than_38_digits() {
-    // 这一条是"放开精度"的核心：过去 i128 只装得下 38 位有效数字
+    // 这一条是"放开精度"的核心:过去 i128 只装得下 38 位有效数字
     let mut db = db("CREATE TABLE t (v NUMERIC)");
     let digits = "123456789012345678901234567890123456789012345678901234567890.5";
     ok(&mut db, &format!("INSERT INTO t VALUES ({digits})"));
 
-    // NUMERIC(38,18) 会拒绝它，裸 NUMERIC 不会
+    // NUMERIC(38,18) 会拒绝它,裸 NUMERIC 不会
     let out = q(&mut db, "SELECT v FROM t");
     assert_eq!(out.value(0, 0), Some(Value::Numeric(digits.to_string())));
 }
 
 #[test]
 fn a_constrained_column_still_cannot_hold_more_than_its_precision() {
-    // 放开的是"默认"，不是"约束"：写了 NUMERIC(N,M) 还是要守
+    // 放开的是"默认",不是"约束":写了 NUMERIC(N,M) 还是要守
     let mut db = db("CREATE TABLE t (v NUMERIC(6,2))");
     let err = failure(
         &mut db,
@@ -461,7 +461,7 @@ fn a_constrained_column_still_cannot_hold_more_than_its_precision() {
 
 #[test]
 fn numeric_with_a_single_typmod_means_scale_zero() {
-    // 与 PostgreSQL 一致：`NUMERIC(N)` 等于 `NUMERIC(N, 0)`
+    // 与 PostgreSQL 一致:`NUMERIC(N)` 等于 `NUMERIC(N, 0)`
     let mut db = db("CREATE TABLE t (v NUMERIC(5))");
     ok(&mut db, "INSERT INTO t VALUES (12345)");
 
@@ -476,9 +476,9 @@ fn big_numbers_survive_multiplication() {
         &mut db,
         "SELECT 123456789012345678901234567890.5 * 1000000000000000000000000000000.5 AS x",
     );
-    // 60 位精度的乘法结果，i128 时代根本做不了
+    // 60 位精度的乘法结果,i128 时代根本做不了
     let text = out.value(0, 0).expect("值").to_string();
-    assert!(text.len() > 50, "结果应当很长，实际 {text}");
+    assert!(text.len() > 50, "结果应当很长,实际 {text}");
     assert!(text.starts_with("123456789012345678901234567890"), "{text}");
 }
 
@@ -509,8 +509,8 @@ fn window_functions_are_rejected() {
 #[test]
 fn an_aggregate_filter_clause_keeps_only_the_matching_rows() {
     let mut db = db(FIXTURE);
-    // 手算：`v > 1` 命中 2、3、10、20 → COUNT 4 / SUM 35；
-    // 而 `COUNT(*)`（没有 FILTER）是 5 行
+    // 手算:`v > 1` 命中 2,3,10,20 → COUNT 4 / SUM 35;
+    // 而 `COUNT(*)`(没有 FILTER)是 5 行
     let out = q(
         &mut db,
         "SELECT COUNT(*) FILTER (WHERE v > 1) AS n, SUM(v) FILTER (WHERE v > 1) AS s,
@@ -526,7 +526,7 @@ fn an_aggregate_filter_clause_keeps_only_the_matching_rows() {
 #[test]
 fn an_aggregate_filter_with_a_group_by_filters_per_group() {
     let mut db = db(FIXTURE);
-    // a 组：1,2,3 里 > 1 的是 2、3 → 2 行；b 组：10,20 全中 → 2 行
+    // a 组:1,2,3 里 > 1 的是 2,3 → 2 行;b 组:10,20 全中 → 2 行
     let out = q(
         &mut db,
         "SELECT g, COUNT(*) FILTER (WHERE v > 1) AS n
@@ -550,7 +550,7 @@ fn grouping_sets_are_rejected() {
 #[test]
 fn distinct_on_is_still_rejected() {
     let mut db = db(FIXTURE);
-    // 裸 `DISTINCT` 已经实现（见 `ir_features.rs`）；`DISTINCT ON` 仍然拒绝
+    // 裸 `DISTINCT` 已经实现(见 `ir_features.rs`);`DISTINCT ON` 仍然拒绝
     let err = failure(&mut db, "SELECT DISTINCT ON (g) g FROM t");
     assert!(err.to_string().contains("DISTINCT ON"), "{err}");
 }
@@ -558,7 +558,7 @@ fn distinct_on_is_still_rejected() {
 #[test]
 fn unknown_functions_are_rejected_by_name() {
     let mut db = SymbolTable::new();
-    // `UPPER` / `LEFT` / `CONCAT_WS` / `ROUND` 都已经实现了，挑一个真没有的
+    // `UPPER` / `LEFT` / `CONCAT_WS` / `ROUND` 都已经实现了,挑一个真没有的
     let err = failure(&mut db, "SELECT LOWER('x') AS x");
     assert!(err.to_string().contains("lower"), "{err}");
 }

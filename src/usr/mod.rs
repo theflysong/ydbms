@@ -1,31 +1,31 @@
-//! 用户系统：用户表、口令认证，以及"谁是管理员"。
+//! 用户系统:用户表,口令认证,以及"谁是管理员".
 //!
-//! 这一层只做两件事：
+//! 这一层只做两件事:
 //!
-//! * **用户与口令**——[`User`] / [`UserStore`]，存成服务目录下的 `users.json`；
-//! * **服务目录与库**——[`service::ServiceDir`] / [`service::Catalog`] /
-//!   [`service::Database`]，见 [`service`] 的文件头。
+//! * **用户与口令**--[`User`] / [`UserStore`],存成服务目录下的 `users.json`;
+//! * **服务目录与库**--[`service::ServiceDir`] / [`service::Catalog`] /
+//!   [`service::Database`],见 [`service`] 的文件头.
 //!
-//! # 本版的口径（与 PostgreSQL 的差别，如实写在这里）
+//! # 本版的口径(与 PostgreSQL 的差别,如实写在这里)
 //!
-//! * **只做认证 + "owner（或管理员）才能连"**。`GRANT` / `REVOKE`、多用户共享、
-//!   `CREATE USER` 都**明确不做**：用户要么由首次启动的 bootstrap（见
-//!   [`UserStore::add`] 的调用方）建出来，要么手工编辑 `users.json`。
-//! * 没有连接协议、没有网络：`ysql` 是**单机**命令行，一个进程打开一个库。
-//! * 口令存的是**加盐单轮 SHA-256**（见 [`hash`] 的文件头），不是 KDF。
+//! * **只做认证 + "owner(或管理员)才能连"**.`GRANT` / `REVOKE`,多用户共享,
+//!   `CREATE USER` 都**明确不做**:用户要么由首次启动的 bootstrap(见
+//!   [`UserStore::add`] 的调用方)建出来,要么手工编辑 `users.json`.
+//! * 没有连接协议,没有网络:`ysql` 是**单机**命令行,一个进程打开一个库.
+//! * 口令存的是**加盐单轮 SHA-256**(见 [`hash`] 的文件头),不是 KDF.
 //!
 //! # `users.json`
 //!
 //! ```text
 //! <server-dist>/users.json
 //! { "version": 1,
-//!   "users": [ { "name": "bob", "salt": "…32 位十六进制…",
-//!                "password_hash": "…64 位十六进制…",
+//!   "users": [ { "name": "bob", "salt": "...32 位十六进制...",
+//!                "password_hash": "...64 位十六进制...",
 //!                "is_admin": true, "created_unix": 1760000000 } ] }
 //! ```
 //!
-//! **这是磁盘契约**：`version` 必存，新增字段一律 `#[serde(default)]`
-//! （老文件要一直读得回来），改名或改结构就是改文件格式。
+//! **这是磁盘契约**:`version` 必存,新增字段一律 `#[serde(default)]`
+//! (老文件要一直读得回来),改名或改结构就是改文件格式.
 
 pub mod hash;
 pub mod service;
@@ -41,12 +41,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::table::{DbError, Result};
 
-/// `users.json` 的格式版本。
+/// `users.json` 的格式版本.
 pub const USERS_VERSION: u32 = 1;
 
-/// 现在（unix 秒）。
+/// 现在(unix 秒).
 ///
-/// 不引 chrono：本版只需要"谁先谁后"和一个人能读的时间戳，秒就够了。
+/// 不引 chrono:本版只需要"谁先谁后"和一个人能读的时间戳,秒就够了.
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -54,51 +54,51 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// 一个用户。
+/// 一个用户.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
-    /// 用户名（服务目录内唯一）。
+    /// 用户名(服务目录内唯一).
     pub name: String,
-    /// 盐：`SALT_LEN` 字节的十六进制（见 [`hash`]）。
+    /// 盐:`SALT_LEN` 字节的十六进制(见 [`hash`]).
     pub salt: String,
-    /// `sha256(salt ‖ password)` 的十六进制。
+    /// `sha256(salt ‖ password)` 的十六进制.
     pub password_hash: String,
-    /// 是不是管理员：管理员能连**任何**库（owner 检查对它放行）。
+    /// 是不是管理员:管理员能连**任何**库(owner 检查对它放行).
     #[serde(default)]
     pub is_admin: bool,
-    /// 建立时间（unix 秒，见 [`now_unix`]）。
+    /// 建立时间(unix 秒,见 [`now_unix`]).
     pub created_unix: u64,
 }
 
-/// `users.json` 的内容。
+/// `users.json` 的内容.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserStore {
-    /// 格式版本，见 [`USERS_VERSION`]。
+    /// 格式版本,见 [`USERS_VERSION`].
     pub version: u32,
-    /// 用户表，按建立顺序。
+    /// 用户表,按建立顺序.
     #[serde(default)]
     pub users: Vec<User>,
 }
 
-/// 认证失败的原因。
+/// 认证失败的原因.
 ///
-/// 与 [`DbError`] 分开：这里的三条都是**给用户看的**，`Display` 直接是中文，
-/// `ysql` 把它原样打出来（别的错误类型沿用了英文框架）。
+/// 与 [`DbError`] 分开:这里的三条都是**给用户看的**,`Display` 直接是中文,
+/// `ysql` 把它原样打出来(别的错误类型沿用了英文框架).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
-    /// 服务目录里没有这个用户。
+    /// 服务目录里没有这个用户.
     UnknownUser {
-        /// 被请求的用户名。
+        /// 被请求的用户名.
         name: String,
     },
-    /// 用户在，但口令不对。
+    /// 用户在,但口令不对.
     BadPassword {
-        /// 用户名。
+        /// 用户名.
         name: String,
     },
-    /// `users.json` 被改坏了（盐不是合法十六进制）。
+    /// `users.json` 被改坏了(盐不是合法十六进制).
     Corrupt {
-        /// 用户名。
+        /// 用户名.
         name: String,
     },
 }
@@ -106,17 +106,13 @@ pub enum AuthError {
 impl fmt::Display for AuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AuthError::UnknownUser { name } => write!(
-                f,
-                "用户 `{}` 不存在（本版没有 CREATE USER：用户表在服务目录的 users.json 里）",
+            AuthError::UnknownUser { name } => write!(f, "{}", tr!("usr.mod.001", arg0 = 
                 name
-            ),
-            AuthError::BadPassword { name } => write!(f, "用户 `{}` 的口令不对", name),
-            AuthError::Corrupt { name } => write!(
-                f,
-                "用户 `{}` 的盐不是合法的十六进制（users.json 被改坏了）",
+            )),
+            AuthError::BadPassword { name } => write!(f, "{}", tr!("usr.mod.002", arg0 =  name)),
+            AuthError::Corrupt { name } => write!(f, "{}", tr!("usr.mod.003", arg0 = 
                 name
-            ),
+            )),
         }
     }
 }
@@ -128,7 +124,7 @@ impl Default for UserStore {
 }
 
 impl UserStore {
-    /// 一个空用户表（`version` 是当前版本）。
+    /// 一个空用户表(`version` 是当前版本).
     pub fn empty() -> Self {
         UserStore {
             version: USERS_VERSION,
@@ -136,41 +132,40 @@ impl UserStore {
         }
     }
 
-    /// `users.json` 在不在——**bootstrap 就靠它判断"是不是首次启动"**。
+    /// `users.json` 在不在--**bootstrap 就靠它判断"是不是首次启动"**.
     pub fn exists(path: &Path) -> bool {
         path.is_file()
     }
 
-    /// 读 `users.json`。
+    /// 读 `users.json`.
     ///
-    /// 文件不存在、版本不认识、JSON 坏了都**报错**——不存在的判断请先用
-    /// [`UserStore::exists`]（"不存在"与"空用户表"是两件不同的事）。
+    /// 文件不存在,版本不认识,JSON 坏了都**报错**--不存在的判断请先用
+    /// [`UserStore::exists`] ("不存在"与"空用户表"是两件不同的事).
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| io_err(path, e))?;
         let store: UserStore = serde_json::from_str(&raw).map_err(|e| DbError::Format {
             path: path.display().to_string(),
             line: None,
-            message: format!("users.json 不是合法的用户表：{}", e),
+            message: format!("{}", tr!("usr.mod.004", arg0 =  e)),
         })?;
         if store.version != USERS_VERSION {
             return Err(DbError::Format {
                 path: path.display().to_string(),
                 line: None,
-                message: format!(
-                    "不认识的 users.json 版本 {}（本版只认 {}）",
-                    store.version, USERS_VERSION
-                ),
+                message: format!("{}", tr!("usr.mod.005", arg0 = 
+                    store.version, arg1 =  USERS_VERSION
+                )),
             });
         }
         Ok(store)
     }
 
-    /// 写 `users.json`（临时文件 + rename，读者不会看到写了一半的用户表）。
+    /// 写 `users.json`(临时文件 + rename,读者不会看到写了一半的用户表).
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(|e| DbError::Format {
             path: path.display().to_string(),
             line: None,
-            message: format!("用户表序列化失败：{}", e),
+            message: format!("{}", tr!("usr.mod.006", arg0 =  e)),
         })?;
 
         let tmp = path.with_extension("json.tmp");
@@ -178,29 +173,29 @@ impl UserStore {
         std::fs::rename(&tmp, path).map_err(|e| io_err(path, e))
     }
 
-    /// 按名字找一个用户。
+    /// 按名字找一个用户.
     pub fn find(&self, name: &str) -> Option<&User> {
         self.users.iter().find(|user| user.name == name)
     }
 
-    /// 加一个用户：取新盐、算哈希、登记。
+    /// 加一个用户:取新盐,算哈希,登记.
     ///
-    /// 重名与空口令都**拒绝**（[`DbError::Denied`]）——本版没有 `ALTER USER`，
-    /// 悄悄改掉别人的口令比报错危险得多。
+    /// 重名与空口令都**拒绝**([`DbError::Denied`])--本版没有 `ALTER USER`,
+    /// 悄悄改掉别人的口令比报错危险得多.
     pub fn add(&mut self, name: &str, password: &str, is_admin: bool) -> Result<&User> {
         if name.trim().is_empty() {
             return Err(DbError::Denied {
-                message: "用户名不能为空".to_string(),
+                message: tr!("usr.mod.007").into_owned(),
             });
         }
         if password.is_empty() {
             return Err(DbError::Denied {
-                message: format!("用户 `{}` 的口令不能为空", name),
+                message: format!("{}", tr!("usr.mod.008", arg0 =  name)),
             });
         }
         if self.find(name).is_some() {
             return Err(DbError::Denied {
-                message: format!("用户 `{}` 已经存在", name),
+                message: format!("{}", tr!("usr.mod.009", arg0 =  name)),
             });
         }
 
@@ -214,10 +209,10 @@ impl UserStore {
         });
 
         // push 之后一定取得到
-        Ok(self.users.last().expect("刚 push 过"))
+        Ok(self.users.last().expect(&tr!("usr.mod.010").into_owned()))
     }
 
-    /// 认证：用户必须在、口令必须对。
+    /// 认证:用户必须在,口令必须对.
     pub fn authenticate(&self, name: &str, password: &str) -> std::result::Result<&User, AuthError> {
         let user = self
             .find(name)

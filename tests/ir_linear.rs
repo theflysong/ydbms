@@ -1,12 +1,12 @@
-//! 线性 IR 的 testbench：**手写 IR** 跑查询，核对结果。
+//! 线性 IR 的 testbench:**手写 IR** 跑查询,核对结果.
 //!
-//! 按 `tests/phys_tab.rs` 的方式建表（`x / f(x)=x²+1 / f'(x)=2x`，x ∈ [-5,5]），
-//! 然后把查询**手工**写成 [`PlanBuilder`] + [`ProgBuilder`] 的调用序列——本版没有
-//! AST → IR 的降级，IR 就是手写的。
+//! 按 `tests/phys_tab.rs` 的方式建表(`x / f(x)=x²+1 / f'(x)=2x`,x ∈ [-5,5]),
+//! 然后把查询**手工**写成 [`PlanBuilder`] + [`ProgBuilder`] 的调用序列--本版没有
+//! AST → IR 的降级,IR 就是手写的.
 //!
-//! 除了核对查询结果，还重点验证「线性」不是形式而是有静态保证的：
-//! [`Plan::analyze`] 必须挡住寄存器先使用后定义、列下标越界、把布尔当结果列、
-//! 以及违反拓扑序的输入。
+//! 除了核对查询结果,还重点验证"线性"不是形式而是有静态保证的:
+//! [`Plan::analyze`] 必须挡住寄存器先使用后定义,列下标越界,把布尔当结果列,
+//! 以及违反拓扑序的输入.
 
 use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Table, TabShape, Value};
 use ydbms::db::PhysTab;
@@ -17,7 +17,7 @@ use ydbms::ir::{
 
 const X_MIN: i32 = -5;
 const X_MAX: i32 = 5;
-/// 行数：x 取遍闭区间 `[-5, 5]`。
+/// 行数:x 取遍闭区间 `[-5, 5]`.
 const N: usize = (X_MAX - X_MIN + 1) as usize;
 
 /// f(x) = x² + 1
@@ -30,7 +30,7 @@ fn df(x: i32) -> i32 {
     2 * x
 }
 
-/// 主表形状：`x INT, value INT, drvd INT`。
+/// 主表形状:`x INT, value INT, drvd INT`.
 fn quadratic_shape() -> ColumnsShape {
     ColumnsShape::new(vec![
         Column::new("x", DataType::Int),
@@ -39,7 +39,7 @@ fn quadratic_shape() -> ColumnsShape {
     ])
 }
 
-/// 建主表，`x ∈ [-5, 5]`。
+/// 建主表,`x ∈ [-5, 5]`.
 fn build_quadratic_table(name: &str) -> PhysTab {
     let shape = quadratic_shape();
     let mut tab = PhysTab::new(name, &shape);
@@ -50,7 +50,7 @@ fn build_quadratic_table(name: &str) -> PhysTab {
     tab
 }
 
-/// 第二张表 `t(id, label)`，`id` 取 `[-5, 5]` 里的偶数（5 行），`label = id * 100`。
+/// 第二张表 `t(id, label)`,`id` 取 `[-5, 5]` 里的偶数(5 行),`label = id * 100`.
 fn build_labels_table() -> PhysTab {
     let shape = ColumnsShape::new(vec![
         Column::new("id", DataType::Int),
@@ -66,7 +66,7 @@ fn build_labels_table() -> PhysTab {
     tab
 }
 
-/// 只装了主表 `f` 的符号表。
+/// 只装了主表 `f` 的符号表.
 fn symbols_with_f() -> SymbolTable {
     let mut symbols = SymbolTable::new();
     symbols
@@ -75,7 +75,7 @@ fn symbols_with_f() -> SymbolTable {
     symbols
 }
 
-/// 把第 `c` 列取成 `Vec<i32>`，便于直接断言。
+/// 把第 `c` 列取成 `Vec<i32>`,便于直接断言.
 fn column_of(table: &PhysTab, c: usize) -> Vec<i32> {
     (0..table.nrows())
         .map(|r| {
@@ -87,7 +87,7 @@ fn column_of(table: &PhysTab, c: usize) -> Vec<i32> {
         .collect()
 }
 
-/// 造一个 `col(index) OP 常量` 形式的谓词。
+/// 造一个 `col(index) OP 常量` 形式的谓词.
 fn col_cmp(index: usize, op: BinOp, value: i32) -> Prog {
     let mut p = ProgBuilder::new();
     let c = p.col(index);
@@ -96,7 +96,7 @@ fn col_cmp(index: usize, op: BinOp, value: i32) -> Prog {
     p.finish(r)
 }
 
-/// 造一组「直接取某几列」的投影。
+/// 造一组"直接取某几列"的投影.
 fn project_cols(indices: &[usize], names: &[&str]) -> (Vec<Prog>, Vec<String>) {
     let progs = indices
         .iter()
@@ -109,7 +109,7 @@ fn project_cols(indices: &[usize], names: &[&str]) -> (Vec<Prog>, Vec<String>) {
     (progs, names.iter().map(|s| s.to_string()).collect())
 }
 
-/// 造一个「取第 `index` 列」的排序键。
+/// 造一个"取第 `index` 列"的排序键.
 fn key_of(index: usize, desc: bool) -> SortKey {
     let mut p = ProgBuilder::new();
     let c = p.col(index);
@@ -251,7 +251,7 @@ fn unary_negate_and_not() {
 
     let out = execute(&plan, &symbols).unwrap();
 
-    // 只留下 x < 0 的行，取负后是 5..1
+    // 只留下 x < 0 的行,取负后是 5..1
     assert_eq!(column_of(&out, 0), vec![5, 4, 3, 2, 1]);
 }
 
@@ -376,7 +376,7 @@ fn inner_join_on_equality() {
     let left = b.scan("f");
     let right = b.scan("t");
 
-    // f.x = t.id：左支 0..2，右支从 3 开始（扁平下标）
+    // f.x = t.id:左支 0..2,右支从 3 开始(扁平下标)
     let mut p = ProgBuilder::new();
     let x = p.col(0);
     let id = p.col(3);
@@ -463,7 +463,7 @@ fn alias_resolves_to_the_same_table() {
     assert_eq!(symbols.column_index("p", "value"), Some(1));
     assert_eq!(symbols.column_index("p", "nope"), None);
 
-    // 通过别名扫描，结果与原名一致
+    // 通过别名扫描,结果与原名一致
     let mut b = PlanBuilder::new();
     let s = b.scan("p");
     let plan = b.finish(s).unwrap();
@@ -502,7 +502,7 @@ fn duplicate_symbol_is_rejected() {
 fn bulk_import_is_atomic() {
     let mut symbols = symbols_with_f();
 
-    // 第二条与已有的 f 冲突，整批都不该生效
+    // 第二条与已有的 f 冲突,整批都不该生效
     let err = symbols
         .extend([
             Symbol::relation("t", build_labels_table()),
@@ -531,13 +531,13 @@ fn scanning_an_unregistered_table_is_rejected() {
     );
 }
 
-// -------------------------------------------------- 静态校验：坏 IR 必须被挡住
+// -------------------------------------------------- 静态校验:坏 IR 必须被挡住
 
 #[test]
 fn verify_rejects_a_register_used_before_being_written() {
     let symbols = symbols_with_f();
 
-    // 手搓一个坏程序：Binary 读了它这一条正要写的 1 号寄存器
+    // 手搓一个坏程序:Binary 读了它这一条正要写的 1 号寄存器
     let prog = Prog::new(
         vec![
             Step::Col {
@@ -604,7 +604,7 @@ fn verify_rejects_a_boolean_result_column() {
 fn analyze_rejects_a_non_topological_input() {
     let symbols = symbols_with_f();
 
-    // 手工造一个自引用的计划：0 号节点的输入是它自己
+    // 手工造一个自引用的计划:0 号节点的输入是它自己
     let plan = Plan {
         nodes: vec![Node {
             op: Op::Filter {
@@ -625,7 +625,7 @@ fn analyze_rejects_a_non_topological_input() {
 fn builder_rejects_a_forward_reference() {
     let mut b = PlanBuilder::new();
 
-    // 还没有任何节点，就引用 5 号
+    // 还没有任何节点,就引用 5 号
     let err = b.filter(5, col_cmp(0, BinOp::Eq, 0)).unwrap_err();
 
     assert!(matches!(err, DbError::IrInvalid { .. }), "got {err:?}");
@@ -666,7 +666,7 @@ fn division_by_zero_is_a_runtime_error() {
         .unwrap();
     let plan = b.finish(pr).unwrap();
 
-    // 静态校验应当通过（两个 INT 相除类型正确），错误发生在求值
+    // 静态校验应当通过(两个 INT 相除类型正确),错误发生在求值
     plan.analyze(&symbols).expect("类型上没问题");
 
     let err = execute(&plan, &symbols).unwrap_err();

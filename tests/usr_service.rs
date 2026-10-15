@@ -1,20 +1,23 @@
-//! 服务目录与库的 testbench（阶段 5.1 / 5.2 / 5.3 里阶段 6 用到的那一块）。
+//! 服务目录与库的 testbench(阶段 5.1 / 5.2 / 5.3 里阶段 6 用到的那一块).
 //!
-//! 覆盖：库目录与 `catalog.json`、owner 与管理员、单写者锁、打开即载入、
-//! 提交点只写脏表（含"表没了就把文件删掉"）、以及各种明确报错的口径。
+//! 覆盖:库目录与 `catalog.json`,owner 与管理员,单写者锁,打开即载入,
+//! 提交点只写脏表(含"表没了就把文件删掉"),以及各种明确报错的口径.
 //!
-//! 同进程里换会话就够了（跨进程的端到端在 `tests/ysql_cli.rs`）。
+//! 同进程里换会话就够了(跨进程的端到端在 `tests/ysql_cli.rs`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ydbms::cmd::{Session, Sink};
-use ydbms::db::table::Value;
+use ydbms::db::table::{Column, ColumnsShape, DataType, Table, Value};
+use ydbms::db::PhysTab;
+use ydbms::pers::{CsvPersister, Persister, TablePath};
+use ydbms::usr::service::CommitIntent;
 use ydbms::usr::{ServiceDir, User};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// 自清理的临时目录（每个测试一个**服务目录**）。
+/// 自清理的临时目录(每个测试一个**服务目录**).
 struct TempDir {
     path: PathBuf,
 }
@@ -33,7 +36,7 @@ impl TempDir {
         &self.path
     }
 
-    /// 建一个服务目录（`users.json` 之类这里不关心，直接手搓用户）。
+    /// 建一个服务目录(`users.json` 之类这里不关心,直接手搓用户).
     fn service(&self) -> ServiceDir {
         ServiceDir::resolve(Some(self.path.to_path_buf()), None).expect("服务目录")
     }
@@ -45,7 +48,7 @@ impl Drop for TempDir {
     }
 }
 
-/// 一个不碰磁盘的用户（认证在 `tests/usr_auth.rs` 里单独测）。
+/// 一个不碰磁盘的用户(认证在 `tests/usr_auth.rs` 里单独测).
 fn user(name: &str, is_admin: bool) -> User {
     User {
         name: name.to_string(),
@@ -56,7 +59,7 @@ fn user(name: &str, is_admin: bool) -> User {
     }
 }
 
-/// 打开一个会话，两路输出都进内存。
+/// 打开一个会话,两路输出都进内存.
 fn open_session(service: &ServiceDir, database: &str, as_user: &User) -> Session {
     let db = service.open(database, as_user).expect("打开库");
     Session::open_with_sinks(
@@ -178,7 +181,7 @@ fn a_second_writer_on_the_same_database_is_refused() {
     let err = service.open("d", &bob).expect_err("第二个写者要拒绝");
     assert!(err.to_string().contains("单写者锁"), "{err}");
 
-    // 第一个句柄一放手，别人就能连（锁跟着句柄走，不会留下陈旧锁文件）
+    // 第一个句柄一放手,别人就能连(锁跟着句柄走,不会留下陈旧锁文件)
     drop(first);
     assert!(service.open("d", &bob).is_ok());
 }
@@ -198,15 +201,15 @@ fn tables_written_at_commit_are_loaded_by_the_next_session() {
             "CREATE TABLE movies (movie_id INT, title VARCHAR(20));\n\
              INSERT INTO movies VALUES (1, 'Alien'), (2, 'a\\b'), (3, NULL);",
         );
-        assert!(session.messages().contains("成功 2 条，失败 0 条"), "{}", session.messages());
+        assert!(session.messages().contains("成功 2 条,失败 0 条"), "{}", session.messages());
         assert_eq!(session.failed(), 0);
-    } // 会话一放手：单写者锁释放，数据已经在盘上
+    } // 会话一放手:单写者锁释放,数据已经在盘上
 
     let lib = dir.path().join("filmdb");
     assert!(lib.join("movies.csv").is_file());
     assert!(lib.join("movies.schema.json").is_file());
 
-    // 另一个会话（另一个进程也是同一条路）把它读回来
+    // 另一个会话(另一个进程也是同一条路)把它读回来
     let mut session = open_session(&service, "filmdb", &bob);
     assert_eq!(session.database(), Some("filmdb"));
     assert_eq!(session.user(), Some("bob"));
@@ -214,7 +217,7 @@ fn tables_written_at_commit_are_loaded_by_the_next_session() {
     let table = session.symbols().relation("movies").expect("表回来了");
     assert_eq!(table.nrows(), 3);
     assert_eq!(table.row(0).unwrap()[1], Value::Text("Alien".to_string()));
-    // NULL 与带反斜杠的文本必须逐值回来（这正是 pers 的数据格式契约）
+    // NULL 与带反斜杠的文本必须逐值回来(这正是 pers 的数据格式契约)
     assert_eq!(table.row(1).unwrap()[1], Value::Text("a\\b".to_string()));
     assert_eq!(table.row(2).unwrap()[1], Value::Null);
 
@@ -252,7 +255,7 @@ fn a_table_dropped_by_drop_schema_cascade_has_its_files_removed() {
 
     let lib = dir.path().join("d");
     {
-        // 表名带 schema 前缀，文件名就是 `study.movies.csv`
+        // 表名带 schema 前缀,文件名就是 `study.movies.csv`
         let mut session = open_session(&service, "d", &bob);
         session.run_script(
             "CREATE SCHEMA study;\nSET search_path TO study;\n\
@@ -267,13 +270,13 @@ fn a_table_dropped_by_drop_schema_cascade_has_its_files_removed() {
         assert!(session.messages().contains("schema study 已删除"), "{}", session.messages());
     }
 
-    assert!(!lib.join("study.movies.csv").exists(), "表没了，文件也要没");
+    assert!(!lib.join("study.movies.csv").exists(), "表没了,文件也要没");
     assert!(!lib.join("study.movies.schema.json").exists());
 }
 
 #[test]
 fn a_table_created_and_dropped_in_the_same_piece_is_not_an_error() {
-    // 建出来又清掉、而且都在同一段里：没有东西要写，也不该让提交失败
+    // 建出来又清掉,而且都在同一段里:没有东西要写,也不该让提交失败
     let dir = TempDir::new("cascade-same-piece");
     let service = dir.service();
     service.create_database("d", "bob").unwrap();
@@ -291,15 +294,15 @@ fn a_table_created_and_dropped_in_the_same_piece_is_not_an_error() {
     let lib = dir.path().join("d");
     assert!(!lib.join("s.t.csv").exists(), "压根没落盘过");
 
-    drop(session); // 放开单写者锁，才轮得到另一个会话打开
+    drop(session); // 放开单写者锁,才轮得到另一个会话打开
     assert!(service.open("d", &bob).expect("再打开").load_tables().unwrap().is_empty());
 }
 
 #[test]
 fn a_write_is_on_disk_before_the_session_ends() {
-    // "写完就落盘"的字面口径：提交点是**一次 `run_with`**，所以 `run_script` 一返回
-    // 数据就已经在盘上了——不用等会话结束、更不用等进程退出（这正是
-    // "INSERT 之后立刻 kill -9，重启数据还在"要的那条性质）。
+    // "写完就落盘"的字面口径:提交点是**一次 `run_with`**,所以 `run_script` 一返回
+    // 数据就已经在盘上了--不用等会话结束,更不用等进程退出(这正是
+    // "INSERT 之后立刻 kill -9,重启数据还在"要的那条性质).
     let dir = TempDir::new("durable");
     let service = dir.service();
     service.create_database("d", "bob").unwrap();
@@ -309,7 +312,7 @@ fn a_write_is_on_disk_before_the_session_ends() {
     session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (9);");
     assert_eq!(session.failed(), 0, "{}", session.messages());
 
-    // 会话还开着（锁也还握着）：直接读盘上的那份 CSV
+    // 会话还开着(锁也还握着):直接读盘上的那份 CSV
     let csv = std::fs::read_to_string(dir.path().join("d/t.csv")).expect("t.csv 应当已经在盘上");
     assert!(csv.lines().any(|line| line == "9"), "{csv}");
 
@@ -319,9 +322,9 @@ fn a_write_is_on_disk_before_the_session_ends() {
 
 #[test]
 fn a_late_search_path_change_does_not_make_commit_save_the_wrong_table() {
-    // 提交点必须按**表自己的生效名**精确取表：`s.t` 与 `t` 都在、`search_path`
-    // 又指向 `s` 时，按 `search_path` 再解一次会把 `s.t` 存成 `t` 的那一份，
-    // 而真正的 `t` 悄悄不落盘（踩过的坑：数据静默丢失）。
+    // 提交点必须按**表自己的生效名**精确取表:`s.t` 与 `t` 都在,`search_path`
+    // 又指向 `s` 时,按 `search_path` 再解一次会把 `s.t` 存成 `t` 的那一份,
+    // 而真正的 `t` 悄悄不落盘(踩过的坑:数据静默丢失).
     let dir = TempDir::new("search-path-shift");
     let service = dir.service();
     service.create_database("d", "bob").unwrap();
@@ -335,7 +338,7 @@ fn a_late_search_path_change_does_not_make_commit_save_the_wrong_table() {
         );
         assert_eq!(session.failed(), 0, "{}", session.messages());
 
-        // `search_path` 指向 s 之后，非限定的 `t` 指的是 `s.t`：报的是**生效名**
+        // `search_path` 指向 s 之后,非限定的 `t` 指的是 `s.t`:报的是**生效名**
         session.run_script("INSERT INTO t VALUES (8);");
         assert!(session.messages().contains("插入 1 行到 s.t"), "{}", session.messages());
         assert_eq!(session.failed(), 0, "{}", session.messages());
@@ -364,12 +367,12 @@ fn a_corrupt_catalog_does_not_open_the_door_for_dropping_someone_elses_database(
 
     let mut session = open_session(&service, "alices", &alice);
 
-    // 正常情况：不是 owner 就不给删
+    // 正常情况:不是 owner 就不给删
     session.run_script("DROP DATABASE bobs;");
     assert!(session.messages().contains("不能删"), "{}", session.messages());
     assert!(service.exists("bobs"));
 
-    // `catalog.json` 被改坏：**读不出来就报错**，不能当成"没有 owner 限制"放行
+    // `catalog.json` 被改坏:**读不出来就报错**,不能当成"没有 owner 限制"放行
     std::fs::write(dir.path().join("bobs/catalog.json"), "{ 这不是 JSON }\n").unwrap();
     session.run_script("DROP DATABASE bobs;");
 
@@ -390,7 +393,7 @@ fn a_file_stem_that_does_not_match_the_schema_name_is_refused() {
         session.run_script("CREATE TABLE a (x INT); INSERT INTO a VALUES (1);");
     }
 
-    // 手工把 a 的两个文件复制成 b：b.csv 的模式里写的还是表名 a
+    // 手工把 a 的两个文件复制成 b:b.csv 的模式里写的还是表名 a
     let lib = dir.path().join("d");
     std::fs::copy(lib.join("a.csv"), lib.join("b.csv")).unwrap();
     std::fs::copy(lib.join("a.schema.json"), lib.join("b.schema.json")).unwrap();
@@ -416,14 +419,14 @@ fn create_and_drop_database_from_a_session_touch_the_service_directory() {
 
     session.run_script("CREATE DATABASE filmdb;");
     assert!(
-        session.messages().contains("库 filmdb 已建（owner bob）"),
+        session.messages().contains("库 filmdb 已建(owner bob)"),
         "{}",
         session.messages()
     );
     assert!(dir.path().join("filmdb/catalog.json").is_file());
     assert_eq!(service.catalog("filmdb").unwrap().owner, "bob");
 
-    // 重名要说出来，而且不改变任何东西
+    // 重名要说出来,而且不改变任何东西
     session.run_script("CREATE DATABASE filmdb;");
     assert!(session.messages().contains("already exists"), "{}", session.messages());
     assert_eq!(session.failed(), 1);
@@ -432,7 +435,7 @@ fn create_and_drop_database_from_a_session_touch_the_service_directory() {
     session.run_script("DROP DATABASE nope;");
     assert!(session.messages().contains("unknown database"), "{}", session.messages());
     session.run_script("DROP DATABASE IF EXISTS nope;");
-    assert!(session.messages().contains("不存在（IF EXISTS）"), "{}", session.messages());
+    assert!(session.messages().contains("不存在(IF EXISTS)"), "{}", session.messages());
 
     session.run_script("DROP DATABASE filmdb;");
     assert!(session.messages().contains("库 filmdb 已删"), "{}", session.messages());
@@ -449,12 +452,12 @@ fn dropping_the_database_in_use_or_one_someone_else_uses_is_refused() {
 
     let mut session = open_session(&service, "home", &bob);
 
-    // 正在用的那个：明确拒绝
+    // 正在用的那个:明确拒绝
     session.run_script("DROP DATABASE home;");
     assert!(session.messages().contains("正在使用的库"), "{}", session.messages());
     assert!(service.exists("home"));
 
-    // 别人正连着（同进程里另一把句柄，flock 一样互斥）
+    // 别人正连着(同进程里另一把句柄,flock 一样互斥)
     let held = service.open("victim", &bob).expect("另一个写者");
     session.run_script("DROP DATABASE victim;");
     assert!(session.messages().contains("正被另一个进程使用"), "{}", session.messages());
@@ -484,11 +487,443 @@ fn a_non_owner_cannot_drop_someone_elses_database() {
 
 #[test]
 fn a_memory_session_refuses_database_statements() {
-    // `ydbms` 那个实验终端：没有服务目录，两条语句都要**明确拒绝**，不是假装成功
+    // `ydbms` 那个实验终端:没有服务目录,两条语句都要**明确拒绝**,不是假装成功
     let mut session = Session::with_sinks(Sink::buffer(), Sink::buffer());
     session.run_script("CREATE DATABASE filmdb;");
 
     assert!(session.database().is_none());
     assert!(session.messages().contains("这个会话没有服务目录"), "{}", session.messages());
     assert_eq!(session.failed(), 1);
+}
+
+// ------------------------------------------------------------ 事务的落盘点(4.1)
+
+/// 一张只有一列 `x INT` 的表(造"下一次的内容"给崩溃现场用).
+fn table_of(name: &str, rows: &[i32]) -> PhysTab {
+    let shape = ColumnsShape::new(vec![Column::new("x", DataType::Int)]);
+    let mut table = PhysTab::new(name, &shape);
+    for row in rows {
+        table.insert(vec![Value::Int(*row)]).unwrap();
+    }
+    table
+}
+
+#[test]
+fn a_transaction_writes_nothing_before_commit() {
+    // 提交点是 `COMMIT`:`BEGIN; ...` 里的语句一句都不落盘
+    let dir = TempDir::new("tx-disk");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+
+        // 事务外:建表当场落盘("写完就落盘")
+        session.run_script("CREATE TABLE t (x INT);");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+        assert!(lib.join("t.csv").is_file());
+
+        // 事务里:插行**不**落盘,也不该留下提交意图
+        session.run_script("BEGIN; INSERT INTO t VALUES (1);");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+        let csv = std::fs::read_to_string(lib.join("t.csv")).unwrap();
+        assert!(!csv.lines().any(|line| line == "1"), "事务里不该落盘:{csv}");
+        assert!(!lib.join("commit.json").exists(), "事务里不该有提交意图");
+
+        // `COMMIT` 一次把改动写下去,提交意图用完就删
+        session.run_script("COMMIT;");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+        let csv = std::fs::read_to_string(lib.join("t.csv")).unwrap();
+        assert!(csv.lines().any(|line| line == "1"), "{csv}");
+        assert!(!lib.join("commit.json").exists(), "提交完要把意图删掉");
+    }
+
+    // 另一个会话把它读回来
+    let session = open_session(&service, "d", &bob);
+    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 1);
+}
+
+#[test]
+fn an_open_transaction_is_discarded_when_the_session_ends() {
+    // 等价于断开连接时的 `ROLLBACK`(与 PostgreSQL 一致):留在内存里的改动不落盘
+    let dir = TempDir::new("tx-open");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+        session.run_script("CREATE TABLE t (x INT);");
+        session.run_script("BEGIN; INSERT INTO t VALUES (1);");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+    } // 会话一放手,事务就丢了
+
+    let session = open_session(&service, "d", &bob);
+    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 0, "没提交的改动不落盘");
+}
+
+#[test]
+fn rollback_after_a_transaction_reports_the_table_before_the_transaction() {
+    // 磁盘模式下的整表回滚:撤销之后写回去的是事务前那一份
+    let dir = TempDir::new("tx-rollback");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+        session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (1);");
+        session.run_script("BEGIN; INSERT INTO t VALUES (2); ROLLBACK;");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+    }
+
+    let session = open_session(&service, "d", &bob);
+    let table = session.symbols().relation("t").unwrap();
+    assert_eq!(table.nrows(), 1);
+    assert_eq!(table.row(0).unwrap()[0], Value::Int(1));
+}
+
+// ------------------------------------------------- 提交的原子性与崩溃恢复(4.2)
+
+/// 造一次"提交崩在中途"的现场:`t` 的正式文件还是旧的那一份,`t` 的下一次内容
+/// 摆在暂存文件里.
+///
+/// `through` 决定停在哪一步:`"stage"` = 只暂存(还没写提交意图),
+/// `"intent"` = 提交意图也写了,`"promote-t"` = 连 `t` 都推广了(崩在推广中途).
+fn crash_scene(dir: &Path, through: &str) {
+    let persister = CsvPersister::new();
+    let pending_t = table_of("t", &[2]);
+    let pending_u = table_of("u", &[7]);
+
+    persister
+        .stage(&pending_t, &TablePath::new(dir, "t"))
+        .expect("暂存 t");
+    persister
+        .stage(&pending_u, &TablePath::new(dir, "u"))
+        .expect("暂存 u");
+    if through == "stage" {
+        return;
+    }
+
+    CommitIntent {
+        version: 1,
+        written: vec!["t".to_string(), "u".to_string()],
+        removed: Vec::new(),
+    }
+    .save(dir)
+    .expect("写提交意图");
+
+    if through == "promote-t" {
+        // 只推广了 `t`(`save` = 暂存 + 推广,结果一样:`t` 的 `.new` 没了)
+        persister
+            .save(&pending_t, &TablePath::new(dir, "t"))
+            .expect("推广 t");
+    }
+}
+
+/// 一个已经提交过的两行库:`t` 有 1,`u` 有 7.
+fn crash_fixture(tag: &str) -> (TempDir, ServiceDir, User) {
+    let dir = TempDir::new(tag);
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+
+    let mut session = open_session(&service, "d", &bob);
+    session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (1);");
+    session.run_script("CREATE TABLE u (x INT); INSERT INTO u VALUES (7);");
+    assert_eq!(session.failed(), 0, "{}", session.messages());
+    drop(session);
+
+    (dir, service, bob)
+}
+
+#[test]
+fn a_crash_before_the_commit_intent_is_all_before_the_commit() {
+    let (dir, service, bob) = crash_fixture("crash-stage");
+    let lib = dir.path().join("d");
+
+    // 上一次提交只走到"暂存"就崩了:正式文件还是旧的,也没有提交意图
+    crash_scene(&lib, "stage");
+    assert!(lib.join("t.csv.new").is_file(), "现场:暂存文件在");
+    assert!(!lib.join("commit.json").exists());
+
+    // 打开库:暂存残渣被清掉,两行表都还是提交前那一份
+    let session = open_session(&service, "d", &bob);
+    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 1);
+    assert!(!lib.join("t.csv.new").exists(), "残渣要清掉");
+    assert!(!lib.join("t.schema.json.new").exists());
+}
+
+#[test]
+fn a_crash_after_the_commit_intent_replays_to_all_after_the_commit() {
+    let (dir, service, bob) = crash_fixture("crash-intent");
+    let lib = dir.path().join("d");
+
+    // 提交意图已经落盘,但一张表都还没推广:**这份提交必须完成**
+    crash_scene(&lib, "intent");
+    assert!(lib.join("commit.json").is_file());
+
+    let session = open_session(&service, "d", &bob);
+
+    // `t` 补成了下一次的内容(2),`u` 没被这次提交碰过,照旧
+    let t = session.symbols().relation("t").unwrap();
+    assert_eq!(t.nrows(), 1);
+    assert_eq!(t.row(0).unwrap()[0], Value::Int(2), "崩在提交之后 = 新数据");
+    assert_eq!(session.symbols().relation("u").unwrap().row(0).unwrap()[0], Value::Int(7));
+
+    // 补完了就把意图删掉,不会无限重放
+    assert!(!lib.join("commit.json").exists(), "补完要删掉提交意图");
+    assert!(!lib.join("t.csv.new").exists(), "暂存文件已经搬进正式位置");
+}
+
+#[test]
+fn a_crash_in_the_middle_of_promoting_still_ends_after_the_commit() {
+    let (dir, service, bob) = crash_fixture("crash-promote");
+    let lib = dir.path().join("d");
+
+    // 推广到一半:`t` 已经是新的,`u` 还没搬
+    crash_scene(&lib, "promote-t");
+    assert!(!lib.join("t.csv.new").exists(), "t 已经搬过了");
+    assert!(lib.join("u.csv.new").is_file(), "u 还没搬");
+
+    let session = open_session(&service, "d", &bob);
+
+    // 两张表都停在"提交之后":t 是新的,u 的暂存文件也补上了(内容是 7,与旧的一致)
+    assert_eq!(session.symbols().relation("t").unwrap().row(0).unwrap()[0], Value::Int(2));
+    assert_eq!(session.symbols().relation("u").unwrap().nrows(), 1);
+    assert!(!lib.join("u.csv.new").exists(), "重放要把剩下的搬完");
+    assert!(!lib.join("commit.json").exists());
+}
+
+#[test]
+fn a_broken_commit_intent_refuses_to_open_the_database() {
+    // 提交意图坏了:宁可开不了库,也不要静默地当成"没发生过上一次提交"
+    let (dir, service, bob) = crash_fixture("crash-broken");
+    let lib = dir.path().join("d");
+
+    std::fs::write(lib.join("commit.json"), "{ 这不是 JSON").unwrap();
+    let err = service.open("d", &bob).expect_err("损坏的提交意图要挡住打开");
+    assert!(format!("{err}").contains("commit.json"), "{err}");
+
+    // 版本不认识也一样
+    std::fs::write(
+        lib.join("commit.json"),
+        r#"{"version": 99, "written": [], "removed": []}"#,
+    )
+    .unwrap();
+    let err = service.open("d", &bob).expect_err("不认识的版本要挡住打开");
+    assert!(format!("{err}").contains("99"), "{err}");
+
+    // 修好之后照常打开
+    std::fs::remove_file(lib.join("commit.json")).unwrap();
+    let session = open_session(&service, "d", &bob);
+    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 1);
+}
+
+// ------------------------------------------------- 库级 search_path(5.4)
+
+#[test]
+fn a_database_level_search_path_applies_to_later_connections_only() {
+    let dir = TempDir::new("db-settings");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+        session.run_script("CREATE SCHEMA study; CREATE TABLE study.movies (id INT);");
+        session.run_script("INSERT INTO study.movies VALUES (1);");
+        session.run_script("ALTER DATABASE d SET search_path TO study;");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+        assert!(session.messages().contains("只影响以后的连接"), "{}", session.messages());
+
+        // 改的是"以后的连接":**这个会话**的 search_path 一个字都没变
+        session.run_script("SELECT * FROM movies;");
+        assert_eq!(session.failed(), 1, "本会话不该因此解析得到 movies:{}", session.messages());
+    }
+
+    // 新连接:非限定名按库级默认值解析到 `study.movies`
+    let mut session = open_session(&service, "d", &bob);
+    session.run_script("SELECT id FROM movies;");
+    assert_eq!(session.failed(), 0, "{}", session.messages());
+    assert!(session.query_output().contains('1'), "{}", session.query_output());
+
+    // 落盘的是 `catalog.json` 里的 `settings`
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("d/catalog.json")).unwrap())
+            .unwrap();
+    assert_eq!(json["settings"]["search_path"][0].as_str(), Some("study"));
+}
+
+#[test]
+fn resetting_the_database_level_search_path_clears_it() {
+    let dir = TempDir::new("db-settings-reset");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+        session.run_script("CREATE SCHEMA study; ALTER DATABASE d SET search_path TO study;");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+        session.run_script("ALTER DATABASE d SET search_path TO DEFAULT;");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+    }
+
+    let mut session = open_session(&service, "d", &bob);
+    session.run_script("SELECT * FROM movies;");
+    assert_eq!(session.failed(), 1, "清掉之后非限定名又解析不到了");
+}
+
+#[test]
+fn a_non_owner_cannot_change_someone_elses_database_settings() {
+    let dir = TempDir::new("db-settings-owner");
+    let service = dir.service();
+    service.create_database("bobs", "bob").unwrap();
+    service.create_database("alices", "alice").unwrap();
+
+    let alice = user("alice", false);
+    let mut session = open_session(&service, "alices", &alice);
+    session.run_script("ALTER DATABASE bobs SET search_path TO study;");
+    assert!(session.messages().contains("不能改"), "{}", session.messages());
+    assert!(service.catalog("bobs").unwrap().settings.search_path.is_empty());
+    drop(session); // 放开单写者锁,才轮得到下一个会话
+
+    // 管理员可以
+    let admin = user("root", true);
+    let mut session = open_session(&service, "alices", &admin);
+    session.run_script("ALTER DATABASE bobs SET search_path TO study;");
+    assert_eq!(session.failed(), 0, "{}", session.messages());
+    assert_eq!(service.catalog("bobs").unwrap().settings.search_path, ["study"]);
+}
+
+#[test]
+fn an_old_catalog_without_settings_still_opens() {
+    // `settings` 是后加的字段:野外的老 `catalog.json` 必须照旧读得回来
+    let dir = TempDir::new("old-catalog");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+
+    std::fs::write(
+        dir.path().join("d/catalog.json"),
+        "{\"version\": 1, \"name\": \"d\", \"owner\": \"bob\", \"created_unix\": 1}\n",
+    )
+    .unwrap();
+
+    let session = open_session(&service, "d", &bob);
+    assert!(session.symbols().search_path().is_empty());
+}
+
+#[test]
+fn a_database_level_setting_cannot_be_sneaked_in_inside_a_transaction() {
+    // 它写的是 `catalog.json`(服务目录),而事务撤销不了目录--所以事务里**明确
+    // 拒绝**,而不是让它静默生效(那正是"回滚不生效"最坏的一种)
+    let dir = TempDir::new("db-settings-tx");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+
+    let mut session = open_session(&service, "d", &bob);
+    session.run_script("BEGIN; ALTER DATABASE d SET search_path TO study; ROLLBACK;");
+
+    assert!(session.messages().contains("不能在事务里跑"), "{}", session.messages());
+    assert!(service.catalog("d").unwrap().settings.search_path.is_empty(), "一个字都不该写进去");
+}
+
+/// 把库目录设成只读.返回 `false` 表示这个环境拦不住写(比如以 root 跑测试),
+/// 相关测试应当直接跳过--它们靠"目录不可写"来证明"那条路根本不碰磁盘".
+#[cfg(unix)]
+fn make_read_only(lib: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::fs::write(lib.join(".probe"), b"x").is_ok() {
+        let _ = std::fs::remove_file(lib.join(".probe"));
+        return false;
+    }
+
+    let mut perms = std::fs::metadata(lib).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(lib, perms).unwrap();
+    true
+}
+
+#[cfg(unix)]
+fn make_writable(lib: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(lib).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(lib, perms).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn a_read_only_statement_does_not_touch_the_database_directory() {
+    // 只读语句一个字节的 IO 都不做:否则库目录只读时,一次纯 `SELECT` 会变成
+    // "查询成功,却报提交失败"
+    let dir = TempDir::new("read-only-select");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+        session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (1);");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+
+        if !make_read_only(&lib) {
+            return; // 权限拦不住,这条测试证明不了什么
+        }
+
+        session.run_script("SELECT x FROM t;");
+        assert_eq!(session.failed(), 0, "只读查询不该报错:{}", session.messages());
+        assert!(!session.messages().contains("提交失败"), "{}", session.messages());
+
+        make_writable(&lib);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_warned_rollback_keeps_a_pending_retry() {
+    // 提交失败时 `dirty` 被有意保留(下次再试).此时敲一条**没有事务**的
+    // `ROLLBACK`(按 PostgreSQL 只发一句警告,什么都没撤销),那批改动必须还留着
+    // --丢掉它就等于"报了错,还悄悄不再落盘".
+    let dir = TempDir::new("retry-after-warning");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+        session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (1);");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+
+        if !make_read_only(&lib) {
+            return; // 拦不住写,这条测试证明不了什么
+        }
+
+        // 这一条写进内存了,但落盘失败 ⇒ `dirty` 留着等下次重试
+        session.run_script("INSERT INTO t VALUES (2);");
+        assert!(session.messages().contains("提交失败"), "{}", session.messages());
+
+        // 只发警告的 `ROLLBACK`:什么都撤销不了,也不该把重试集抹掉
+        session.run_script("ROLLBACK;");
+        assert!(session.messages().contains("警告"), "{}", session.messages());
+
+        make_writable(&lib);
+
+        // 下一条语句的自提交把欠着的那张表补写回去
+        session.run_script("SELECT x FROM t;");
+        assert_eq!(session.failed(), 1, "只有那次失败:{}", session.messages());
+    }
+
+    // 另一个会话读回来:两行都在(欠的那一次提交补上了)
+    let session = open_session(&service, "d", &bob);
+    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 2, "重试集不该被警告抹掉");
 }

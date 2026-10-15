@@ -1,7 +1,7 @@
-//! 用户表与口令认证的 testbench（阶段 6.1）。
+//! 用户表与口令认证的 testbench(阶段 6.1).
 //!
-//! 这里只碰 `src/usr/`：加盐哈希、`users.json` 的往返、bootstrap 的口径。
-//! "谁能连哪个库"在 `tests/usr_service.rs`，真进程的端到端在 `tests/ysql_cli.rs`。
+//! 这里只碰 `src/usr/`:加盐哈希,`users.json` 的往返,bootstrap 的口径.
+//! "谁能连哪个库"在 `tests/usr_service.rs`,真进程的端到端在 `tests/ysql_cli.rs`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +10,7 @@ use ydbms::usr::{hash, AuthError, UserStore};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// 自清理的临时目录。
+/// 自清理的临时目录.
 struct TempDir {
     path: PathBuf,
 }
@@ -25,7 +25,7 @@ impl TempDir {
         TempDir { path }
     }
 
-    /// `users.json` 的路径。
+    /// `users.json` 的路径.
     fn users(&self) -> PathBuf {
         self.path.join("users.json")
     }
@@ -48,7 +48,7 @@ fn a_salted_hash_round_trips_and_rejects_a_wrong_password() {
     assert!(!hash::verify(&salt, "s3cre", &stored), "少一个字符就不行");
     assert!(!hash::verify(&salt, "S3CRET", &stored), "大小写要区分");
 
-    // 同一个口令、两份不同的盐 → 哈希不同（这正是盐的用处）
+    // 同一个口令,两份不同的盐 → 哈希不同(这正是盐的用处)
     let other = hash::random_salt().expect("取盐");
     assert_ne!(other, salt, "两份盐不该撞上");
     assert_ne!(hash::hash_password(&other, "s3cret"), stored);
@@ -61,7 +61,7 @@ fn hex_round_trips_and_rejects_junk() {
     assert_eq!(text.len(), 512);
     assert_eq!(hash::from_hex(&text).as_deref(), Some(&bytes[..]));
 
-    // 大写也认，空白忽略
+    // 大写也认,空白忽略
     assert_eq!(hash::from_hex(" ABCD \n").as_deref(), Some(&[0xab, 0xcd][..]));
 
     assert_eq!(hash::from_hex("abc"), None, "奇数长度不是十六进制");
@@ -70,8 +70,8 @@ fn hex_round_trips_and_rejects_junk() {
 
 #[test]
 fn the_hash_is_sha256_of_salt_then_password() {
-    // 空盐 + "abc" 就是 FIPS 180-4 里 SHA-256("abc") 的公开测试向量。
-    // 用它钉住"算的到底是哪个算法、盐在前还是口令在前"。
+    // 空盐 + "abc" 就是 FIPS 180-4 里 SHA-256("abc") 的公开测试向量.
+    // 用它钉住"算的到底是哪个算法,盐在前还是口令在前".
     assert_eq!(
         hash::hash_password(&[], "abc"),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -94,7 +94,7 @@ fn users_json_holds_no_plaintext_and_round_trips() {
     store.save(&path).expect("写 users.json");
 
     let raw = std::fs::read_to_string(&path).expect("读回");
-    assert!(!raw.contains("hunter2"), "口令不能明文落盘：{raw}");
+    assert!(!raw.contains("hunter2"), "口令不能明文落盘:{raw}");
 
     let back = UserStore::load(&path).expect("读回用户表");
     assert_eq!(back.users.len(), 1);
@@ -119,7 +119,7 @@ fn a_missing_users_json_is_not_the_same_as_an_empty_one() {
     assert!(!UserStore::exists(&path));
     assert!(
         UserStore::load(&path).is_err(),
-        "不存在的用户表要报错——bootstrap 靠 exists 判断，不能靠 load 空手回来"
+        "不存在的用户表要报错--bootstrap 靠 exists 判断,不能靠 load 空手回来"
     );
 
     // 空的用户表存下去之后就是"存在且为空"
@@ -156,7 +156,7 @@ fn a_second_user_can_be_added_but_not_a_duplicate_or_an_empty_password() {
     let mut store = UserStore::empty();
     store.add("bob", "hunter2", true).expect("第一个用户");
 
-    // 第二个用户：不是管理员也能加（本版没有 CREATE USER，靠库 API / 手工编辑）
+    // 第二个用户:不是管理员也能加(本版没有 CREATE USER,靠库 API / 手工编辑)
     let alice = store.add("alice", "correct horse", false).expect("第二个用户");
     assert!(!alice.is_admin);
     assert!(store.authenticate("alice", "correct horse").is_ok());

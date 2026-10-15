@@ -1,8 +1,8 @@
-//! NULL、三值逻辑、左外连接、`NOT NULL` 强制、以及 CSV 里的 NULL 记法。
+//! NULL,三值逻辑,左外连接,`NOT NULL` 强制,以及 CSV 里的 NULL 记法.
 //!
-//! 最要紧的一条是 [`csv_round_trip_distinguishes_null_empty_and_backslash_n`]：
-//! CSV 里 NULL 用 `\N`、以反斜杠开头的文本要转义，于是「NULL」「空字符串」
-//! 「字面文本 `\N`」三者**互不混淆**。这是可往返性的核心断言。
+//! 最要紧的一条是 [`csv_round_trip_distinguishes_null_empty_and_backslash_n`]:
+//! CSV 里 NULL 用 `\N`,以反斜杠开头的文本要转义,于是"NULL""空字符串"
+//! "字面文本 `\N`"三者**互不混淆**.这是可往返性的核心断言.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +15,7 @@ use ydbms::pers::{CsvPersister, Persister, TablePath};
 fn ok(db: &mut SymbolTable, sql: &str) {
     let results = run_script(sql, db).expect("应当能解析");
     for r in &results {
-        assert!(r.outcome.is_ok(), "第 {} 条失败了：{:?}", r.index, r.outcome);
+        assert!(r.outcome.is_ok(), "第 {} 条失败了:{:?}", r.index, r.outcome);
     }
 }
 
@@ -30,7 +30,7 @@ fn q(db: &mut SymbolTable, sql: &str) -> PhysTab {
     assert_eq!(results.len(), 1, "期望恰好一条语句");
     match results.remove(0).outcome.expect("应当成功") {
         Outcome::Rows(table) => table,
-        other => panic!("期望 Rows，得到 {other:?}"),
+        other => panic!("期望 Rows,得到 {other:?}"),
     }
 }
 
@@ -40,7 +40,7 @@ fn failure(db: &mut SymbolTable, sql: &str) -> DbError {
     results.remove(0).outcome.expect_err("本应失败")
 }
 
-/// 取第 `c` 列的文本形式（NULL 会显示成 `NULL`）。
+/// 取第 `c` 列的文本形式(NULL 会显示成 `NULL`).
 fn col(table: &PhysTab, c: usize) -> Vec<String> {
     (0..table.nrows())
         .map(|r| table.value(r, c).expect("格子").to_string())
@@ -51,8 +51,8 @@ fn col(table: &PhysTab, c: usize) -> Vec<String> {
 
 #[test]
 fn a_truth_still_cannot_be_projected() {
-    // `IS NULL` 算出来的是真值，而真值**不能作结果列**——这条边界没有因为
-    // 引入 NULL 而松动。
+    // `IS NULL` 算出来的是真值,而真值**不能作结果列**--这条边界没有因为
+    // 引入 NULL 而松动.
     let mut db = SymbolTable::new();
     let err = failure(&mut db, "SELECT NULL IS NULL AS a");
     assert!(matches!(err, DbError::IrInvalid { .. }), "got {err:?}");
@@ -60,7 +60,7 @@ fn a_truth_still_cannot_be_projected() {
 
 #[test]
 fn comparison_with_null_is_unknown_not_false() {
-    // `= NULL` 在 SQL 里是 UNKNOWN，WHERE 把它丢掉 → 0 行（而不是报错，也不是全行）
+    // `= NULL` 在 SQL 里是 UNKNOWN,WHERE 把它丢掉 → 0 行(而不是报错,也不是全行)
     let mut db = db("CREATE TABLE t (a INT); INSERT INTO t VALUES (1), (2)");
     let out = q(&mut db, "SELECT a FROM t WHERE a = NULL");
     assert_eq!(out.nrows(), 0);
@@ -95,7 +95,7 @@ fn null_propagates_through_arithmetic() {
 
 // ------------------------------------------------------------ LEFT JOIN
 
-/// 两张小表：`dept` 有 3 个部门，`emp` 只覆盖其中 2 个。
+/// 两张小表:`dept` 有 3 个部门,`emp` 只覆盖其中 2 个.
 const JOIN_FIXTURE: &str = "
     CREATE TABLE dept (id INT, name TEXT);
     INSERT INTO dept VALUES (1, 'A'), (2, 'B'), (3, 'C');
@@ -107,7 +107,7 @@ const JOIN_FIXTURE: &str = "
 fn inner_join_drops_unmatched_left_rows() {
     let mut db = db(JOIN_FIXTURE);
     let out = q(&mut db, "SELECT d.name, e.id FROM dept AS d JOIN emp AS e ON e.dept_id = d.id");
-    assert_eq!(out.nrows(), 3, "部门 C 没有员工，内连接里不出现");
+    assert_eq!(out.nrows(), 3, "部门 C 没有员工,内连接里不出现");
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn left_join_keeps_unmatched_left_rows_with_nulls() {
         "SELECT d.name, e.id FROM dept AS d LEFT JOIN emp AS e ON e.dept_id = d.id ORDER BY d.id, e.id",
     );
 
-    assert_eq!(out.nrows(), 4, "3 个部门：A 两人、B 一人、C 补一行 NULL");
+    assert_eq!(out.nrows(), 4, "3 个部门:A 两人,B 一人,C 补一行 NULL");
     assert_eq!(col(&out, 0), vec!["A", "A", "B", "C"]);
     assert_eq!(col(&out, 1), vec!["10", "11", "12", "NULL"]);
 }
@@ -144,15 +144,15 @@ fn left_join_with_a_condition_that_matches_nothing_still_keeps_left_rows() {
         &mut db,
         "SELECT d.id, e.id FROM dept AS d LEFT JOIN emp AS e ON e.dept_id = d.id AND e.id > 100",
     );
-    assert_eq!(out.nrows(), 3, "一个都没匹配，但左行全在");
+    assert_eq!(out.nrows(), 3, "一个都没匹配,但左行全在");
     assert_eq!(col(&out, 1), vec!["NULL", "NULL", "NULL"]);
 }
 
 #[test]
 fn a_left_join_makes_the_right_side_nullable() {
-    // 右支的列声明了 NOT NULL，但左外连接没匹配上的行上它们**就是 NULL**。
-    // NOT NULL 不能从右支带进外连接的输出 schema——否则真正产生外连接 NULL 时
-    // 会报"列声明了 NOT NULL"，把合法结果判成错。这是引入外连接时踩到的坑。
+    // 右支的列声明了 NOT NULL,但左外连接没匹配上的行上它们**就是 NULL**.
+    // NOT NULL 不能从右支带进外连接的输出 schema--否则真正产生外连接 NULL 时
+    // 会报"列声明了 NOT NULL",把合法结果判成错.这是引入外连接时踩到的坑.
     let mut db = db(
         "CREATE TABLE d (id INT NOT NULL);
          INSERT INTO d VALUES (1), (2);
@@ -171,7 +171,7 @@ fn a_left_join_makes_the_right_side_nullable() {
 
 #[test]
 fn an_inner_join_keeps_the_not_null_flag() {
-    // 内连接里右支的每个值都来自真实行，所以 NOT NULL 要保留
+    // 内连接里右支的每个值都来自真实行,所以 NOT NULL 要保留
     let mut db = db(
         "CREATE TABLE d (id INT NOT NULL);
          INSERT INTO d VALUES (1);
@@ -202,7 +202,7 @@ fn order_by_asc_puts_nulls_last_by_default() {
 
 #[test]
 fn order_by_desc_puts_nulls_first_by_default() {
-    // PostgreSQL 的默认：DESC → NULLS FIRST。**NULL 的位置不跟着 desc 翻转。**
+    // PostgreSQL 的默认:DESC → NULLS FIRST.**NULL 的位置不跟着 desc 翻转.**
     let mut db = db("CREATE TABLE t (a INT); INSERT INTO t VALUES (2), (NULL), (1)");
     let out = q(&mut db, "SELECT a FROM t ORDER BY a DESC");
 
@@ -233,7 +233,7 @@ fn not_null_is_now_really_enforced() {
         Ok(Outcome::Created { unenforced, .. }) => {
             assert!(
                 !unenforced.iter().any(|s| s.contains("NOT NULL")),
-                "NOT NULL 现在真的强制了：{unenforced:?}"
+                "NOT NULL 现在真的强制了:{unenforced:?}"
             );
             assert!(unenforced.iter().any(|s| s.contains("PRIMARY KEY")), "{unenforced:?}");
         }
@@ -346,7 +346,7 @@ fn csv_schema_records_the_default_and_old_files_still_load() {
     let dir = TempDir::new("default");
     let at = TablePath::new(dir.path(), "t");
 
-    // `DEFAULT` 是**列定义的一部分**，跟着模式文件走；存的是 CSV 字段形式
+    // `DEFAULT` 是**列定义的一部分**,跟着模式文件走;存的是 CSV 字段形式
     let shape = ColumnsShape::new(vec![
         Column::new("a", DataType::Int).with_default("7"),
         Column::new("b", DataType::Text).with_default("\\N"),
@@ -358,7 +358,7 @@ fn csv_schema_records_the_default_and_old_files_still_load() {
     assert_eq!(loaded.columns()[0].default_text(), Some("7"));
     assert_eq!(loaded.columns()[1].default_text(), Some("\\N"), "NULL 记作 \\N");
 
-    // 老文件（没有 default 键）照常读
+    // 老文件(没有 default 键)照常读
     let old = TablePath::new(dir.path(), "old");
     std::fs::write(
         old.schema_path(),
@@ -381,9 +381,9 @@ fn csv_schema_records_not_null_and_old_files_still_load() {
     CsvPersister::new().save(&saved, &at).unwrap();
 
     let raw = std::fs::read_to_string(at.schema_path()).unwrap();
-    assert!(raw.contains("not_null"), "schema 里应当记下 NOT NULL：{raw}");
+    assert!(raw.contains("not_null"), "schema 里应当记下 NOT NULL:{raw}");
 
-    // 老文件（没有 not_null 键）照常读
+    // 老文件(没有 not_null 键)照常读
     let old = TablePath::new(dir.path(), "old");
     std::fs::write(
         old.schema_path(),
