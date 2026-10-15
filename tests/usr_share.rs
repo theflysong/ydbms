@@ -577,3 +577,128 @@ fn a_memory_session_refuses_grant_statements_but_still_runs_sql() {
     assert_eq!(session.failed(), 3, "{}", session.messages());
     assert!(session.query_output().contains('1'), "{}", session.query_output());
 }
+
+// ------------------------------------------------------------ 元命令(6.4)
+
+#[test]
+fn backslash_l_lists_databases_and_owners() {
+    let s = scene("meta-l");
+    s.service.create_database("other", "bob").expect("建库");
+
+    let mut bob = open(&s.service, "filmdb", &s.bob);
+    bob.run_interactive("\\l");
+    let text = bob.messages();
+    assert!(text.contains("filmdb") && text.contains("other"), "{text}");
+    assert!(text.contains("owner") && text.contains("bob"), "{text}");
+    // 当前那个库带一个 `*`
+    assert!(text.contains("*owner"), "当前库该有标记:{text}");
+}
+
+#[test]
+fn backslash_du_lists_roles_and_their_attributes() {
+    let s = scene("meta-du");
+    let mut bob = open(&s.service, "filmdb", &s.bob);
+    bob.run_script("CREATE ROLE reader; GRANT reader TO alice;");
+    assert_eq!(bob.failed(), 0, "{}", bob.messages());
+
+    bob.run_interactive("\\du");
+    let text = bob.messages();
+    assert!(text.contains("超级用户"), "bob 是超级用户:{text}");
+    assert!(text.contains("alice") && text.contains("reader"), "{text}");
+    assert!(text.contains("不可登录"), "reader 是 NOLOGIN:{text}");
+}
+
+#[test]
+fn backslash_c_switches_database_and_releases_the_old_lock() {
+    let s = scene("meta-c");
+    s.service.create_database("other", "owner").expect("建库");
+
+    let mut owner = open(&s.service, "filmdb", &s.owner);
+    assert_eq!(owner.prompt(), "filmdb => ");
+
+    owner.run_interactive("\\c other");
+    assert!(owner.messages().contains("已连到库"), "{}", owner.messages());
+    assert_eq!(owner.database(), Some("other"));
+    assert_eq!(owner.prompt(), "other => ", "提示符跟着库走");
+    assert!(owner.symbols().names().is_empty(), "换的是新库的表");
+
+    // 旧库的单写者锁当场释放:另一个句柄立刻连得上
+    let back = s.service.open("filmdb", &s.bob).expect("旧库的锁该放了");
+    assert_eq!(back.owner(), "owner");
+}
+
+#[test]
+fn backslash_c_refuses_inside_a_transaction_and_keeps_the_current_database() {
+    let s = scene("meta-c-tx");
+    s.service.create_database("other", "owner").expect("建库");
+
+    let mut owner = open(&s.service, "filmdb", &s.owner);
+    owner.run_script("BEGIN;");
+    owner.run_interactive("\\c other");
+    assert!(
+        owner.messages().contains("会丢掉当前事务"),
+        "{}",
+        owner.messages()
+    );
+    assert_eq!(owner.database(), Some("filmdb"), "拒绝之后留在原地");
+    owner.run_script("ROLLBACK;");
+    assert_eq!(owner.failed(), 1, "{}", owner.messages());
+
+    // 事务关了就能切
+    owner.run_interactive("\\c other");
+    assert_eq!(owner.database(), Some("other"));
+}
+
+#[test]
+fn backslash_c_to_an_unreachable_database_keeps_the_current_one() {
+    let s = scene("meta-c-bad");
+    s.service.create_database("other", "owner").expect("建库");
+
+    let mut owner = open(&s.service, "filmdb", &s.owner);
+    owner.run_interactive("\\c nope");
+    assert!(owner.messages().contains("unknown database"), "{}", owner.messages());
+    assert_eq!(owner.database(), Some("filmdb"));
+
+    // 没有 `CONNECT` 的库也切不过去
+    s.service.create_database("alices", "alice").expect("建库");
+    owner.run_interactive("\\c alices");
+    assert!(owner.messages().contains("owner"), "{}", owner.messages());
+    assert_eq!(owner.database(), Some("filmdb"));
+
+    // 用法错误
+    owner.run_interactive("\\c");
+    assert!(owner.messages().contains("用法"), "{}", owner.messages());
+    assert_eq!(owner.database(), Some("filmdb"));
+
+    // 已经连着的库只发一句提示,不算错
+    let before = owner.failed();
+    owner.run_interactive("\\c filmdb");
+    assert_eq!(owner.failed(), before, "{}", owner.messages());
+    assert!(owner.messages().contains("已经连着"), "{}", owner.messages());
+}
+
+#[test]
+fn the_prompt_follows_the_current_role_too() {
+    let s = scene("prompt-role");
+    let mut bob = open(&s.service, "filmdb", &s.bob);
+    assert_eq!(bob.prompt(), "filmdb => ");
+
+    bob.run_script("CREATE ROLE r; SET ROLE r;");
+    assert_eq!(bob.failed(), 0, "{}", bob.messages());
+    assert_eq!(bob.prompt(), "filmdb[r] => ");
+
+    bob.run_script("RESET ROLE;");
+    assert_eq!(bob.prompt(), "filmdb => ");
+}
+
+#[test]
+fn the_service_metacommands_need_the_service_directory() {
+    let mut session = Session::with_sinks(Sink::buffer(), Sink::buffer());
+    session.run_interactive("\\l");
+    session.run_interactive("\\du");
+    session.run_interactive("\\c somewhere");
+
+    assert!(session.messages().contains("没有服务目录"), "{}", session.messages());
+    assert_eq!(session.failed(), 3, "{}", session.messages());
+    assert_eq!(session.prompt(), "sql> ");
+}

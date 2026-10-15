@@ -41,14 +41,17 @@ const SWITCHES: &[&str] = &["on", "off"];
 /// 本版认的 `\set` 变量(与 [`crate::cmd::engine`] 的判断一致).
 const VARIABLES: &[&str] = &["ON_ERROR_STOP"];
 
-/// 补全的候选来源:现在有哪些表,哪些列.
+/// 补全的候选来源:现在有哪些表,哪些列,服务目录里有哪些库.
 ///
-/// 由 [`Catalog::from_symbols`] 从符号表现算--上一条语句刚建出来的表,下一条就该能补出来.
+/// 由 [`Catalog::from_symbols`] 从符号表现算--上一条语句刚建出来的表,下一条就该能补出来;
+/// `databases` 由会话那一层填(内存模式留空),只有 `\c` 用得上.
 pub struct Catalog {
     /// 表名(含别名与 `study.movies` 这类限定名,照符号表里的原样).
     pub tables: Vec<String>,
     /// 所有列名(跨表去重).
     pub columns: Vec<String>,
+    /// 服务目录里的库名(内存模式为空).
+    pub databases: Vec<String>,
     /// 每张表自己的列,给 `别名.` 这种限定补全用.
     per_table: Vec<(String, Vec<String>)>,
 }
@@ -79,6 +82,7 @@ impl Catalog {
         Catalog {
             tables,
             columns,
+            databases: Vec::new(),
             per_table,
         }
     }
@@ -186,6 +190,7 @@ fn metacommand(head: &str, cursor: usize, catalog: &Catalog) -> Option<Suggestio
     let items = match name {
         "\\i" | "\\o" | "\\ls" | "\\cd" => paths(word),
         "\\d" => matched(&catalog.tables, word, str::to_string),
+        "\\c" | "\\connect" => matched(&catalog.databases, word, str::to_string),
         "\\timing" => matched(SWITCHES, word, str::to_string),
         // `\set`:先补变量名,变量名写完再补取值
         "\\set" => {

@@ -142,7 +142,7 @@ fn metacommand_names_complete() {
     assert_eq!(inserts("\\ti", &c), vec!["\\timing"]);
 
     let all = inserts("\\", &c);
-    for want in ["\\i", "\\set", "\\dt", "\\timing"] {
+    for want in ["\\i", "\\set", "\\dt", "\\timing", "\\l", "\\du", "\\c", "\\connect"] {
         assert!(all.contains(&want.to_string()), "{want} 不在 {all:?}");
     }
 }
@@ -154,9 +154,21 @@ fn metacommand_arguments_complete() {
     assert!(inserts("\\set ON_ERROR_STOP ", &c).contains(&"on".to_string()));
     assert!(inserts("\\timing ", &c).contains(&"off".to_string()));
     assert!(inserts("\\d ", &c).contains(&"t".to_string()));
+    assert!(inserts("\\c ", &c).is_empty(), "手搓的目录里没有库名可补");
 
     // 没有候选的命令就是没有
     assert!(inserts("\\echo ", &c).is_empty());
+}
+
+#[test]
+fn connect_completes_database_names() {
+    let mut c = catalog();
+    c.databases = vec!["filmdb".to_string(), "other".to_string()];
+
+    assert_eq!(inserts("\\c ", &c), vec!["filmdb", "other"]);
+    assert_eq!(inserts("\\c fi", &c), vec!["filmdb"]);
+    assert_eq!(inserts("\\connect ot", &c), vec!["other"]);
+    assert!(inserts("\\c nope", &c).is_empty());
 }
 
 #[test]

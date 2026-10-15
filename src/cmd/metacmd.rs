@@ -4,8 +4,8 @@
 //! 变量认不认识)都留给执行,因为执行那边才有输出去向可以报告错误.认不出来的
 //! 命令也照样返回 [`MetaCmd::Unknown`],让它走到执行层去打印"未知元命令".
 //!
-//! 与 psql 一致:元命令只在**行首**(trim 之后)才算,参数取到行尾,所以路径可以
-//! 带空格.
+//! 与 psql 一致:元命令只在**行首**(trim 之后)才算,参数取到行尾,所以路径
+//! (以及 `\c` 的库名)可以带空格.
 
 use std::path::PathBuf;
 
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// 忘了补另一处,用户就会看到自相矛盾的提示.
 pub const NAMES: &[&str] = &[
     "\\q", "\\quit", "\\!", "\\i", "\\pwd", "\\ls", "\\cd", "\\echo", "\\dt", "\\d", "\\o",
-    "\\timing", "\\set",
+    "\\timing", "\\set", "\\l", "\\du", "\\c", "\\connect",
 ];
 
 /// 一条元命令.
@@ -46,6 +46,14 @@ pub enum MetaCmd {
     /// 装的是**原样的取值**(可能是空串):语法层不解释它,`yes` 这种认不出来的
     /// 写法留给执行层去报错--别在这里悄悄当成开关的哪一边.
     Timing(String),
+    /// `\l` -- 列出服务目录里的库与 owner.
+    ListDatabases,
+    /// `\du` -- 列出角色(名字,属性,所属角色).
+    ListRoles,
+    /// `\c [库]` / `\connect [库]` -- 换一个库.**脚本里也能用**.
+    ///
+    /// 参数取到行尾(与 `\i` / `\o` 一样),所以库名里可以有空格.
+    Connect(Option<String>),
     /// `\set <变量> [值]` -- 这里只拆词;认不认识这个变量由执行层判断.
     Set {
         /// 变量名.
@@ -91,6 +99,13 @@ pub fn parse(line: &str) -> Option<MetaCmd> {
             Some(rest.to_string())
         }),
         "o" => MetaCmd::Output(path()),
+        "l" => MetaCmd::ListDatabases,
+        "du" => MetaCmd::ListRoles,
+        "c" | "connect" => MetaCmd::Connect(if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        }),
         "timing" => MetaCmd::Timing(rest.to_string()),
         "set" => {
             let (name, value) = match rest.find(char::is_whitespace) {

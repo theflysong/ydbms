@@ -64,6 +64,13 @@
 //!   **两张都空时一个字节的 IO 都不做**(只读语句占绝大多数);
 //! * 内存模式下一行 IO 都不做;**事务开着时直接返回**(提交点是 `COMMIT`).
 //!
+//! # 服务目录那三条元命令(6.4)
+//!
+//! `\l`(列库与 owner),`\du`(列角色),`\c <库>`(换库)都只在服务模式下有用,
+//! 内存模式明确拒绝.`\c` 的顺序是**有意**的:事务里拒绝 → 先补旧库欠着的提交 →
+//! 先开新库再换句柄(开不成留在原地)→ 换一张全新的符号表,当前角色回到会话用户.
+//! 提示符**每轮现取**([`Session::prompt`]),所以换库与 `SET ROLE` 下一条就看得见.
+//!
 //! # 当前角色与权限(6.4)
 //!
 //! 服务模式下引擎要把**当前角色**(`SymbolTable::role()`,刚连上时是认证过的
@@ -662,16 +669,7 @@ impl Session {
         messages: Sink,
     ) -> Result<Self> {
         let mut session = Session::with_sinks(query_out, messages);
-        let tables = db.load_tables()?;
-
-        // 整批原子:任何一张读不回来就整体失败,不留下装了一半的符号表
-        let mut known_on_disk = BTreeSet::new();
-        let mut batch = Vec::with_capacity(tables.len());
-        for table in tables {
-            known_on_disk.insert(table.name().to_string());
-            batch.push(Symbol::relation(table.name().to_string(), table));
-        }
-        session.symbols.extend(batch)?;
+        let known_on_disk = load_tables(&mut session.symbols, &db)?;
 
         // 库级的会话默认值(`ALTER DATABASE ... SET search_path ...`):打开库时套成
         // 会话的初始 `search_path`.**空**就什么都不做(与过去完全一样).
@@ -691,6 +689,155 @@ impl Session {
             known_on_disk,
         });
         Ok(session)
+    }
+
+
+    /// 这个会话的提示符.
+    ///
+    /// 服务模式是 `<库> => `(当前角色与会话用户不同时把角色带上,免得 `SET ROLE`
+    /// 之后忘了自己在谁的身份下);内存模式是 `sql> `.`\c` 换库之后下一条就变.
+    pub fn prompt(&self) -> String {
+        match &self.store {
+            Some(store) if store.user.name == self.symbols.role() => {
+                format!("{} => ", store.db.name())
+            }
+            Some(store) => format!("{}[{}] => ", store.db.name(), self.symbols.role()),
+            None => "sql> ".to_string(),
+        }
+    }
+
+    /// `\c <库>`:换一个库.
+    ///
+    /// 顺序是**有意**的,四步都不许换:
+    ///
+    /// 1. 事务开着就拒绝(与断开连接时的静默回滚不同,这里宁可先说清楚);
+    /// 2. 旧库欠着的提交先补上(补不上就不切,那批改动不能丢);
+    /// 3. **先开新库再换句柄**:开不成 / 载入失败就留在原地,旧库的锁不撒手;
+    /// 4. 换的是一张**全新的符号表**(新库的表),当前角色回到会话用户(换库 = 换连接).
+    fn switch_database(&mut self, name: Option<String>) -> Flow {
+        let Some(store) = self.store.as_ref() else {
+            return self.error(&tr!("cmd.engine.060").into_owned());
+        };
+        let Some(name) = name else {
+            return self.error(&tr!("cmd.engine.059").into_owned());
+        };
+
+        if name == store.db.name() {
+            let current = store.db.name().to_string();
+            self.msg(&format!("{}", tr!("cmd.engine.061", arg0 =  current)));
+            return Flow::Continue;
+        }
+        if self.symbols.in_transaction() {
+            return self.error(&tr!("cmd.engine.063").into_owned());
+        }
+
+        // 旧库欠着的提交:先补上(补不上就不切)
+        if let Err(e) = self.commit() {
+            return self.error(&format!("{}", tr!("cmd.engine.012", arg0 =  e)));
+        }
+
+        // 借来 `service` / `user`:下面要改 `self.symbols` 与 `self.store`,不能
+        // 一直借着 `store`
+        let (service, user) = match self.store.as_ref() {
+            Some(store) => (store.service.clone(), store.user.clone()),
+            None => return self.error(&tr!("cmd.engine.060").into_owned()),
+        };
+
+        let db = match service.open(&name, &user) {
+            Ok(db) => db,
+            Err(e) => return self.error(&format!("{}", tr!("cmd.engine.010", arg0 =  e))),
+        };
+
+        let mut symbols = SymbolTable::new();
+        let known_on_disk = match load_tables(&mut symbols, &db) {
+            Ok(known) => known,
+            // 新库载入失败:那个句柄当场 drop(锁立刻回到内核),本会话原地不动
+            Err(e) => return self.error(&format!("{}", tr!("cmd.engine.010", arg0 =  e))),
+        };
+        let settings = db.catalog().settings.clone();
+        if !settings.search_path.is_empty() {
+            symbols.set_search_path(settings.search_path);
+        }
+        // 换库 = 换连接:当前角色回到认证过的会话用户
+        symbols.set_role(user.name.clone());
+
+        let database = db.name().to_string();
+        self.symbols = symbols;
+        if let Some(store) = self.store.as_mut() {
+            store.db = db;
+            store.dirty.clear();
+            store.known_on_disk = known_on_disk;
+        }
+        self.msg(&format!("{}", tr!("cmd.engine.062", arg0 =  database)));
+        Flow::Continue
+    }
+
+    /// `\l`:列服务目录里的库与 owner.
+    fn list_databases(&mut self) -> Flow {
+        let Some(store) = self.store.as_ref() else {
+            return self.error(&tr!("cmd.engine.060").into_owned());
+        };
+        let (service, current) = (store.service.clone(), store.db.name().to_string());
+
+        let databases = match service.databases() {
+            Ok(names) => names,
+            Err(e) => return self.error(&format!("{}", tr!("cmd.engine.067", arg0 =  e))),
+        };
+        if databases.is_empty() {
+            self.msg(&tr!("cmd.engine.066").into_owned());
+            return Flow::Continue;
+        }
+
+        self.msg(&format!("{:<28}{}\n", tr!("cmd.engine.064").into_owned(), tr!("cmd.engine.065").into_owned()));
+        for name in databases {
+            let owner = match service.catalog(&name) {
+                Ok(catalog) => catalog.owner,
+                // 元数据读不出来就报错,不糊一个"?"过去(`\l` 也照这一层的规矩办)
+                Err(e) => return self.error(&format!("{}", tr!("cmd.engine.067", arg0 =  e))),
+            };
+            let mark = match name == current {
+                true => "*",
+                false => " ",
+            };
+            self.msg(&format!("{:<27}{}{}\n", name, mark, owner));
+        }
+        Flow::Continue
+    }
+
+    /// `\du`:列角色(名字,属性,所属角色).
+    fn list_roles(&mut self) -> Flow {
+        let Some(store) = self.store.as_ref() else {
+            return self.error(&tr!("cmd.engine.060").into_owned());
+        };
+        let users = match store.service.users() {
+            Ok(users) => users,
+            Err(e) => return self.error(&format!("{}", tr!("cmd.engine.090", arg0 =  e))),
+        };
+
+        self.msg(&format!("{:<24}{:<32}{}\n", tr!("cmd.engine.091").into_owned(), tr!("cmd.engine.092").into_owned(), tr!("cmd.engine.093").into_owned()));
+        for user in &users.users {
+            let mut attrs = Vec::new();
+            if user.is_admin {
+                attrs.push(tr!("cmd.engine.094").into_owned());
+            }
+            attrs.push(match user.can_login {
+                true => tr!("cmd.engine.095").into_owned(),
+                false => tr!("cmd.engine.096").into_owned(),
+            });
+            if user.can_create_db {
+                attrs.push(tr!("cmd.engine.097").into_owned());
+            }
+            if user.can_create_role {
+                attrs.push(tr!("cmd.engine.098").into_owned());
+            }
+            if !user.inherit {
+                attrs.push(tr!("cmd.engine.099").into_owned());
+            }
+            let mut belongs = user.member_of.clone();
+            belongs.sort();
+            self.msg(&format!("{:<24}{:<32}{}\n", user.name, attrs.join(","), belongs.join(",")));
+        }
+        Flow::Continue
     }
 
     /// 符号表(只读).
@@ -764,7 +911,12 @@ impl Session {
     ///
     /// **每次补全前现算**--上一条语句刚建出来的表,下一条就该能补出来.
     pub fn catalog(&self) -> Catalog {
-        Catalog::from_symbols(&self.symbols)
+        let mut catalog = Catalog::from_symbols(&self.symbols);
+        // `\c` 的补全要库名:读不出来就当没有候选(补全不该报错)
+        if let Some(store) = &self.store {
+            catalog.databases = store.service.databases().unwrap_or_default();
+        }
+        catalog
     }
 
     /// 交互输入:**全部**元命令可用(含 `\!`).
@@ -1181,6 +1333,12 @@ impl Session {
                 }
             },
 
+            MetaCmd::ListDatabases => self.list_databases(),
+
+            MetaCmd::ListRoles => self.list_roles(),
+
+            MetaCmd::Connect(name) => self.switch_database(name),
+
             MetaCmd::Timing(value) => self.set_timing(&value),
 
             MetaCmd::Set { name, value } => self.set_variable(&name, value.as_deref()),
@@ -1384,6 +1542,24 @@ impl Session {
         }
         Flow::Continue
     }
+}
+
+/// 把一个库里的表读进符号表,**整批原子**,返回"磁盘上有哪些表".
+///
+/// 任何一张读不回来就整体失败,不留下装了一半的符号表;调用方([`Session::open_with_sinks`]
+/// 与 [`Session::switch_database`])拿返回的集合当"磁盘上应该有哪些"的起点.
+fn load_tables(symbols: &mut SymbolTable, db: &Database) -> Result<BTreeSet<String>> {
+    let tables = db.load_tables()?;
+
+    let mut known_on_disk = BTreeSet::new();
+    let mut batch = Vec::with_capacity(tables.len());
+    for table in tables {
+        known_on_disk.insert(table.name().to_string());
+        batch.push(Symbol::relation(table.name().to_string(), table));
+    }
+    symbols.extend(batch)?;
+
+    Ok(known_on_disk)
 }
 
 /// `on` / `off` / `1` / `0` / `true` / `false`(不分大小写);别的写法返回 `None`.

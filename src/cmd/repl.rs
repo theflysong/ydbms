@@ -47,20 +47,21 @@ pub fn run() -> io::Result<()> {
 
     let mut session = Session::new();
     banner_memory();
-    interact(&mut session, "sql> ")
+    interact(&mut session)
 }
 
 /// 服务模式的入口(`ysql`):会话**已经**打开了一个库(见 [`Session::open`]).
 ///
-/// 提示符由调用方给(`ysql` 用 `<库> => `);横幅写清用户,库与服务目录,
-/// 因为这几样决定了"数据写到哪儿去了".
-pub fn run_session(session: &mut Session, prompt: &str) -> io::Result<()> {
+/// 提示符**每轮从会话取**([`Session::prompt`])--`\c` 换了库(或 `SET ROLE` 换了
+/// 身份)之后,下一条提示符就得跟着变.横幅写清用户,库与服务目录,因为这几样
+/// 决定了"数据写到哪儿去了".
+pub fn run_session(session: &mut Session) -> io::Result<()> {
     banner_session(session);
-    interact(session, prompt)
+    interact(session)
 }
 
 /// 读输入,交给引擎,直到 `\q`(或 Ctrl-D / EOF).两种入口共用这一套.
-fn interact(session: &mut Session, prompt: &str) -> io::Result<()> {
+fn interact(session: &mut Session) -> io::Result<()> {
     if !io::stdin().is_terminal() {
         return run_plain(session);
     }
@@ -83,7 +84,8 @@ fn interact(session: &mut Session, prompt: &str) -> io::Result<()> {
             helper.catalog = session.catalog();
         }
 
-        match editor.readline(prompt) {
+        let prompt = session.prompt();
+        match editor.readline(&prompt) {
             Ok(line) => {
                 let _ = editor.add_history_entry(line.as_str());
                 submit(session, &line);
@@ -267,6 +269,7 @@ fn banner_session(session: &Session) {
         println!("{}", tr!("cmd.repl.008", arg0 =  db));
         println!("{}", tr!("cmd.repl.009", arg0 =  db));
         println!("{}", tr!("cmd.repl.010", arg0 =  db));
+        println!("{}", tr!("cmd.repl.031", arg0 =  db));
     }
     println!();
     banner_commands();
@@ -281,6 +284,9 @@ fn banner_commands() {
     println!("{}", tr!("cmd.repl.014"));
     println!("{}", tr!("cmd.repl.015"));
     println!();
+    println!("{}", tr!("cmd.repl.028"));
+    println!("{}", tr!("cmd.repl.029"));
+    println!("{}", tr!("cmd.repl.030"));
     println!("{}", tr!("cmd.repl.016"));
     println!("{}", tr!("cmd.repl.017"));
     println!("{}", tr!("cmd.repl.018"));

@@ -600,3 +600,134 @@ fn a_granted_user_reads_but_cannot_write_across_processes() {
     // 授权表就在库目录里
     assert!(dir.path().join("filmdb/grants.json").is_file());
 }
+
+/// 验收原文:**`\c filmdb` 之后旧库的锁已释放(另一个进程能连上)**.
+///
+/// 这里两个都是"另一个进程":子进程是交互式的(管道喂输入),它 `\c other` 之后,
+/// **测试进程**必须马上能连上它放手了的那个库.
+#[test]
+fn switching_database_releases_the_old_lock_across_processes() {
+    use std::io::{BufRead, Write as _};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new("switch-db");
+    bootstrap(&dir);
+
+    // 先建出第二个库(用一次性进程)
+    let setup = dir.script("setup.sql", "CREATE DATABASE other;\n");
+    let out = run(&dir, &["-U", "bob", "-d", "bob", "-f", setup.to_str().unwrap()], Some(PASSWORD));
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    // 交互式子进程(标准输入是管道:读完一段就走非 tty 那条路)
+    let mut child = Command::new(bin())
+        .arg("--server-dist")
+        .arg(dir.path())
+        .args(["-U", "bob", "-d", "bob"])
+        .env_remove("PGPASSWORD")
+        .env("PGPASSWORD", PASSWORD)
+        .env("YDBMS_LANG", "zh-CN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("起不了 ysql");
+
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 等横幅(= 库已经打开)
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) if line.contains("服务目录") => break,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+            Err(RecvTimeoutError::Timeout) => panic!("等不到子进程把库打开"),
+            Err(RecvTimeoutError::Disconnected) => panic!("子进程提前退出了"),
+        }
+    }
+
+    // 让它换库
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"\\c other\n")
+        .expect("喂输入");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) if line.contains("已连到库") => break,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+            Err(RecvTimeoutError::Timeout) => panic!("等不到子进程换库"),
+            Err(RecvTimeoutError::Disconnected) => panic!("子进程换库时退出了"),
+        }
+    }
+
+    // 旧库的锁已经放了:测试进程立刻连得上
+    let service = ServiceDir::resolve(Some(dir.path().to_path_buf()), None).expect("服务目录");
+    let freed = service.open("bob", &bob()).expect("旧库的锁该放了");
+
+    // 而它现在握着的那个库,别人连不上
+    let err = service.open("other", &bob()).expect_err("新库还在子进程手里");
+    assert!(err.to_string().contains("单写者锁"), "{err}");
+
+    drop(freed);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `\c` 在**脚本**里也能用(`-f` 与 `\i` 是同一条路):后半段跑在换过去的库里.
+#[test]
+fn a_script_may_switch_databases() {
+    let dir = TempDir::new("script-switch");
+    bootstrap(&dir);
+
+    let setup = dir.script(
+        "setup.sql",
+        "CREATE DATABASE other;\n",
+    );
+    let out = run(&dir, &["-U", "bob", "-d", "bob", "-f", setup.to_str().unwrap()], Some(PASSWORD));
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    let load = dir.script(
+        "load.sql",
+        "CREATE TABLE t (x INT);\nINSERT INTO t VALUES (42);\n",
+    );
+    let out = run(
+        &dir,
+        &["-U", "bob", "-d", "other", "-f", load.to_str().unwrap()],
+        Some(PASSWORD),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    // 从默认库出发,`\c other` 之后读到的是 other 里的表
+    let script = dir.script("switch.sql", "\\c other\nSELECT x FROM t;\n");
+    let out = run(
+        &dir,
+        &["-U", "bob", "-d", "bob", "-f", script.to_str().unwrap()],
+        Some(PASSWORD),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains("已连到库"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("42"), "{}", stdout(&out));
+
+    // 反过来:在 `bob` 库里没有 t
+    let query = dir.script("q.sql", "SELECT x FROM t;\n");
+    let out = run(&dir, &["-U", "bob", "-d", "bob", "-f", query.to_str().unwrap()], Some(PASSWORD));
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}

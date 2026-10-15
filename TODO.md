@@ -7,7 +7,7 @@
 阶段 4~6 是新开的一块(把引擎做成"带用户与库的服务化命令行"),依赖链是
 **事务 → 持久化/目录 → 用户与 CLI**,与阶段 0~3 互不阻塞.
 **阶段 4(真事务与原子提交),阶段 5(服务目录与库),阶段 6(用户系统与 `ysql`)
-都已经做完**,这三节只剩下面几条收尾;其中 5.5 已经**明确不做**(理由写在那一节里).
+都已经做完**;5.5 与 6.4 之后新提的那几项都已落地,剩下的都在下面各节里写着.
 
 难度标记:**[易]** 半天内,改动集中;**[中]** 一到两天,要动一两层;**[难]** 需要新机制或重写.
 
@@ -23,14 +23,14 @@
 | **3** | 性能与架构(索引,哈希连接,下推,重排,UPDATE) | 1 | 3.0 拉取式执行模型,3.1 索引 / 索引嵌套循环,3.2 哈希连接,3.3 谓词下推,3.5 `UPDATE`,3.6 索引进目录 + 可空侧下推 |
 | **4** | 真事务(`BEGIN` / `COMMIT` / `ROLLBACK`)与原子提交 | 0 | 4.1 写前整表快照 + 目录快照 + 逐条隐式提交,4.2 影子分页 + `commit.json` 重放 |
 | **5** | 服务目录,数据库与"写完就落盘"(`--server-dist` / `-d`) | 0 | 5.1 库目录 / `catalog.json` / `CREATE`·`DROP DATABASE`,5.2 打开即载入 + 只写脏表的提交点,5.3 服务目录与单写者锁(随阶段 6 一起做),5.4 库级会话默认值(`ALTER DATABASE ... SET search_path`) |
-| **6** | 用户系统(`src/usr/`)与 `ysql` 命令行 | 1 | 6.1 用户表与认证,6.2 `ysql` 命令行,6.3 端到端验收与文档 |
+| **6** | 用户系统(`src/usr/`)与 `ysql` 命令行 | 0 | 6.1 用户表与认证,6.2 `ysql` 命令行,6.3 端到端验收与文档,6.4 角色 / 授权 / `\c`·`\l`·`\du` |
 
 **当前基线**(改动前先确认还成立):
 
 ```text
 db.sql 52/0 · query1 4/0 · query2 5/0 · query3 8/0 · query4 6/0 · query5 9/0
 (格式:成功 / 失败)
-cargo test --offline → 584 通过(1 个 #[ignore] 的基准),0 warning;约 12 秒
+cargo test --offline → 654 通过(2 个 #[ignore]:两个基准),0 warning;约 13 秒
 (其中 tests/ydbms_suite.rs 的端到端装载 + 25 条查询约 9 秒)
 执行模型:拉取式 -- ir::exec 的每个节点产出一个 RowSource,
           只有需要随机访问 / 重扫 / 哈希 build / 最终结果才物化(见 ir/exec.rs)
@@ -57,15 +57,22 @@ DDL/DML:CREATE TABLE 的 NOT NULL / DEFAULT / CHECK **真强制**(CHECK 见 ir/c
         强制点),usr/(用户与库)
 交互式终端:cmd/ -- rustyline 行编辑 + Tab 补全 + 多行累积,
           引擎与 SQL 部分的分工见"阶段 1"开头
-用户与库:usr/ -- 服务目录(默认 ~/.ydbms):users.json + 各库目录;
-          users.json 存的是**加盐 SHA-256**(sha2 依赖,盐来自 /dev/urandom),没有明文;
-          库就是目录,<库>/catalog.json 记 owner 与**库级 settings.search_path**;每个库
-          一把 flock(File::try_lock),第二个写者直接连不上;口径是只做认证 +
-          "owner(或管理员)才能连";`ALTER DATABASE <库> SET search_path TO ...` 写的就是
-          那条 settings,**打开库时**由引擎套成会话的初始 search_path(只影响以后的连接)
+用户与库:usr/ -- 服务目录(默认 ~/.ydbms):users.json + .users.lock + 各库目录;
+          users.json 是**角色表**(加盐 SHA-256,没有明文;LOGIN / SUPERUSER /
+          CREATEDB / CREATEROLE / INHERIT 五个属性 + member_of 成员关系),改它要先拿
+          .users.lock(第二个写者直接报错);库就是目录,<库>/catalog.json 记 owner 与
+          **库级 settings.search_path**,<库>/grants.json 记授权(connect + 表级/列级),
+          每个库一把 flock(File::try_lock),第二个写者直接连不上;
+          口径:**超级用户不是继承来的**(只有当前角色自己 is_admin 才算),普通权限
+          (owner 身份,表权限)沿成员关系按 INHERIT 逐边继承;
+          `ALTER DATABASE <库> SET search_path TO ...` 写的就是那条 settings,
+          **打开库时**由引擎套成会话的初始 search_path(只影响以后的连接)
 命令行:main.rs(ydbms,内存模式,行为未变)与 src/bin/ysql.rs(服务模式:
         cmd/cli.rs 解析 -U / -d / -f / --server-dist / -h;密码从 PGPASSWORD 来;
         -f 与 \i 同一条路;退出码 0 / 1)
+元命令:cmd/ -- \l(列库与 owner),\du(列角色与属性),\c <库>(换库:事务里拒绝,
+        先补旧库欠着的提交,先开新库再换句柄,旧库的锁当场释放;脚本里也能用);
+        提示符每轮现取,`SET ROLE` 之后是 <库>[<角色>] => 
 文案:rust-i18n -- locales/zh-CN.yml 是**源文案**(515 条),locales/en.yml 是英文译文;
       调用点一律 `tr!("模块.文件.序号", 名字 = 表达式)`(占位符在文案表里写 `%{名字}`),
       默认语言 zh-CN,`YDBMS_LANG` -> `LC_ALL` -> `LC_MESSAGES` -> `LANG` 可以改;
@@ -190,26 +197,22 @@ AFFAIR test {
 - **量级**:一个项目.
 - **验收**:10 万行的表里改一行,提交只写那一行(对比:现在是一次整表重写).
 
-# 阶段 6 -- 用户系统的收尾
+# 阶段 6 -- 用户系统与多用户共享
 
-6.1 / 6.2 / 6.3 已经做完(`src/usr/` 的用户表与认证,`ysql` 的
-`-U` / `-d` / `-f` / `--server-dist`,跨进程端到端与文档),口径写在
-`src/usr/AGENTS.md` 与 `src/cmd/cli.rs` 的文件头里.下面这条是当时**明确列为不做**的.
+6.1 / 6.2 / 6.3(用户表与认证,`ysql` 命令行,跨进程端到端)与 **6.4**(角色系统,
+表级 / 列级 / 跨库授权,`\c` / `\l` / `\du`,口令轮换)**都做完了**;口径写在
+`src/usr/AGENTS.md`(角色,成员关系,`users.json` / `grants.json` / `.users.lock`
+三份磁盘契约),"谁能做什么"那张矩阵在 `src/usr/AGENTS.md` 与 `src/cmd/AGENTS.md`,
+语句层的权限检查与列使用分析在 `src/ir/AGENTS.md`.
 
-## 6.4 [难]多用户共享:`CREATE USER` / `GRANT` / `REVOKE` 与 `\c` / `\l`
+**明确不做**(理由都写在各自的文档里):
 
-**缺在哪**:本版只做认证 + "owner(或管理员)才能连".用户只能靠 `UserStore::add`
-或手工编辑 `users.json` 加;权限只有"连不连得上"这一档,库里没有表级授权;换库要退出
-重连(没有 `\c`),列库只能靠 `-d` 报错时打出来的那一串(没有 `\l`).
-
-- **要点**:先定**授权信息存哪儿**(`<库>/grants.json`,还是 `users.json` 里的角色),
-  再谈表级权限;`\c <库>` 换库时要连**单写者锁**一起换(旧库得能被别人连上),
-  `\l` 列出服务目录下的库与 owner.
-- **需要决定**:权限粒度(库级 / 表级 / 列级)与"管理员"的边界;本版把
-  `GRANT`/`REVOKE` 列为不做,就是因为还没想清楚这两件事.
-- **量级**:一个项目(授权模型 + 元命令 + 端到端).
-- **验收**:表级 `GRANT SELECT` 之后另一个人 `SELECT` 得过,`INSERT` 被拒;
-  `\c filmdb` 之后旧库的锁已释放(另一个进程能连上).
+- `REASSIGN OWNED BY`(要跨库改 `catalog.json` 的 owner;要换 owner 就
+  `ALTER DATABASE <库> OWNER TO <角色>`),`GRANT ... TO PUBLIC`,
+  `WITH GRANT OPTION` / `ADMIN OPTION FOR`,`REVOKE ... CASCADE`;
+- `SET SESSION AUTHORIZATION`,`ALTER ROLE ... IN DATABASE ... SET/RESET`;
+- `REVOKE CONNECT` 之后**踢掉已经连上的会话**(连接是一次性的,只影响以后);
+- 口令的 KDF 升级(仍是加盐单轮 SHA-256,`users.json` 的 `version` 留给它).
 
 # 附:外部依赖备忘
 

@@ -215,7 +215,7 @@ pub fn run() -> i32 {
         }
     };
 
-    let (mut session, prompt) = match connect(&args, &getenv) {
+    let mut session = match connect(&args, &getenv) {
         Ok(connected) => connected,
         Err(message) => {
             eprintln!("{message}");
@@ -230,7 +230,7 @@ pub fn run() -> i32 {
             session.run_file(script);
             i32::from(session.failed() > 0)
         }
-        None => match repl::run_session(&mut session, &prompt) {
+        None => match repl::run_session(&mut session) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{}", tr!("cmd.cli.010", e = e));
@@ -244,7 +244,7 @@ pub fn run() -> i32 {
 fn connect(
     args: &Args,
     getenv: &dyn Fn(&str) -> Option<String>,
-) -> std::result::Result<(Session, String), String> {
+) -> std::result::Result<Session, String> {
     let service = ServiceDir::resolve(Some(args.server_dist.clone()), getenv("HOME").map(PathBuf::from))
         .map_err(|e| format!("{}", tr!("cmd.cli.011", e = e)))?;
 
@@ -273,11 +273,9 @@ fn connect(
     let db = service
         .open(&args.database, &user)
         .map_err(|e| format!("{}", tr!("cmd.cli.016", e = e)))?;
-    let prompt = format!("{} => ", db.name());
 
-    let session = Session::open(db, user, service)
-        .map_err(|e| format!("{}", tr!("cmd.cli.017", arg0 =  args.database, e = e)))?;
-    Ok((session, prompt))
+    Session::open(db, user, service)
+        .map_err(|e| format!("{}", tr!("cmd.cli.017", arg0 =  args.database, e = e)))
 }
 
 /// 认证:`users.json` 不在就 bootstrap.
