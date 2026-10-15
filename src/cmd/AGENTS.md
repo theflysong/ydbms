@@ -50,9 +50,33 @@
   那些改动真的被撤销了,再写回去就是白写一整张表.**`applied: false` 的那种
   (没有事务时的 `ROLLBACK`,只发一句警告)不许清**--那会把上一次提交失败留下的
   重试集一并抹掉,那批改动就再也不会落盘了.
-- `CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE ... SET` 的文件系统那一半在
-  `usr`,引擎只把 `store` 作为 `ir::stmt::Databases` 递进去;内存模式由 `NoDatabases`
-  明确拒绝,**事务里也一律拒绝**(撤销记录管不到服务目录).
+- `CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE ... SET`,以及角色那几条
+  (`CREATE/ALTER/DROP ROLE`,`GRANT <角色>`,`SET ROLE`)的文件系统那一半在 `usr`,
+  引擎只把 `store` 作为 `ir::stmt::Server` 递进去;内存模式由 `NoServer` 明确拒绝,
+  **事务里也一律拒绝**(撤销记录管不到服务目录;`SET ROLE` 是例外--它是会话状态,
+  记在符号表里,能回滚).
+
+### 权限判定(`Store` 实现 `Server` 的那几问)
+
+"谁在连"与"**当前角色**"是两件事:前者是认证过的 `Session::user`,后者是
+`SymbolTable::role()`(`SET ROLE` 之后不同).`Server` 的每个方法都收 `role` 参数,
+所以"当前角色"只有一个来源,`Store` 不缓存它.
+
+- 查权限前先读**当下那一份** `users.json`(`ServiceDir::users`):另一个进程刚删掉某个
+  角色时,会话手里那份记录就是过期的--`role_record` 找不到就报错,不猜.
+- **超级用户看当前角色自己**(`is_admin`),不沿成员关系继承;`owner` 身份与表权限
+  才用 `ServiceDir::acts_as`(有效角色集).这条与 `usr::roles` 里的口径一一对应.
+- 几种"能不能":
+  - 动结构(`CREATE TABLE` 等)→ `check_ddl`:owner(含继承)或超级用户;
+  - 建库 → `check_create_database`:`CREATEDB` 或超级用户;
+  - 建 / 改 / 删角色,授成员 → 超级用户或 `CREATEROLE`(`require_role_manager`);
+  - **自己改自己的口令**是个例外:谁都能换自己的(`ALTER USER 自己 PASSWORD ...`),
+    但换成别人,改属性,改名都要 `CREATEROLE`;
+  - `SET ROLE` → 超级用户,或者是目标的成员(`usr::can_set_role`,**不看** `INHERIT`).
+- 改名与删角色**不许碰当前会话用户与当前角色**(会话里存的就是名字,改掉就成了幽灵):
+  要改就先 `RESET ROLE` 或换个会话.
+- 报错一律说清"缺什么,该谁来给":权限不足时报的是"`谁` 在表 `X` 上没有 `Y`,
+  要 owner 或管理员执行 `GRANT ...`"这一类句子(表权限那几条在 commit 2 之后生效).
 
 ### 文案:一律走 `tr!`
 

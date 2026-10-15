@@ -27,6 +27,13 @@
 //! `RENAME`/`OWNER`...);`SAVEPOINT` 与嵌套事务(`BEGIN`/`COMMIT`/`ROLLBACK` 与
 //! `ALTER DATABASE ... SET search_path` 是支持的);参数占位符;数组与位串类型.
 //!
+//! 角色那几条**是支持的**(`CREATE/ALTER/DROP USER`·`ROLE`·`GROUP`,
+//! `GRANT/REVOKE <角色>`,`SET ROLE`/`RESET ROLE`);其中**显式拒绝**的是:
+//! `CREATE ROLE` 的 `VALID UNTIL`/`CONNECTION LIMIT`/`SYSID`/`ADMIN`/`IN GROUP`,
+//! `ALTER ROLE ... IN DATABASE ... SET/RESET`,`WITH ADMIN OPTION` /
+//! `ADMIN OPTION FOR` / `GRANTED BY` / `CASCADE`,以及
+//! `CURRENT_USER`/`SESSION_USER`/`PUBLIC` 这几种角色写法.
+//!
 //! # 子查询与相关引用
 //!
 //! 子查询就是"再开一个查询":`lower_select` 多收一个**外层作用域链**
@@ -48,11 +55,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pg_query::protobuf::{
-    a_const::Val, node, AConst, AExpr, AExprKind, AlterDatabaseSetStmt, BoolExpr, BoolExprType,
-    CaseExpr, ConstrType, CreateSchemaStmt, CreateStmt, CreatedbStmt, DropBehavior, DropStmt,
-    DropdbStmt, FuncCall, InsertStmt,
+    a_const::Val, node, AConst, AExpr, AExprKind, AlterDatabaseSetStmt, AlterRoleStmt, BoolExpr,
+    BoolExprType, CaseExpr, ConstrType, CreateRoleStmt, CreateSchemaStmt, CreateStmt, CreatedbStmt,
+    DefElem, DropBehavior, DropRoleStmt, DropStmt,
+    DropdbStmt, FuncCall, GrantRoleStmt, InsertStmt,
     JoinExpr, JoinType, LimitOption, Node, NullTestType, ObjectType, OnCommitAction, RangeVar,
-    IndexStmt, SelectStmt, SetOperation, SortBy, SortByDir, SortByNulls,
+    IndexStmt, RenameStmt, RoleSpec, RoleSpecType, RoleStmtType, SelectStmt, SetOperation, SortBy,
+    SortByDir,
+    SortByNulls,
     SqlValueFunction, SqlValueFunctionOp, SubLink, SubLinkType, TransactionStmt,
     TransactionStmtKind, TypeName, UpdateStmt, VariableSetKind, VariableSetStmt,
 };
@@ -62,6 +72,7 @@ use crate::db::table::{
     DEFAULT_TIMESTAMP_PRECISION,
     MAX_TIMESTAMP_PRECISION,
 };
+use crate::usr::{Password, PasswordAction, RoleAttrChange, RoleAttrs};
 
 use super::checks::Check;
 use super::expr::{
@@ -73,7 +84,7 @@ use super::plan::{
     passthrough_column, plan_has_outer, project_column, AggFunc, AggSpec, JoinKind, JoinStrategy,
     NodeId, Op, Plan, PlanBuilder, SortKey,
 };
-use super::stmt::{Stmt, TxOp};
+use super::stmt::{AlterRoleRequest, CreateRoleRequest, GrantRoleRequest, Stmt, TxOp};
 use super::symbol::SymbolTable;
 
 /// 解析 SQL 并降级成**恰好一条查询**.
@@ -135,6 +146,12 @@ pub fn lower_statement(stmt: &Node, symbols: &SymbolTable) -> Result<Stmt> {
         }
         Some(node::Node::TransactionStmt(tx)) => lower_transaction(tx),
         Some(node::Node::VariableSetStmt(set)) => lower_set(set),
+        Some(node::Node::CreateRoleStmt(role)) => lower_create_role(role),
+        Some(node::Node::AlterRoleStmt(role)) => lower_alter_role(role),
+        Some(node::Node::AlterRoleSetStmt(_)) => Err(unsupported("ALTER ROLE ... IN DATABASE")),
+        Some(node::Node::DropRoleStmt(drop)) => lower_drop_role(drop),
+        Some(node::Node::GrantRoleStmt(grant)) => lower_grant_role(grant),
+        Some(node::Node::RenameStmt(rename)) => lower_rename(rename),
         _ => Err(unsupported(tr!("ir.irgen.006").into_owned())),
     }
 }
@@ -227,7 +244,7 @@ fn lower_transaction(tx: &TransactionStmt) -> Result<Stmt> {
 }
 
 /// `ALTER DATABASE name SET search_path TO ...`:库级默认值(见
-/// [`Databases::set_database_search_path`]).
+/// [`Server::set_database_search_path`]).
 ///
 /// 只认 `search_path` 这一个变量--它是库元数据里唯一有语义的东西,别的变量本版
 /// 没有会话默认值可言,接受下来等于假装.`RESET search_path` 与
@@ -289,9 +306,9 @@ fn parse_search_path(set: &VariableSetStmt) -> Result<Vec<String>> {
     }
 }
 
-/// `CREATE DATABASE name`:只留名字,建目录 / 写 `catalog.json` 是 [`Databases`] 的事.
+/// `CREATE DATABASE name`:只留名字,建目录 / 写 `catalog.json` 是 [`Server`] 的事.
 ///
-/// [`Databases`]: super::stmt::Databases
+/// [`Server`]: super::stmt::Server
 fn lower_create_database(db: &CreatedbStmt) -> Result<Stmt> {
     if !db.options.is_empty() {
         return Err(unsupported(
@@ -309,7 +326,7 @@ fn lower_create_database(db: &CreatedbStmt) -> Result<Stmt> {
 
 /// `DROP DATABASE [IF EXISTS] name`.
 ///
-/// [`Databases`]: super::stmt::Databases
+/// [`Server`]: super::stmt::Server
 fn lower_drop_database(db: &DropdbStmt) -> Result<Stmt> {
     if !db.options.is_empty() {
         return Err(unsupported(tr!("ir.irgen.024").into_owned()));
@@ -410,12 +427,33 @@ fn object_name(node: &Node) -> Option<String> {
     }
 }
 
-/// `SET`:只认 `SET search_path TO ...`,别的变量一律拒绝.
+/// `SET`:只认 `SET search_path TO ...` 与 `SET ROLE ...`,别的变量一律拒绝.
 ///
 /// `search_path` **不是**无操作的:`filmdb.sql` 的建表写的是非限定名,而测试查的
 /// 是 `study.movies`--不作前缀那些表就永远不存在(见 [`crate::ir::symbol`]).
+///
+/// `SET ROLE` 在语法树里就是一个"变量"(PostgreSQL 的 `role` 是个 GUC 式的开关):
+/// 解出目标名交出去;`SET ROLE NONE` / `DEFAULT` 与 `RESET ROLE` 都解成 `None`
+/// (=回到会话用户).`SET SESSION AUTHORIZATION` 走下面那条"不认识的变量"拒绝.
 fn lower_set(set: &VariableSetStmt) -> Result<Stmt> {
     let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+
+    if set.name.eq_ignore_ascii_case("role") {
+        return match kind {
+            VariableSetKind::VarSetValue => {
+                let text = set_name_string(set)
+                    .ok_or_else(|| unsupported(tr!("ir.irgen.205").into_owned()))?;
+                let target = match text.to_ascii_lowercase().as_str() {
+                    "none" | "default" => None,
+                    _ => Some(text),
+                };
+                Ok(Stmt::SetRole(target))
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => Ok(Stmt::SetRole(None)),
+            _ => Err(unsupported(format!("{}", tr!("ir.irgen.205")))),
+        };
+    }
+
     if kind != VariableSetKind::VarSetValue {
         return Err(unsupported(format!("{}", tr!("ir.irgen.033", arg0 =  set.name))));
     }
@@ -427,6 +465,325 @@ fn lower_set(set: &VariableSetStmt) -> Result<Stmt> {
     let names = parse_search_path(set)?;
 
     Ok(Stmt::SetSearchPath { path: names })
+}
+
+/// `SET ROLE` 的取值:恰好一个字符串字面量.
+fn set_name_string(set: &VariableSetStmt) -> Option<String> {
+    match set.args.as_slice() {
+        [only] => const_string(only),
+        _ => None,
+    }
+}
+
+// --------------------------------------------------------------- 角色(6.4)
+
+/// `CREATE USER` / `CREATE ROLE` / `CREATE GROUP`.
+///
+/// 三者的差别只有**默认属性**(`USER` 默认能登录)与报文里的那个词,别的选项都一样:
+/// `PASSWORD` / `SUPERUSER` / `CREATEDB` / `CREATEROLE` / `INHERIT` / `IN ROLE`.
+/// 其余的(`VALID UNTIL`,`CONNECTION LIMIT`,`BYPASSRLS`,`REPLICATION`,`SYSID`,
+/// `ADMIN`,`IN GROUP`...)一律**显式拒绝**--写进来了却不当回事,比报错坏.
+fn lower_create_role(role: &CreateRoleStmt) -> Result<Stmt> {
+    let kind = RoleStmtType::try_from(role.stmt_type).unwrap_or(RoleStmtType::Undefined);
+    let (what, mut attrs) = match kind {
+        RoleStmtType::RolestmtUser => ("CREATE USER", RoleAttrs::user()),
+        RoleStmtType::RolestmtRole => ("CREATE ROLE", RoleAttrs::role()),
+        RoleStmtType::RolestmtGroup => ("CREATE GROUP", RoleAttrs::role()),
+        _ => {
+            return Err(unsupported(format!("{}", tr!("ir.irgen.196", arg0 = 
+                kind.as_str_name()
+            ))))
+        }
+    };
+    if role.role.trim().is_empty() {
+        return Err(unsupported(format!("{}", tr!("ir.irgen.201"))));
+    }
+
+    let mut password = None;
+    let mut add_to = Vec::new();
+    for option in &role.options {
+        let elem = match &option.node {
+            Some(node::Node::DefElem(elem)) => elem,
+            _ => {
+                return Err(unsupported(format!("{}", tr!("ir.irgen.198", arg0 = 
+                    what
+                ))))
+            }
+        };
+
+        match elem.defname.as_str() {
+            "password" => {
+                // `PASSWORD NULL` 在语法树里是个空值节点:与不写同义(没有口令)
+                password = match def_string(elem) {
+                    Some(text) => {
+                        if text.is_empty() {
+                            return Err(unsupported(format!("{}", tr!("ir.irgen.197"))));
+                        }
+                        Some(Password::new(text))
+                    }
+                    None => None,
+                };
+            }
+            "superuser" => {
+                attrs.admin = def_bool(elem).ok_or_else(|| {
+                    unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  elem.defname)))
+                })?
+            }
+            "createdb" => {
+                attrs.create_db = def_bool(elem).ok_or_else(|| {
+                    unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  elem.defname)))
+                })?
+            }
+            "createrole" => {
+                attrs.create_role = def_bool(elem).ok_or_else(|| {
+                    unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  elem.defname)))
+                })?
+            }
+            "inherit" => {
+                attrs.inherit = def_bool(elem).ok_or_else(|| {
+                    unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  elem.defname)))
+                })?
+            }
+            // `LOGIN` / `NOLOGIN` 在语法树里就是 `canlogin` 这一条
+            "canlogin" => {
+                attrs.login = def_bool(elem).ok_or_else(|| {
+                    unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  elem.defname)))
+                })?
+            }
+            "addroleto" => add_to.extend(def_roles(elem)?),
+            other => {
+                return Err(unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  other))))
+            }
+        }
+    }
+
+    Ok(Stmt::CreateRole(CreateRoleRequest {
+        what,
+        name: role.role.clone(),
+        password,
+        attrs,
+        add_to,
+    }))
+}
+
+/// `ALTER USER` / `ALTER ROLE`:改属性,换口令,改名.
+///
+/// **`ALTER USER` 与 `ALTER ROLE` 在语法树里是同一个节点**(`AlterRoleStmt` 没有
+/// "哪一种"的字段),所以报文里统一写 `ALTER ROLE`--语句原文照旧打在 `[N]` 那一段里.
+/// `RENAME TO` 是 `action == -1` 加一条 `newname` 选项.
+fn lower_alter_role(role: &AlterRoleStmt) -> Result<Stmt> {
+    let name = role_spec(role.role.as_ref())?;
+    let mut request = AlterRoleRequest {
+        what: "ALTER ROLE",
+        name,
+        new_name: None,
+        password: PasswordAction::Unchanged,
+        changes: Vec::new(),
+    };
+    for option in &role.options {
+        let elem = match &option.node {
+            Some(node::Node::DefElem(elem)) => elem,
+            _ => return Err(unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  "ALTER ROLE")))),
+        };
+
+        match elem.defname.as_str() {
+            "password" => {
+                request.password = match def_string(elem) {
+                    Some(text) => {
+                        if text.is_empty() {
+                            return Err(unsupported(format!("{}", tr!("ir.irgen.197"))));
+                        }
+                        PasswordAction::Set(Password::new(text))
+                    }
+                    // `PASSWORD NULL`:清掉
+                    None => PasswordAction::Clear,
+                };
+            }
+            "superuser" | "createdb" | "createrole" | "inherit" | "canlogin" => {
+                let value = def_bool(elem).ok_or_else(|| {
+                    unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  elem.defname)))
+                })?;
+                request.changes.push(match elem.defname.as_str() {
+                    "superuser" => RoleAttrChange::Admin(value),
+                    "createdb" => RoleAttrChange::CreateDb(value),
+                    "createrole" => RoleAttrChange::CreateRole(value),
+                    "inherit" => RoleAttrChange::Inherit(value),
+                    _ => RoleAttrChange::Login(value),
+                });
+            }
+            other => {
+                return Err(unsupported(format!("{}", tr!("ir.irgen.198", arg0 =  other))))
+            }
+        }
+    }
+
+    Ok(Stmt::AlterRole(request))
+}
+
+/// `DROP USER` / `DROP ROLE`(语法树里是同一个节点,报文里统一写 `DROP ROLE`).
+fn lower_drop_role(drop: &DropRoleStmt) -> Result<Stmt> {
+    let mut names = Vec::new();
+    for node in &drop.roles {
+        names.push(role_spec(node_role_spec(node))?);
+    }
+    if names.is_empty() {
+        return Err(unsupported("DROP ROLE (no name)"));
+    }
+
+    Ok(Stmt::DropRole {
+        what: "DROP ROLE",
+        names,
+        if_exists: drop.missing_ok,
+    })
+}
+
+/// `GRANT <角色> TO <成员>` / `REVOKE <角色> FROM <成员>`.
+///
+/// 本版没有 `ADMIN OPTION` 那一档(能不能把角色再授出去由 `CREATEROLE` 决定),
+/// 所以 `WITH ADMIN OPTION` 与 `ADMIN OPTION FOR` 都**显式拒绝**:答应下来却不当
+/// 回事,等于给了一个假的权限开关.
+fn lower_grant_role(grant: &GrantRoleStmt) -> Result<Stmt> {
+    if !grant.opt.is_empty() {
+        return Err(unsupported("GRANT role ... WITH ADMIN OPTION / ADMIN OPTION FOR"));
+    }
+    if grant.grantor.is_some() {
+        return Err(unsupported("GRANT role ... GRANTED BY"));
+    }
+    if DropBehavior::try_from(grant.behavior).unwrap_or(DropBehavior::Undefined)
+        == DropBehavior::DropCascade
+    {
+        return Err(unsupported("REVOKE ... CASCADE"));
+    }
+
+    let mut roles = Vec::new();
+    for node in &grant.granted_roles {
+        roles.push(granted_role_name(node)?);
+    }
+    let mut members = Vec::new();
+    for node in &grant.grantee_roles {
+        members.push(role_spec(node_role_spec(node))?);
+    }
+    if roles.is_empty() || members.is_empty() {
+        return Err(unsupported(tr!("ir.irgen.202").into_owned()));
+    }
+
+    Ok(Stmt::GrantRole(GrantRoleRequest {
+        roles,
+        members,
+        is_grant: grant.is_grant,
+    }))
+}
+
+/// `GRANT <角色>` 里那半个名字.
+///
+/// **实测坑**:`GrantRoleStmt.granted_roles` 里的角色名有时不是 `RoleSpec`,而是
+/// 一个 `AccessPriv`(它的 `priv_name` 就是角色名,`cols` 为空)--所以两种节点都得认.
+fn granted_role_name(node: &Node) -> Result<String> {
+    match &node.node {
+        Some(node::Node::RoleSpec(spec)) => role_spec(Some(spec)),
+        Some(node::Node::AccessPriv(priv_)) if priv_.cols.is_empty() && !priv_.priv_name.is_empty() => {
+            Ok(priv_.priv_name.clone())
+        }
+        _ => Err(unsupported(format!("{}", tr!("ir.irgen.202")))),
+    }
+}
+
+/// `ALTER ROLE r RENAME TO s`:语法树里是 [`RenameStmt`],别的 `RENAME` 照旧拒绝.
+///
+/// (实测:它不是 `AlterRoleStmt` 加一个负数 `action`--那个写法在本版的解析器上
+/// 根本不会出现,别再猜一处.)
+fn lower_rename(rename: &RenameStmt) -> Result<Stmt> {
+    let kind = ObjectType::try_from(rename.rename_type).unwrap_or(ObjectType::Undefined);
+    if kind != ObjectType::ObjectRole {
+        return Err(unsupported(format!("{}", tr!("ir.irgen.006"))));
+    }
+    if rename.subname.is_empty() || rename.newname.is_empty() {
+        return Err(unsupported("ALTER ROLE ... RENAME TO"));
+    }
+
+    Ok(Stmt::AlterRole(AlterRoleRequest {
+        what: "ALTER ROLE",
+        name: rename.subname.clone(),
+        new_name: Some(rename.newname.clone()),
+        password: PasswordAction::Unchanged,
+        changes: Vec::new(),
+    }))
+}
+
+/// `Node` 里那个 `RoleSpec`(没有就报"授权对象必须是用户名字").
+fn node_role_spec(node: &Node) -> Option<&RoleSpec> {
+    match &node.node {
+        Some(node::Node::RoleSpec(spec)) => Some(spec),
+        _ => None,
+    }
+}
+
+/// `RoleSpec` → 角色名.
+///
+/// 只认写出来的名字:`CURRENT_USER` / `SESSION_USER` / `PUBLIC` 这些**显式拒绝**
+/// (本版没有"当前用户"这种写法,也没有 `PUBLIC` 那一档).
+fn role_spec(spec: Option<&RoleSpec>) -> Result<String> {
+    let spec = spec.ok_or_else(|| unsupported(tr!("ir.irgen.202").into_owned()))?;
+    let kind = RoleSpecType::try_from(spec.roletype).unwrap_or(RoleSpecType::Undefined);
+    if kind != RoleSpecType::RolespecCstring {
+        return Err(unsupported(format!("{}", tr!("ir.irgen.202"))));
+    }
+    if spec.rolename.trim().is_empty() {
+        return Err(unsupported(format!("{}", tr!("ir.irgen.201"))));
+    }
+    Ok(spec.rolename.clone())
+}
+
+/// 一条 `DefElem` 的字符串取值(`PASSWORD 'x'`;空值节点给 `None`).
+///
+/// `PASSWORD NULL` 是个空值节点(`A_Const` 的 `isnull`),所以 `None` 有两种来源:
+/// "不是字符串"与"就是 NULL"--调用方按各自的口径处理(建角色时两者同义,改口令时
+/// NULL 是"清掉").
+fn def_string(elem: &DefElem) -> Option<String> {
+    let arg = elem.arg.as_deref()?;
+    match &arg.node {
+        Some(node::Node::String(s)) => Some(s.sval.clone()),
+        Some(node::Node::AConst(_)) => const_string(arg),
+        _ => None,
+    }
+}
+
+/// 一条 `DefElem` 的布尔取值(`SUPERUSER` / `NOSUPERUSER` 之类).
+fn def_bool(elem: &DefElem) -> Option<bool> {
+    match elem.arg.as_deref().and_then(|arg| arg.node.as_ref()) {
+        Some(node::Node::Boolean(value)) => Some(value.boolval),
+        Some(node::Node::Integer(value)) => Some(value.ival != 0),
+        _ => None,
+    }
+}
+
+/// 一条 `DefElem` 里的角色清单(`IN ROLE a, b`).
+///
+/// 认不出来的写法**拒绝**,不悄悄少加一个成员("少加一个"是那种事后才发现的
+/// 安静错误).
+fn def_roles(elem: &DefElem) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    if let Some(arg) = elem.arg.as_deref() {
+        collect_role_specs(arg, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// 把 `RoleSpec`(可能是 `List`)收进 `out`,认不出来就报错.
+fn collect_role_specs(node: &Node, out: &mut Vec<String>) -> Result<()> {
+    match &node.node {
+        Some(node::Node::RoleSpec(spec)) => {
+            out.push(role_spec(Some(spec))?);
+            Ok(())
+        }
+        Some(node::Node::List(list)) => {
+            for item in &list.items {
+                collect_role_specs(item, out)?;
+            }
+            Ok(())
+        }
+        _ => Err(unsupported(format!("{}", tr!("ir.irgen.202")))),
+    }
 }
 
 // ------------------------------------------------------------- CREATE INDEX

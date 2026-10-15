@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! <server-dist>/                     默认 ~/.ydbms(--server-dist 可换)
-//! ├── users.json                    用户表(见 [`crate::usr`])
+//! ├── users.json                    角色表(见 [`crate::usr`])
+//! ├── .users.lock                   改 roles.json 时的 flock(读-改-写期间持有)
 //! └── <库>/
 //!     ├── catalog.json              {version, name, owner, created_unix, settings}
 //!     ├── .lock                     单写者锁(flock;进程退出即释放)
@@ -14,6 +15,27 @@
 //! **一个目录 = 一个库**,这与 [`crate::pers`] 的既有约定一致,也方便手工检查.
 //! 表文件的读写规则**只在 [`crate::pers`] 一处**:这里只负责"库有哪些表,
 //! 谁建的,现在能不能打开",一次 `TablePath::new(dir, 表名)` 就把两者接上.
+//!
+//! # 谁能连:owner(含继承来的身份)或超级用户
+//!
+//! `catalog.json` 的 `owner` 是一个**角色名**;判定看的是
+//! [`roles::effective_roles`](crate::usr::roles::effective_roles)--当前角色自己,
+//! 加上(按 `INHERIT` 逐边判断)它属于的那些角色.超级用户不在这个闭包里,它与
+//! `owner` 是**并列**的两个放行条件.
+//!
+//! **权威判定在调用方**([`crate::cmd::engine::Store`]),因为"谁在连"是会话的事;
+//! 这里只把"这个角色名能不能连这个库"这句口径落成一处([`ServiceDir::open`] 里那
+//! 几行),别的角色的改,删,授权都交给 [角色操作](#角色操作)那一节.
+//!
+//! # 角色操作(`CREATE ROLE` / `ALTER ROLE` / `DROP ROLE` / `GRANT <角色>`)
+//!
+//! 这几条改的都是 `users.json`,而且是**读-改-写**:两个 `ysql` 进程(连着不同的库)
+//! 同时建角色就会丢更新,所以一律先拿 `<server-dist>/.users.lock`
+//! ([`ServiceDir::lock_users`],`try_lock`;拿不到就报错,不排队).
+//!
+//! 这一层只做**结构**上说得清的那几步:重名,找不到,成环,最后一个超级用户,
+//! 改名前的"干净角色"检查.**"谁有资格做这件事"不在这里**(那要看会话的当前角色,
+//! 由 `cmd` 的 `Store` 先判),与 `owner` 检查的既有分工一致.
 //!
 //! # `catalog.json` 是磁盘契约
 //!
@@ -44,7 +66,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{now_unix, User};
+use super::roles;
+use super::{
+    now_unix, unknown_role, PasswordAction, RoleAttrChange, RoleAttrs, User, UserStore,
+};
 use crate::db::phys::PhysTab;
 use crate::db::table::{is_file_stem_safe, DbError, Result, Table};
 use crate::pers::csv::promote;
@@ -58,6 +83,9 @@ pub const CATALOG_FILE: &str = "catalog.json";
 
 /// 单写者锁的文件名.
 pub const LOCK_FILE: &str = ".lock";
+
+/// 用户表的写锁文件名(`users.json` 是**全局**的,它自己那把锁).
+pub const USERS_LOCK_FILE: &str = ".users.lock";
 
 /// 提交意图的文件名(见 [`CommitIntent`]).
 pub const COMMIT_FILE: &str = "commit.json";
@@ -403,7 +431,7 @@ impl ServiceDir {
 
         // 目录在,`catalog.json` 不在:说清是"这不是本版建的库",而不是含糊的"库不存在"
         let catalog = Catalog::load(&dir)?;
-        if catalog.owner != user.name && !user.is_admin {
+        if !user.is_admin && !self.acts_as(&user.name, &catalog.owner)? {
             return Err(DbError::Denied {
                 message: format!("{}", tr!("usr.service.016", arg0 = 
                     name, arg1 =  catalog.owner, arg2 =  user.name
@@ -435,6 +463,274 @@ impl ServiceDir {
         // 改文件--必须在锁下做.
         database.recover()?;
         Ok(database)
+    }
+
+    // ------------------------------------------------------------ 角色(6.4)
+
+    /// 读 `users.json`,**文件不在**时给一句说得清的拒绝.
+    ///
+    /// 首次启动的 bootstrap 在 `ysql` 那一条路上(它先建出 `users.json` 才开会话),
+    /// 所以走到这里的"文件不在"只有两种:有人把它删了,或者会话是手工接线的.
+    /// 两种都不能悄悄当成"空用户表"--那样下一次启动会以为早就 bootstrap 过,
+    /// 谁都进不来.
+    fn load_users(&self) -> Result<UserStore> {
+        if !self.users_path().is_file() {
+            return Err(DbError::Denied {
+                message: format!("{}", tr!("usr.service.035", arg0 = 
+                    self.users_path().display()
+                )),
+            });
+        }
+        self.users()
+    }
+
+    /// `users.json` 的角色表(读一次,自己判"谁做什么").
+    ///
+    /// 认证只管"这个人是不是他",做不做得了某件事要看**当前角色**的属性与成员关系,
+    /// 所以 `cmd` 的 `Store` 每回都读一份新的--文件很小,而"另一个进程刚改过"
+    /// 比"缓存快一点"重要.
+    pub fn users(&self) -> Result<UserStore> {
+        UserStore::load(&self.users_path())
+    }
+
+    /// `role` 算不算 `owner`:owner 在它的**有效角色集**里.
+    ///
+    /// 有效角色集 = 自己 + 按 `INHERIT` 逐边继承来的那些身份
+    /// ([`roles::effective_roles`]);超级用户**不在**这个集合里,它与 owner 是并列的
+    /// 两个放行条件(调用方自己判超级用户).
+    ///
+    /// 没有 `users.json` 时只认他自己(手工/测试里手搓的角色,或者还没 bootstrap):
+    /// 这不是放行--owner 判定照旧要名字对得上.
+    pub fn acts_as(&self, role: &str, owner: &str) -> Result<bool> {
+        if role == owner {
+            return Ok(true);
+        }
+        if !self.users_path().is_file() {
+            return Ok(false);
+        }
+        Ok(roles::effective_roles(&self.users()?, role).contains(owner))
+    }
+
+    /// `users.json` 之外还记着这个角色名的地方:库的 owner,以及库里的授权记录.
+    ///
+    /// 返回库名(按字典序,去重).`DROP ROLE` 与 `ALTER ROLE ... RENAME TO` 靠它
+    /// 说清"卡在哪几个库":那些文件分散在各库目录里,而那些库可能正被别的进程锁着,
+    /// 所以**改不干净的地方就不改**,报错让用户自己去清.
+    ///
+    /// 读不出来就报错(不猜):`catalog.json` 坏了的库恰恰是最不该随手绕过的时候.
+    pub fn role_traces(&self, role: &str) -> Result<Vec<String>> {
+        let mut traces = Vec::new();
+        for database in self.databases()? {
+            if self.catalog(&database)?.owner == role {
+                traces.push(database);
+            }
+        }
+        Ok(traces)
+    }
+
+    /// 拿 `<server-dist>/.users.lock`(读-改-写期间持有).
+    ///
+    /// `try_lock`:**拿不到就报错,不排队**--另一个进程正在改用户表时等下去,
+    /// 只会把两个进程都挂住;与库的单写者锁同一个口径("宁可连不上,也不要写坏数据").
+    /// 锁随句柄走,返回值 drop 掉(函数返回)内核就放.
+    fn lock_users(&self) -> Result<File> {
+        let path = self.root.join(USERS_LOCK_FILE);
+        let lock = File::create(&path).map_err(|e| io_err(&path, e))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(lock),
+            Err(TryLockError::WouldBlock) => Err(DbError::Denied {
+                message: format!("{}", tr!("usr.service.021")),
+            }),
+            Err(TryLockError::Error(e)) => Err(io_err(&path, e)),
+        }
+    }
+
+    /// `CREATE USER` / `CREATE ROLE` / `CREATE GROUP`:读-改-写 `users.json`.
+    ///
+    /// `add_to` 是 `IN ROLE a, b` 那几个(建完顺手加成员)."谁有资格建角色"在
+    /// 调用方(`cmd` 的 `Store`)先判.
+    pub fn create_role(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        attrs: RoleAttrs,
+        add_to: &[String],
+    ) -> Result<String> {
+        let _lock = self.lock_users()?;
+        let path = self.users_path();
+        let mut store = self.load_users()?;
+
+        store.add(name, password, attrs)?;
+        for role in add_to {
+            if store.find(role).is_none() {
+                return Err(unknown_role(role));
+            }
+            store.add_membership(role, name)?;
+        }
+        store.save(&path)?;
+
+        let login = match attrs.login {
+            true => tr!("usr.service.022").into_owned(),
+            false => tr!("usr.service.023").into_owned(),
+        };
+        Ok(format!("{}", tr!("usr.service.024", arg0 =  name, arg1 =  login)))
+    }
+
+    /// `ALTER USER` / `ALTER ROLE`:改属性,换口令,改名.
+    ///
+    /// 改名要过**干净角色**那一关([`ServiceDir::role_traces`]),理由写在那里;
+    /// 摘掉最后一个超级用户也拒绝(与 bootstrap 的"否则谁都进不去"同一个道理).
+    /// 中途任何一条拒绝都发生在 `save` 之前,所以磁盘上一个字都没动.
+    pub fn alter_role(
+        &self,
+        name: &str,
+        new_name: Option<&str>,
+        password: PasswordAction,
+        changes: &[RoleAttrChange],
+    ) -> Result<String> {
+        let _lock = self.lock_users()?;
+        let path = self.users_path();
+        let mut store = self.load_users()?;
+
+        let mut attrs = store
+            .find(name)
+            .ok_or_else(|| unknown_role(name))?
+            .attrs();
+        for change in changes {
+            change.apply(&mut attrs);
+        }
+        if !attrs.admin && store.is_last_superuser(name) {
+            return Err(DbError::Denied {
+                message: format!("{}", tr!("usr.service.025", arg0 =  name)),
+            });
+        }
+
+        store.set_attrs(name, attrs)?;
+        match password {
+            PasswordAction::Unchanged => {}
+            PasswordAction::Clear => store.set_password(name, None)?,
+            PasswordAction::Set(ref text) => store.set_password(name, Some(text.as_str()))?,
+        }
+
+        let renamed = match new_name {
+            Some(new_name) if new_name != name => {
+                let traces = self.role_traces(name)?;
+                if !traces.is_empty() {
+                    return Err(DbError::Denied {
+                        message: format!("{}", tr!("usr.service.026", arg0 = 
+                            name, arg1 =  traces.join(",")
+                        )),
+                    });
+                }
+                store.rename(name, new_name)?;
+                true
+            }
+            _ => false,
+        };
+
+        store.save(&path)?;
+        let shown = match (renamed, new_name) {
+            (true, Some(new_name)) => format!("{}", tr!("usr.service.027", arg0 = 
+                name, arg1 =  new_name
+            )),
+            _ => format!("{}", tr!("usr.service.028", arg0 =  name)),
+        };
+        Ok(shown)
+    }
+
+    /// `DROP USER` / `DROP ROLE`(`IF EXISTS` 命中只发一句提示).
+    ///
+    /// 不放过:最后一个超级用户,拥有库的角色,还有在某个库里留着授权的角色--后两条
+    /// 都点名"卡在哪几个库"(理由见 [`ServiceDir::role_traces`])."别删自己"在
+    /// 调用方判(那是会话的事).
+    pub fn drop_roles(&self, names: &[String], if_exists: bool) -> Result<String> {
+        let _lock = self.lock_users()?;
+        let path = self.users_path();
+        let mut store = self.load_users()?;
+
+        let mut missing = Vec::new();
+        for name in names {
+            if store.find(name).is_none() {
+                if if_exists {
+                    missing.push(name.clone());
+                    continue;
+                }
+                return Err(unknown_role(name));
+            }
+            if store.is_last_superuser(name) {
+                return Err(DbError::Denied {
+                    message: format!("{}", tr!("usr.service.029", arg0 =  name)),
+                });
+            }
+            let traces = self.role_traces(name)?;
+            if !traces.is_empty() {
+                return Err(DbError::Denied {
+                    message: format!("{}", tr!("usr.service.030", arg0 = 
+                        name, arg1 =  traces.join(",")
+                    )),
+                });
+            }
+        }
+
+        let mut dropped = Vec::new();
+        for name in names {
+            if store.find(name).is_some() {
+                store.remove(name)?;
+                dropped.push(name.clone());
+            }
+        }
+        store.save(&path)?;
+
+        let mut parts = Vec::new();
+        if !dropped.is_empty() {
+            parts.push(format!("{}", tr!("usr.service.031", arg0 =  dropped.join(","))));
+        }
+        if !missing.is_empty() {
+            parts.push(format!("{}", tr!("usr.service.032", arg0 =  missing.join(","))));
+        }
+        Ok(parts.join(" "))
+    }
+
+    /// `GRANT <角色> TO <成员>` / `REVOKE <角色> FROM <成员>`.
+    ///
+    /// 成环由 [`UserStore::add_membership`] 拒绝;"谁有资格授角色"在调用方判.
+    pub fn grant_roles(
+        &self,
+        roles: &[String],
+        members: &[String],
+        is_grant: bool,
+    ) -> Result<String> {
+        let _lock = self.lock_users()?;
+        let path = self.users_path();
+        let mut store = self.load_users()?;
+
+        for role in roles {
+            if store.find(role).is_none() {
+                return Err(unknown_role(role));
+            }
+        }
+        for member in members {
+            if store.find(member).is_none() {
+                return Err(unknown_role(member));
+            }
+            for role in roles {
+                if is_grant {
+                    store.add_membership(role, member)?;
+                } else {
+                    store.remove_membership(role, member)?;
+                }
+            }
+        }
+        store.save(&path)?;
+
+        Ok(match is_grant {
+            true => format!("{}", tr!("usr.service.033", arg0 = 
+                roles.join(","), arg1 =  members.join(",")
+            )),
+            false => format!("{}", tr!("usr.service.034", arg0 = 
+                roles.join(","), arg1 =  members.join(",")
+            )),
+        })
     }
 }
 

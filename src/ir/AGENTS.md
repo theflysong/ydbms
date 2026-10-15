@@ -135,26 +135,53 @@ PhysTab                          ← db::source::materialize
 `CHECK` 与索引**不落盘**(它们不是列定义:`CHECK` 是程序,索引是会话级目录对象).
 `DEFAULT` 在 [`Column`](crate::db::table::Column) 里,跟着模式文件走.
 
-### 库(`CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE`):一个口子,不是文件系统
+### 库与角色(`CREATE/DROP/ALTER DATABASE`,`CREATE/ALTER/DROP ROLE`,`GRANT`):一个口子,不是文件系统
 
 语句层**不认识文件系统**:`Stmt::CreateDatabase` / `DropDatabase` /
-`AlterDatabase` 只把名字(与 `search_path` 的取值)交给
-[`Databases`](stmt.rs)(`create_database` / `drop_database` /
-`set_database_search_path`,返回**给用户看的一行状态**--owner 是谁不归语句层管),
-建目录,写 `catalog.json`,owner 检查都在实现方(`cmd` 的 `Store`,背后是
-`usr::service`).四条规矩:
+`AlterDatabase` / `CreateRole` / `AlterRole` / `DropRole` / `GrantRole` / `SetRole`
+只把名字(与 `search_path` 的取值,或者角色名与口令)交给
+[`Server`](stmt.rs),返回**给用户看的一行状态**--owner 是谁,`users.json` 长什么样
+都不归语句层管.建目录,写 `catalog.json` / `users.json`,以及**权限判定**,都在实现方
+(`cmd` 的 `Store`,背后是 `usr::service` / `usr::roles`).六条规矩:
 
-- **内存模式明确拒绝**:`NoDatabases` 报 `DbError::Denied`.不假装成功,也不"接受但记下来"
+- **当前角色要显式传进去**:每个方法都收一个 `role: &str`,它是
+  `SymbolTable::role()`--`SET ROLE` 之后它与"认证过的会话用户"不是一个人.
+  **只有一个来源**(符号表),别让实现方自己缓存一份;
+- **`resolve_role` 与 `check_*` 是"问",别的都是"做"**:问的那些在内存模式下一律
+  放行(没有用户),做的那些一律 `Denied`("这个会话没有服务目录");
+- **内存模式明确拒绝**:`NoServer` 报 `DbError::Denied`.不假装成功,也不"接受但记下来"
   --库不在任何人的磁盘上,那样会让同一份脚本在 `ysql` 里行为完全不同;
 - **事务里一律拒绝**(`reject_in_transaction`):它们改的是**服务目录**,而撤销记录只管
   符号表--`ROLLBACK` 盖不回一个已经改过的目录.判的是**显式**事务(每条语句都被引擎
   包了一个隐式事务,用 `in_transaction()` 会把事务外的语句也一起挡掉);
 - **现有签名不动**:`execute_stmt` / `Script::run_one` / `run_script` 都保持原样
-  (内部转调 `*_with`,默认实现就是 `NoDatabases`),于是几十处调用方与测试一行不用改;
-  加新的"外部世界"语句时照这个办法办;
+  (内部转调 `*_with`,默认实现就是 `NoServer`),于是几十处调用方与测试一行不用改;
+  加新的"外部世界"语句时照这个办法办;**口令不许回显**:`Script::run_one_with` 把
+  `CREATE/ALTER ROLE ... PASSWORD` 的回显文本换成 `PASSWORD '***'`
+  (语句原文会被引擎逐条打出来,而那里面就是口令);
 - **选项一律显式拒绝**(`ENCODING` / `OWNER` / `RENAME` / `WITH FORCE`...):本版只建
   **空库**,建出来的库目录里只有 `catalog.json`;`ALTER DATABASE` 只认
   `SET search_path TO ...` 与 `RESET search_path`.
+- **角色那几条的选项也是显式拒绝的**:`PASSWORD` / `SUPERUSER` / `CREATEDB` /
+  `CREATEROLE` / `INHERIT` / `IN ROLE` 之外(`VALID UNTIL`,`CONNECTION LIMIT`,
+  `SYSID`,`ADMIN`,`IN GROUP`...)一律 `Unsupported`;`ALTER ROLE r RENAME TO s` 在
+  语法树里是 **`RenameStmt`**(不是带 `action` 的 `AlterRoleStmt`),别的 `RENAME`
+  照旧拒绝;`GRANT <角色> TO <成员>` 的 `granted_roles` 里那半个名字**实测是
+  `AccessPriv` 而不是 `RoleSpec`**,两种都得认(见 `granted_role_name`).
+
+### 语句里查权限:一处入口,只查该查的
+
+权限检查全在 `run_stmt` 里(执行的唯一入口),**动数据之前**:
+
+- `SELECT` / `INSERT` / `UPDATE` 按**表与列**查(`check_table`,列集合为空 = "这张表上
+  至少有一列的该权限");
+- `CREATE TABLE` / `CREATE INDEX` / `DROP INDEX` / `CREATE SCHEMA` / `DROP SCHEMA`
+  查 `check_ddl`(owner 含继承,或超级用户);
+- `CREATE DATABASE` 查 `check_create_database`(`CREATEDB` 或超级用户);
+- 库与角色那几条的判定在实现方(它们本来就只走那个口子).
+
+内存模式([`NoServer`](stmt.rs))放行 `check_*`--**这不是"忘了查"**,是内存里没有用户,
+键盘前的人就是主人;而改服务目录的语句在内存模式下一律拒绝.
 
 ### 事务:撤销记录在符号表里,每条语句自成一个隐式事务(4.1)
 

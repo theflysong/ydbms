@@ -400,6 +400,11 @@ fn bob() -> User {
         password_hash: String::new(),
         is_admin: true,
         created_unix: 0,
+        can_login: true,
+        can_create_db: true,
+        can_create_role: true,
+        inherit: true,
+        member_of: Vec::new(),
     }
 }
 

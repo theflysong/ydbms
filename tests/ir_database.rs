@@ -1,44 +1,108 @@
-//! `CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE` 在**语句层**的 testbench.
+//! 库与角色那几条语句在**语句层**的 testbench.
 //!
 //! 用一个"只在内存里记名字"的假服务目录证明两件事:
 //!
-//! * 语句层对文件系统**一无所知**--它只把名字(与 `search_path` 的取值)交给
-//!   [`Databases`];
+//! * 语句层对文件系统**一无所知**--它只把名字(与 `search_path` 的取值,或者
+//!   角色名与口令)交给 [`Server`];
 //! * 没有服务目录时(`ydbms` 那个实验终端,绝大多数测试)这几条语句**明确拒绝**,
-//!   不是静默无操作.
+//!   不是静默无操作;表/Schema 的**权限检查**则一律放行(内存里没有用户).
 //!
-//! 真的建目录,写 `catalog.json` 在 `tests/usr_service.rs`,跨进程在 `tests/ysql_cli.rs`.
+//! 真的建目录,写 `catalog.json` / `users.json` 在 `tests/usr_service.rs` 与
+//! `tests/usr_roles.rs`,跨进程在 `tests/ysql_cli.rs`.
 
 use ydbms::db::table::{DbError, Result};
-use ydbms::ir::{run_script, Databases, Script, SymbolTable};
+use ydbms::ir::{
+    run_script, AlterRoleRequest, CreateRoleRequest, GrantRoleRequest, Script, Server, SymbolTable,
+};
 
-/// 假的服务目录:记下被建 / 被删 / 被改的名字.
+/// 假的服务目录:记下被建 / 被删 / 被改的名字,以及角色那几条的入参.
 #[derive(Debug, Default)]
 struct FakeDbs {
     created: Vec<String>,
     dropped: Vec<(String, bool)>,
     settings: Vec<(String, Vec<String>)>,
+    roles: Vec<CreateRoleRequest>,
+    altered: Vec<AlterRoleRequest>,
+    dropped_roles: Vec<(String, bool)>,
+    memberships: Vec<GrantRoleRequest>,
+    /// 记下"谁做了什么",用来证明权限判定确实被问过.
+    checks: Vec<String>,
 }
 
-impl Databases for FakeDbs {
-    fn create_database(&mut self, name: &str) -> Result<String> {
+impl Server for FakeDbs {
+    fn create_database(&mut self, _role: &str, name: &str) -> Result<String> {
         self.created.push(name.to_string());
         Ok(format!("假服务目录:库 {} 已建", name))
     }
 
-    fn drop_database(&mut self, name: &str, if_exists: bool) -> Result<String> {
+    fn drop_database(&mut self, _role: &str, name: &str, if_exists: bool) -> Result<String> {
         self.dropped.push((name.to_string(), if_exists));
         Ok(format!("假服务目录:库 {} 已删", name))
     }
 
-    fn set_database_search_path(&mut self, name: &str, path: &[String]) -> Result<String> {
+    fn set_database_search_path(
+        &mut self,
+        _role: &str,
+        name: &str,
+        path: &[String],
+    ) -> Result<String> {
         self.settings.push((name.to_string(), path.to_vec()));
         Ok(format!("假服务目录:库 {} 的 search_path 已记下", name))
+    }
+
+    fn create_role(&mut self, _role: &str, request: &CreateRoleRequest) -> Result<String> {
+        self.roles.push(request.clone());
+        Ok(format!("假服务目录:角色 {} 已建", request.name))
+    }
+
+    fn alter_role(&mut self, _role: &str, request: &AlterRoleRequest) -> Result<String> {
+        self.altered.push(request.clone());
+        Ok(format!("假服务目录:角色 {} 已改", request.name))
+    }
+
+    fn drop_role(
+        &mut self,
+        _role: &str,
+        _what: &'static str,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<String> {
+        for name in names {
+            self.dropped_roles.push((name.clone(), if_exists));
+        }
+        Ok(format!("假服务目录:角色 {} 已删", names.join(",")))
+    }
+
+    fn grant_role(&mut self, _role: &str, request: &GrantRoleRequest) -> Result<String> {
+        self.memberships.push(request.clone());
+        Ok(format!(
+            "假服务目录:{} {} → {}",
+            match request.is_grant {
+                true => "授",
+                false => "收",
+            },
+            request.roles.join(","),
+            request.members.join(",")
+        ))
+    }
+
+    fn resolve_role(&mut self, current: &str, target: Option<&str>) -> Result<String> {
+        Ok(target.unwrap_or(current).to_string())
+    }
+
+    fn check_ddl(&mut self, role: &str, what: &str) -> Result<()> {
+        self.checks.push(format!("ddl:{role}:{what}"));
+        Ok(())
+    }
+
+    fn check_create_database(&mut self, role: &str) -> Result<()> {
+        self.checks.push(format!("createdb:{role}"));
+        Ok(())
     }
 }
 
 /// 逐条跑一段 SQL,`CREATE/DROP DATABASE` 交给 `dbs`.
-fn run_with(sql: &str, dbs: &mut dyn Databases) -> Vec<String> {
+fn run_with(sql: &str, dbs: &mut dyn Server) -> Vec<String> {
     let mut symbols = SymbolTable::new();
     let script = Script::parse(sql).expect("解析");
     (0..script.len())
@@ -99,7 +163,7 @@ fn database_options_are_refused_rather_than_ignored() {
 
 #[test]
 fn a_memory_script_refuses_database_statements() {
-    // `run_script` 走的是 NoDatabases:没有服务目录就明确拒绝
+    // `run_script` 走的是 NoServer:没有服务目录就明确拒绝
     for (sql, what) in [
         ("CREATE DATABASE filmdb;", "CREATE DATABASE"),
         ("ALTER DATABASE filmdb SET search_path TO study;", "ALTER DATABASE"),

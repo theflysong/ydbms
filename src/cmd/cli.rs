@@ -18,8 +18,9 @@
 //!
 //! # 首次启动的 bootstrap
 //!
-//! 服务目录里没有 `users.json` 时,把这次 `-U` 指定的用户建成**管理员**
-//! (否则谁都进不去),并按"没有 `-d` 时默认库 = 用户同名"的规矩把默认库也建出来.
+//! 服务目录里没有 `users.json` 时,把这次 `-U` 指定的用户建成**超级用户**
+//! (`LOGIN` + `CREATEDB` + `CREATEROLE` + `INHERIT`,照 initdb 的口径,否则谁都
+//! 进不去),并按"没有 `-d` 时默认库 = 用户同名"的规矩把默认库也建出来.
 //! **显式给了 `-d` 而库不存在**则报错(建库只有 `CREATE DATABASE` 一条路,
 //! 而它要先连上一个库)--这条"没有 `-d` 就自动建"的例外是两个都需要的折中,
 //! 写在这里,也在 `--help` 里.
@@ -54,7 +55,7 @@ use std::path::PathBuf;
 use super::engine::Session;
 use super::repl;
 use crate::usr::service::ServiceDir;
-use crate::usr::{User, UserStore};
+use crate::usr::{RoleAttrs, User, UserStore};
 
 /// `-h` / `--help` 打出来的帮助;参数报错时也把它跟在后面.
 ///
@@ -294,7 +295,7 @@ fn authenticate(
 
         let mut store = UserStore::empty();
         let user = store
-            .add(&args.user, &password, true)
+            .add(&args.user, Some(&password), RoleAttrs::bootstrap())
             .map_err(|e| format!("{}", tr!("cmd.cli.019", e = e)))?
             .clone();
         store

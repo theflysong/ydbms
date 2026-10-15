@@ -157,6 +157,12 @@ pub struct SymbolTable {
     schemas: Vec<String>,
     /// 当前 `search_path`;**空**表示不加前缀(默认,行为与过去完全一致).
     search_path: Vec<String>,
+    /// **当前角色**:权限检查看的就是它([`crate::ir::stmt::Server`] 的口径).
+    ///
+    /// 它是**会话状态**(与 `search_path` 一样),不是目录:事务开始时随目录快照一起
+    /// 记下,`ROLLBACK` 盖回去(`SET ROLE` 是能回滚的,PostgreSQL 也是).
+    /// 打开库时由引擎设成**会话用户**(认证过的那个名字).
+    role: String,
     /// 进行中的事务(没有就是 `None`).撤销记录在这里,见文件头.
     tx: Option<Tx>,
 }
@@ -207,7 +213,7 @@ impl fmt::Debug for Tx {
     }
 }
 
-/// 事务开始时的目录:符号(只有名字),索引,schema 名,`search_path`.
+/// 事务开始时的目录:符号(只有名字),索引,schema 名,`search_path`,当前角色.
 ///
 /// **数据不在里面**--它按需整表克隆(见 [`SymbolTable::snapshot_before_write`]).
 struct CatalogSnapshot {
@@ -215,6 +221,8 @@ struct CatalogSnapshot {
     indexes: Vec<IndexSymbol>,
     schemas: Vec<String>,
     search_path: Vec<String>,
+    /// 当前角色(`SET ROLE` 也要能被 `ROLLBACK` 盖回去).
+    role: String,
 }
 
 /// 目录快照里的一条符号.关系的**数据**不在快照里,只留名字.
@@ -239,6 +247,7 @@ impl SymbolTable {
             indexes: Vec::new(),
             schemas: Vec::new(),
             search_path: Vec::new(),
+            role: String::new(),
             tx: None,
         }
     }
@@ -464,6 +473,7 @@ impl SymbolTable {
             indexes: self.indexes.clone(),
             schemas: self.schemas.clone(),
             search_path: self.search_path.clone(),
+            role: self.role.clone(),
         }
     }
 
@@ -540,6 +550,7 @@ impl SymbolTable {
         self.indexes = tx.catalog.indexes;
         self.schemas = tx.catalog.schemas;
         self.search_path = tx.catalog.search_path;
+        self.role = tx.catalog.role;
 
         // 4) 索引是"键 → 行号":行号可能已经变了,一律作废,下次用到时重建.
         //    这一步不能省--留着就是拿旧行号回答新键,一个安静的错答案.
@@ -764,6 +775,22 @@ impl SymbolTable {
     /// 当前 `search_path`.
     pub fn search_path(&self) -> &[String] {
         &self.search_path
+    }
+
+    /// 当前角色(`SET ROLE` 之后就是它).
+    ///
+    /// 权限检查拿它去问 [`crate::ir::stmt::Server`];打开库时是**会话用户**,
+    /// 内存模式下是空串(那时没有任何检查).
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// 换当前角色(`SET ROLE` / `RESET ROLE`).
+    ///
+    /// 它随事务的目录快照一起被记下,所以 `ROLLBACK` 会盖回去--与 `search_path`
+    /// 同一套.(校验"能不能借这个身份"不在这里,那是 [`crate::ir::stmt::Server`] 的事.)
+    pub fn set_role(&mut self, role: impl Into<String>) {
+        self.role = role.into();
     }
 
     /// 登记过的 schema 名.

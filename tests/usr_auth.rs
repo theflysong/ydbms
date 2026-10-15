@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ydbms::usr::{hash, AuthError, UserStore};
+use ydbms::usr::{hash, AuthError, RoleAttrs, UserStore};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -90,7 +90,7 @@ fn users_json_holds_no_plaintext_and_round_trips() {
     let path = dir.users();
 
     let mut store = UserStore::empty();
-    store.add("bob", "hunter2", true).expect("加用户");
+    store.add("bob", Some("hunter2"), RoleAttrs::bootstrap()).expect("加用户");
     store.save(&path).expect("写 users.json");
 
     let raw = std::fs::read_to_string(&path).expect("读回");
@@ -131,7 +131,7 @@ fn a_missing_users_json_is_not_the_same_as_an_empty_one() {
 #[test]
 fn an_unknown_user_is_refused() {
     let mut store = UserStore::empty();
-    store.add("bob", "hunter2", true).unwrap();
+    store.add("bob", Some("hunter2"), RoleAttrs::bootstrap()).unwrap();
 
     assert!(matches!(
         store.authenticate("alice", "hunter2"),
@@ -142,7 +142,7 @@ fn an_unknown_user_is_refused() {
 #[test]
 fn a_corrupt_salt_is_reported_as_corrupt() {
     let mut store = UserStore::empty();
-    store.add("bob", "hunter2", true).unwrap();
+    store.add("bob", Some("hunter2"), RoleAttrs::bootstrap()).unwrap();
     store.users[0].salt = "not-hex".to_string();
 
     assert!(matches!(
@@ -154,16 +154,19 @@ fn a_corrupt_salt_is_reported_as_corrupt() {
 #[test]
 fn a_second_user_can_be_added_but_not_a_duplicate_or_an_empty_password() {
     let mut store = UserStore::empty();
-    store.add("bob", "hunter2", true).expect("第一个用户");
+    store.add("bob", Some("hunter2"), RoleAttrs::bootstrap()).expect("第一个用户");
 
     // 第二个用户:不是管理员也能加(本版没有 CREATE USER,靠库 API / 手工编辑)
-    let alice = store.add("alice", "correct horse", false).expect("第二个用户");
+    let alice = store.add("alice", Some("correct horse"), RoleAttrs::user()).expect("第二个用户");
     assert!(!alice.is_admin);
     assert!(store.authenticate("alice", "correct horse").is_ok());
 
-    assert!(store.add("bob", "other", false).is_err(), "重名要拒绝");
-    assert!(store.add("carol", "", false).is_err(), "空口令要拒绝");
-    assert!(store.add("  ", "x", false).is_err(), "空用户名要拒绝");
+    assert!(store.add("bob", Some("other"), RoleAttrs::user()).is_err(), "重名要拒绝");
+    assert!(
+        store.add("carol", Some(""), RoleAttrs::user()).is_err(),
+        "空口令要拒绝"
+    );
+    assert!(store.add("  ", Some("x"), RoleAttrs::user()).is_err(), "空用户名要拒绝");
 }
 
 #[test]

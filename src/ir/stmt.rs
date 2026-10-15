@@ -41,6 +41,7 @@ use super::expr::Prog;
 use super::plan::Plan;
 use super::symbol::{SymbolTable, TxKind};
 use super::{exec, irgen};
+use crate::usr::{Password, PasswordAction, RoleAttrChange, RoleAttrs};
 
 /// 一条语句.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +153,7 @@ pub enum Stmt {
     /// `CREATE DATABASE name`:在**服务目录**下建一个库.
     ///
     /// 语句层不认识文件系统,也不该认识:这里只把名字交出去,真正建目录,写
-    /// `catalog.json`(含 owner)的是 [`Databases`] 的实现.
+    /// `catalog.json`(含 owner)的是 [`Server`] 的实现.
     CreateDatabase {
         /// 库名.
         name: String,
@@ -168,7 +169,7 @@ pub enum Stmt {
 
     /// `ALTER DATABASE name SET search_path TO ...`:改**库级**的会话默认值.
     ///
-    /// 同样只把名字与取值交出去(见 [`Databases::set_database_search_path`]):
+    /// 同样只把名字与取值交出去(见 [`Server::set_database_search_path`]):
     /// 写进哪个文件,什么格式,语句层不知道也不该知道.
     ///
     /// 它**只影响以后的连接**--当前会话的 `search_path` 不动(与 PostgreSQL 一致).
@@ -178,6 +179,76 @@ pub enum Stmt {
         /// 新的库级默认 `search_path`;**空**表示清掉(`RESET` / `TO DEFAULT`).
         search_path: Vec<String>,
     },
+
+    /// `CREATE USER` / `CREATE ROLE` / `CREATE GROUP`:建一个角色.
+    ///
+    /// 与库那几条一样,语句层只把"名字,口令,属性"交出去(见
+    /// [`Server::create_role`])--`users.json` 长什么样不归它管."谁有资格建角色"
+    /// 也在实现方.
+    CreateRole(CreateRoleRequest),
+
+    /// `ALTER USER` / `ALTER ROLE`:改属性,换口令,改名.
+    AlterRole(AlterRoleRequest),
+
+    /// `DROP USER` / `DROP ROLE`:删角色(可以一次删好几个).
+    DropRole {
+        /// 语句里的那个词(`DROP USER` / `DROP ROLE`),报错时照实说.
+        what: &'static str,
+        /// 要删的名字.
+        names: Vec<String>,
+        /// 语句里写了 `IF EXISTS`.
+        if_exists: bool,
+    },
+
+    /// `GRANT <角色> TO <成员>` / `REVOKE <角色> FROM <成员>`:成员关系.
+    GrantRole(GrantRoleRequest),
+
+    /// `SET ROLE <角色>` / `SET ROLE NONE` / `RESET ROLE`.
+    ///
+    /// `None` 表示回到**会话用户**(也就是连接时认证的那个人).这是**会话状态**,
+    /// 存在符号表里,于是事务回滚能把它盖回去(与 `search_path` 同一套).
+    SetRole(Option<String>),
+}
+
+/// `CREATE USER` / `CREATE ROLE` / `CREATE GROUP` 降级出来的东西.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRoleRequest {
+    /// 语句里那个词(`CREATE USER` / `CREATE ROLE` / `CREATE GROUP`).
+    pub what: &'static str,
+    /// 角色名.
+    pub name: String,
+    /// 口令;`None` = 没写(`PASSWORD NULL` 也是 `None`,两者在这里同义).
+    pub password: Option<Password>,
+    /// 属性(已经按语句类型补过默认值).
+    pub attrs: RoleAttrs,
+    /// `IN ROLE a, b`:建完把它加进这些角色的成员里.
+    pub add_to: Vec<String>,
+}
+
+/// `ALTER USER` / `ALTER ROLE` 降级出来的东西.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterRoleRequest {
+    /// 语句里那个词(`ALTER USER` / `ALTER ROLE`).
+    pub what: &'static str,
+    /// 角色名.
+    pub name: String,
+    /// `RENAME TO <新名>`.
+    pub new_name: Option<String>,
+    /// 口令那一下.
+    pub password: PasswordAction,
+    /// 要改的属性(只改列出来的这几条).
+    pub changes: Vec<RoleAttrChange>,
+}
+
+/// `GRANT <角色> TO <成员>` / `REVOKE <角色> FROM <成员>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRoleRequest {
+    /// 受权的角色(`GRANT a, b TO ...` 里的 `a, b`).
+    pub roles: Vec<String>,
+    /// 成员.
+    pub members: Vec<String>,
+    /// `true` 是 `GRANT`,`false` 是 `REVOKE`.
+    pub is_grant: bool,
 }
 
 /// 事务控制语句的三种.
@@ -205,39 +276,85 @@ impl TxOp {
     }
 }
 
-/// `CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE` 的落点.
+/// 服务目录那一层的落点:库,角色,以及"当前角色能不能做这件事".
 ///
-/// **为什么是一个 trait**:这几条语句改的是**服务目录**(目录树,`catalog.json`,
-/// owner),而语句层只认识符号表.于是这里留一个最小的口子,由会话那一层
+/// **为什么是一个 trait**:这些语句改的是**服务目录**(目录树,`catalog.json`,
+/// `users.json`),而语句层只认识符号表.于是这里留一个最小的口子,由会话那一层
 /// (`cmd` 的 `Session`,背后是 `usr::service::{ServiceDir, Database}`)实现;
-/// 内存模式(`ydbms` 那个实验终端,以及各处的测试)用 [`NoDatabases`]
+/// 内存模式(`ydbms` 那个实验终端,以及各处的测试)用 [`NoServer`]
 /// **明确拒绝**这些语句--不是静默无操作,也不是假装成功.
 ///
 /// 返回值是**给用户看的一行状态**(例:`库 filmdb 已建(owner bob)`),
 /// 语句层把它包成 [`Outcome::NoOp`]--语句层不该知道 owner 是谁.
-pub trait Databases {
+///
+/// # 三种方法各管一摊
+///
+/// * `create_*` / `drop_*` / `set_*` / `grant_*`:**做**(读-改-写服务目录);
+/// * `resolve_role` / `check_*`:**问**(这个角色是谁,能不能做这件事)--
+///   "谁在连"是会话的事,所以判定在实现方,与 `owner` 检查的既有分工一致.
+///
+/// **内存模式要分清两种答复**:`check_*` 一律**放行**(内存里没有用户,键盘前的
+/// 人就是主人),而"改服务目录"的那些一律 `Denied`("这个会话没有服务目录").
+pub trait Server {
     /// 建库,返回一行状态.
-    fn create_database(&mut self, name: &str) -> Result<String>;
+    ///
+    /// `role` 是**当前角色**(`SymbolTable::role()`)--权限判定看它,不是看认证过的
+    /// 那个人(`SET ROLE` 之后两者不同).每个方法都收它,是为了让"当前角色"只有
+    /// 符号表一个来源,不让实现方自己缓存一份.
+    fn create_database(&mut self, role: &str, name: &str) -> Result<String>;
 
     /// 删库,返回一行状态.
-    fn drop_database(&mut self, name: &str, if_exists: bool) -> Result<String>;
+    fn drop_database(&mut self, role: &str, name: &str, if_exists: bool) -> Result<String>;
 
     /// 记下库级的默认 `search_path`(`ALTER DATABASE ... SET search_path ...`).
     ///
     /// `path` 为空表示**清掉**这个默认值(`RESET` / `TO DEFAULT`).名字与取值都已
     /// 在语句层解好(那是 SQL 语法的事),这里只管"记到哪儿".
-    fn set_database_search_path(&mut self, name: &str, path: &[String]) -> Result<String>;
+    fn set_database_search_path(&mut self, role: &str, name: &str, path: &[String]) -> Result<String>;
+
+    /// 建一个角色,返回一行状态.
+    fn create_role(&mut self, role: &str, request: &CreateRoleRequest) -> Result<String>;
+
+    /// 改一个角色(属性,口令,改名),返回一行状态.
+    fn alter_role(&mut self, role: &str, request: &AlterRoleRequest) -> Result<String>;
+
+    /// 删角色(可以一次删好几个),返回一行状态.
+    fn drop_role(
+        &mut self,
+        role: &str,
+        what: &'static str,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<String>;
+
+    /// 授 / 收成员关系,返回一行状态.
+    fn grant_role(&mut self, role: &str, request: &GrantRoleRequest) -> Result<String>;
+
+    /// `SET ROLE` 的目标解析成哪个角色名.
+    ///
+    /// `current` 是**会话当前的**角色名,`target` 是 `SET ROLE` 后面那个名字
+    /// (`None` = `SET ROLE NONE` / `RESET ROLE`,回到会话用户).校验(角色在不在,
+    /// 当前角色是不是它的成员,超级用户放行)在实现方--它才知道"会话用户是谁".
+    fn resolve_role(&mut self, current: &str, target: Option<&str>) -> Result<String>;
+
+    /// 当前角色能不能在这个库里动结构(`CREATE TABLE` / `CREATE INDEX` / ...).
+    ///
+    /// `what` 是语句名(`"CREATE TABLE"`),只为报错时说得具体.
+    fn check_ddl(&mut self, role: &str, what: &str) -> Result<()>;
+
+    /// 当前角色能不能建库(`CREATE DATABASE`).
+    fn check_create_database(&mut self, role: &str) -> Result<()>;
 }
 
-/// 没有服务目录时的 [`Databases`]:这些语句都**明确拒绝**.
+/// 没有服务目录时的 [`Server`]:这些语句都**明确拒绝**.
 ///
 /// 内存模式的 `ydbms` 与所有单元测试都走它.之所以不"接受但记下来":库不在任何人
 /// 的磁盘上,假装建了会让脚本在换到 `ysql` 时行为完全不同.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct NoDatabases;
+pub struct NoServer;
 
-impl Databases for NoDatabases {
-    fn create_database(&mut self, name: &str) -> Result<String> {
+impl Server for NoServer {
+    fn create_database(&mut self, _role: &str, name: &str) -> Result<String> {
         Err(DbError::Denied {
             message: format!("{}", tr!("ir.stmt.001", arg0 = 
                 name
@@ -245,7 +362,7 @@ impl Databases for NoDatabases {
         })
     }
 
-    fn drop_database(&mut self, name: &str, _if_exists: bool) -> Result<String> {
+    fn drop_database(&mut self, _role: &str, name: &str, _if_exists: bool) -> Result<String> {
         Err(DbError::Denied {
             message: format!("{}", tr!("ir.stmt.002", arg0 = 
                 name
@@ -253,12 +370,57 @@ impl Databases for NoDatabases {
         })
     }
 
-    fn set_database_search_path(&mut self, name: &str, _path: &[String]) -> Result<String> {
+    fn set_database_search_path(&mut self, _role: &str, name: &str, _path: &[String]) -> Result<String> {
         Err(DbError::Denied {
             message: format!("{}", tr!("ir.stmt.003", arg0 = 
                 name
             )),
         })
+    }
+
+    fn create_role(&mut self, _role: &str, request: &CreateRoleRequest) -> Result<String> {
+        Err(no_service_dir(request.what))
+    }
+
+    fn alter_role(&mut self, _role: &str, request: &AlterRoleRequest) -> Result<String> {
+        Err(no_service_dir(request.what))
+    }
+
+    fn drop_role(
+        &mut self,
+        _role: &str,
+        what: &'static str,
+        _names: &[String],
+        _if_exists: bool,
+    ) -> Result<String> {
+        Err(no_service_dir(what))
+    }
+
+    fn grant_role(&mut self, _role: &str, request: &GrantRoleRequest) -> Result<String> {
+        Err(no_service_dir(match request.is_grant {
+            true => "GRANT",
+            false => "REVOKE",
+        }))
+    }
+
+    fn resolve_role(&mut self, _current: &str, _target: Option<&str>) -> Result<String> {
+        Err(no_service_dir("SET ROLE"))
+    }
+
+    // 内存里没有用户,键盘前的人就是主人:权限检查**放行**.
+    fn check_ddl(&mut self, _role: &str, _what: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn check_create_database(&mut self, _role: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// "这个会话没有服务目录"的那一条(内存模式下改服务目录的语句共用).
+fn no_service_dir(what: &str) -> DbError {
+    DbError::Denied {
+        message: format!("{}", tr!("ir.stmt.017", arg0 =  what)),
     }
 }
 
@@ -344,9 +506,9 @@ pub struct StmtResult {
 /// 在符号表上执行一条语句,**没有服务目录**(见 [`execute_stmt_with`]).
 ///
 /// 内存模式与绝大多数调用方走它:`CREATE DATABASE` / `DROP DATABASE` 由
-/// [`NoDatabases`] 明确拒绝.
+/// [`NoServer`] 明确拒绝.
 pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
-    execute_stmt_with(stmt, symbols, &mut NoDatabases)
+    execute_stmt_with(stmt, symbols, &mut NoServer)
 }
 
 /// 在符号表上执行一条语句,`CREATE DATABASE` / `DROP DATABASE` / `ALTER DATABASE`
@@ -369,7 +531,7 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
 pub fn execute_stmt_with(
     stmt: &Stmt,
     symbols: &mut SymbolTable,
-    dbs: &mut dyn Databases,
+    dbs: &mut dyn Server,
 ) -> Result<Outcome> {
     let implicit = !symbols.in_transaction();
     if implicit {
@@ -390,7 +552,7 @@ pub fn execute_stmt_with(
 }
 
 /// 一条语句的实际执行([`execute_stmt_with`] 去掉隐式事务那一层).
-fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> Result<Outcome> {
+fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Result<Outcome> {
     match stmt {
         Stmt::Query(plan) => Ok(Outcome::Rows(exec::execute(plan, symbols)?)),
 
@@ -401,6 +563,10 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> 
             unenforced,
             checks,
         } => {
+            // 动结构先问权限:本版把"库里能动结构的人"定为 owner(含继承来的身份)
+            // 或超级用户,表级授权**不**附带这条(见 `ir/AGENTS.md`).
+            dbs.check_ddl(symbols.role(), "CREATE TABLE")?;
+
             // 真实的名字由符号表定(`search_path` 决定要不要加前缀),报告的,
             // 判重的都是**它**--不然 `CREATE TABLE movies` 会说成 `movies`,
             // 而表其实叫 `study.movies`.
@@ -572,6 +738,7 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> 
             column,
             if_not_exists,
         } => {
+            dbs.check_ddl(symbols.role(), "CREATE INDEX")?;
             symbols.create_index(name, table, *column, *if_not_exists)?;
 
             // 报告里写清"建在哪张表的哪一列,多少个键"--索引是个真东西,不是记号
@@ -595,6 +762,7 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> 
         }
 
         Stmt::DropIndex { name, if_exists } => {
+            dbs.check_ddl(symbols.role(), "DROP INDEX")?;
             let dropped = symbols.drop_index(name, *if_exists)?;
             Ok(Outcome::NoOp {
                 message: format!("{}", tr!("ir.stmt.009", arg0 =  dropped)),
@@ -650,6 +818,7 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> 
             name,
             if_not_exists,
         } => {
+            dbs.check_ddl(symbols.role(), "CREATE SCHEMA")?;
             symbols.create_schema(name, *if_not_exists)?;
             Ok(Outcome::NoOp {
                 message: format!("{}", tr!("ir.stmt.013", arg0 =  name)),
@@ -661,6 +830,7 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> 
             if_exists,
             cascade,
         } => {
+            dbs.check_ddl(symbols.role(), "DROP SCHEMA")?;
             let dropped = symbols.drop_schema(name, *if_exists, *cascade)?;
             Ok(Outcome::NoOp {
                 message: format!("{}", tr!("ir.stmt.014", arg0 =  name, arg1 =  dropped)),
@@ -681,15 +851,16 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> 
         // (PostgreSQL 也是"不能在事务块里跑").
         Stmt::CreateDatabase { name } => {
             reject_in_transaction(symbols, "CREATE DATABASE")?;
+            dbs.check_create_database(symbols.role())?;
             Ok(Outcome::NoOp {
-                message: dbs.create_database(name)?,
+                message: dbs.create_database(symbols.role(), name)?,
             })
         }
 
         Stmt::DropDatabase { name, if_exists } => {
             reject_in_transaction(symbols, "DROP DATABASE")?;
             Ok(Outcome::NoOp {
-                message: dbs.drop_database(name, *if_exists)?,
+                message: dbs.drop_database(symbols.role(), name, *if_exists)?,
             })
         }
 
@@ -699,7 +870,58 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Databases) -> 
         Stmt::AlterDatabase { name, search_path } => {
             reject_in_transaction(symbols, "ALTER DATABASE")?;
             Ok(Outcome::NoOp {
-                message: dbs.set_database_search_path(name, search_path)?,
+                message: dbs.set_database_search_path(symbols.role(), name, search_path)?,
+            })
+        }
+
+        // 角色那几条改的也是**服务目录**(`users.json`),所以与库那几条同一个口径:
+        // 事务里拒绝,判定与写盘都在实现方.
+        Stmt::CreateRole(request) => {
+            reject_in_transaction(symbols, request.what)?;
+            Ok(Outcome::NoOp {
+                message: dbs.create_role(symbols.role(), request)?,
+            })
+        }
+
+        Stmt::AlterRole(request) => {
+            reject_in_transaction(symbols, request.what)?;
+            Ok(Outcome::NoOp {
+                message: dbs.alter_role(symbols.role(), request)?,
+            })
+        }
+
+        Stmt::DropRole {
+            what,
+            names,
+            if_exists,
+        } => {
+            reject_in_transaction(symbols, what)?;
+            Ok(Outcome::NoOp {
+                message: dbs.drop_role(symbols.role(), what, names, *if_exists)?,
+            })
+        }
+
+        Stmt::GrantRole(request) => {
+            reject_in_transaction(
+                symbols,
+                match request.is_grant {
+                    true => "GRANT",
+                    false => "REVOKE",
+                },
+            )?;
+            Ok(Outcome::NoOp {
+                message: dbs.grant_role(symbols.role(), request)?,
+            })
+        }
+
+        // `SET ROLE` 是**会话状态**,不是服务目录:先在实现方问出"能借哪个身份",
+        // 再把它记进符号表(于是它能被 `ROLLBACK` 盖回去).事务里**允许**--
+        // 与 `SET search_path` 同一档.
+        Stmt::SetRole(target) => {
+            let resolved = dbs.resolve_role(symbols.role(), target.as_deref())?;
+            symbols.set_role(resolved.clone());
+            Ok(Outcome::NoOp {
+                message: format!("{}", tr!("ir.stmt.018", arg0 =  resolved)),
             })
         }
     }
@@ -792,7 +1014,7 @@ impl Script {
     ///
     /// 没有服务目录的会话走它(见 [`Script::run_one_with`]).
     pub fn run_one(&self, index: usize, symbols: &mut SymbolTable) -> StmtResult {
-        self.run_one_with(index, symbols, &mut NoDatabases)
+        self.run_one_with(index, symbols, &mut NoServer)
     }
 
     /// 同 [`Script::run_one`],但把 `CREATE DATABASE` / `DROP DATABASE` 交给 `dbs`.
@@ -800,14 +1022,18 @@ impl Script {
         &self,
         index: usize,
         symbols: &mut SymbolTable,
-        dbs: &mut dyn Databases,
+        dbs: &mut dyn Server,
     ) -> StmtResult {
         let raw = &self.statements[index];
 
         // 逐条来:后面的语句依赖前面建出来的表,不能先全降级.
+        let mut redacted = None;
         let outcome = match raw.stmt.as_deref() {
             Some(node) => match irgen::lower_statement(node, symbols) {
-                Ok(stmt) => execute_stmt_with(&stmt, symbols, dbs),
+                Ok(stmt) => {
+                    redacted = redacted_text(&stmt);
+                    execute_stmt_with(&stmt, symbols, dbs)
+                }
                 Err(e) => Err(e),
             },
             None => Err(DbError::Parse {
@@ -817,9 +1043,27 @@ impl Script {
 
         StmtResult {
             index: index + 1,
-            text: statement_text(&self.sql, raw),
+            text: redacted.unwrap_or_else(|| statement_text(&self.sql, raw)),
             outcome,
         }
+    }
+}
+
+/// 这条语句的回显文本要不要换掉--**口令不许进输出**.
+///
+/// 引擎对每条语句都会打一行 `[N] <原文>`,而 `CREATE USER bob PASSWORD 'hunter2'`
+/// 的原文里就是口令.这里把它换成 `CREATE USER bob PASSWORD '***'`;别的语句
+/// (包括不带 `PASSWORD` 的 `ALTER ROLE`)照旧回显原文.
+fn redacted_text(stmt: &Stmt) -> Option<String> {
+    match stmt {
+        Stmt::CreateRole(request) if request.password.is_some() => Some(format!(
+            "{} {} PASSWORD '***'",
+            request.what, request.name
+        )),
+        Stmt::AlterRole(request) if request.password != PasswordAction::Unchanged => {
+            Some(format!("{} {} PASSWORD '***'", request.what, request.name))
+        }
+        _ => None,
     }
 }
 

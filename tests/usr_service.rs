@@ -50,12 +50,19 @@ impl Drop for TempDir {
 
 /// 一个不碰磁盘的用户(认证在 `tests/usr_auth.rs` 里单独测).
 fn user(name: &str, is_admin: bool) -> User {
+    // 手搓的角色给全套开关:这个文件考的是库目录与提交点,权限判定在
+    // `tests/usr_roles.rs` 与 `tests/usr_share.rs` 里单独测.
     User {
         name: name.to_string(),
         salt: String::new(),
         password_hash: String::new(),
         is_admin,
         created_unix: 0,
+        can_login: true,
+        can_create_db: true,
+        can_create_role: true,
+        inherit: true,
+        member_of: Vec::new(),
     }
 }
 

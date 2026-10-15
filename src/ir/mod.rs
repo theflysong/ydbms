@@ -79,13 +79,18 @@
 //! 语句层还认这些:`BEGIN`/`COMMIT`/`ROLLBACK`(**真事务**,撤销记录在
 //! [`SymbolTable`] 里;没有显式 `BEGIN` 时引擎给每条语句一个隐式事务,
 //! 成功即提交,失败即回滚),`CREATE SCHEMA`,`SET search_path`(真生效),
-//! `DROP SCHEMA ... CASCADE`,`ALTER DATABASE ... SET search_path`(库级默认值,
-//! 走 [`Databases`] 那个口子).
+//! `DROP SCHEMA ... CASCADE`,`ALTER DATABASE ... SET search_path`(库级默认值),
+//! 以及角色那几条:`CREATE USER`/`CREATE ROLE`/`CREATE GROUP`,
+//! `ALTER USER`/`ALTER ROLE`(`RENAME TO` 也在内),`DROP USER`/`DROP ROLE`,
+//! `GRANT`/`REVOKE <角色>`,`SET ROLE`/`RESET ROLE`(当前角色是**会话状态**,
+//! 记在 [`SymbolTable`] 里,所以能回滚).这些都走 [`Server`] 那个口子--
+//! 语句层只把名字与取值交出去,`users.json` 与权限判定都在实现方.
 //!
 //! 未实现:**代价估算与连接重排**(策略是定规则挑的);CTE;`INTERSECT`/`EXCEPT`;
 //! `DISTINCT ON`;窗口函数;`RIGHT`/`FULL` JOIN;`LATERAL`;`DELETE`/`DROP TABLE`/
 //! `ALTER TABLE`;`SAVEPOINT` 与嵌套事务(`BEGIN` 套 `BEGIN` 只给警告);唯一索引与
-//! 部分索引.(`CHECK` 与索引**不落盘**--它们不是列定义;`DEFAULT` 是列定义的一部分,
+//! 部分索引;`GRANT` 的 `ADMIN OPTION` / `TO PUBLIC` / 列级清单(`GRANT SELECT (c)`),
+//! `CREATE ROLE` 的 `VALID UNTIL` 那一档选项.(`CHECK` 与索引**不落盘**--它们不是列定义;`DEFAULT` 是列定义的一部分,
 //! 跟着模式文件走.)
 
 pub mod checks;
@@ -105,8 +110,8 @@ pub use plan::{
     Analysis, EqKey, IndexPath, JoinKind, JoinStrategy, Node, NodeId, Op, Plan, PlanBuilder, SortKey,
 };
 pub use stmt::{
-    execute_stmt, execute_stmt_with, has_top_level_terminator, run_script, Databases,
-    NoDatabases, Outcome, Script, Stmt, StmtResult, TxOp,
+    execute_stmt, execute_stmt_with, has_top_level_terminator, run_script, AlterRoleRequest,
+    CreateRoleRequest, GrantRoleRequest, NoServer, Outcome, Script, Server, Stmt, StmtResult, TxOp,
 };
 pub use symbol::{Symbol, SymbolTable};
 pub use value::{Scalar, ScalarType, Tri};

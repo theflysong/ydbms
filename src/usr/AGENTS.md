@@ -4,22 +4,33 @@
 
 **用户与库**:谁能进,进哪个库,库在磁盘上的什么位置.
 
-- `mod.rs` -- [`User`](mod.rs) / [`UserStore`](mod.rs)(`users.json`),
-  [`UserStore::authenticate`](mod.rs),`AuthError`,`now_unix`.
+- `mod.rs` -- [`User`](mod.rs)(一个**角色**:口令,属性,成员关系)/
+  [`UserStore`](mod.rs)(`users.json`),[`UserStore::authenticate`](mod.rs),
+  `AuthError`,[`RoleAttrs`](mod.rs) / [`PasswordAction`](mod.rs) /
+  [`RoleAttrChange`](mod.rs)(`CREATE / ALTER ROLE` 的取值),
+  [`Password`](mod.rs)(明文口令的 newtype,`Debug` 打不出来),`now_unix`.
+- `roles.rs` -- **成员关系**的纯函数:[`members_of`](roles.rs)(可达集合,不看
+  `INHERIT`),[`effective_roles`](roles.rs)(看 `INHERIT`,**逐边**判断),
+  [`can_set_role`](roles.rs),[`would_cycle`](roles.rs)."谁能做什么"这句口径
+  只有这一处落点.
 - `hash.rs` -- 口令的加盐哈希:`sha256(salt ‖ password)`,`/dev/urandom` 取盐,
   十六进制的进出.
 - `service.rs` -- 服务目录 [`ServiceDir`](service.rs)(`users.json` + 各库目录),
   库元数据 [`Catalog`](service.rs)(`<库>/catalog.json`),打开着的库
-  [`Database`](service.rs)(目录 + 元数据 + **单写者锁**).
+  [`Database`](service.rs)(目录 + 元数据 + **单写者锁**),以及**角色那几条**语句的
+  读-改-写(`create_role` / `alter_role` / `drop_roles` / `grant_roles`).
 
-`ysql` 的命令行入口在 [`cmd::cli`](../cmd/cli.rs);引擎侧的提交点在
+`ysql` 的命令行入口在 [`cmd::cli`](../cmd/cli.rs);引擎侧的提交点与权限判定在
 [`cmd::engine::Session`](../cmd/engine.rs).
 
 ## 磁盘契约
 
 ```text
 <server-dist>/                    默认 ~/.ydbms(--server-dist 可换)
-├── users.json                    {version, users:[{name, salt, password_hash, is_admin, created_unix}]}
+├── users.json                    {version, users:[{name, salt, password_hash, is_admin, created_unix,
+│                                                  can_login, can_create_db, can_create_role,
+│                                                  inherit, member_of}]}
+├── .users.lock                   改 users.json 时的 flock(读-改-写期间持有)
 └── <库>/
     ├── catalog.json              {version, name, owner, created_unix, settings}
     ├── .lock                     单写者锁(flock)
@@ -32,6 +43,10 @@
 - **`users.json` 与 `catalog.json` 的字段名,`version`,`is_admin`,`settings`
   都属于磁盘契约**:改名或改结构就是改文件格式.**新增字段一律 `#[serde(default)]`**,
   保证老文件读得回来.
+- 后加的五个字段(`can_login` / `can_create_db` / `can_create_role` / `inherit` /
+  `member_of`)**不许让老文件的行为变化**:`can_login` 与 `inherit` 的默认值是
+  `true`(老文件里的人照旧能登录,照旧继承),`member_of` 默认空.**`version` 不升**
+  --升它就没有回头路,而默认值已经够读回来了.
 - 版本不认识就**报错**,别按当前格式硬读.`commit.json` 也一样--**坏了就不许开库**,
   静默忽略它等于把"上次提交崩在中途"这件事抹掉.
 - 库目录里**缺 `catalog.json` 不自动补**:owner 无从知道,补一个等于伪造 owner.
@@ -83,11 +98,45 @@
   要升级就换算法并借 `users.json` 的 `version` 迁移--**别只把这段注释删掉**.
 - 比较走 `hash::verify`(常量时间),别写成 `==` 直接比字符串.
 
-### 库与用户的口径(本版有意做的减法)
+### 角色与成员关系(6.4)
 
-- **只做认证 + "owner(或管理员)才能连"**.`GRANT` / `REVOKE`,多用户共享,
-  `CREATE USER` 都**明确不做**:用户要么由首次启动的 bootstrap 建出来,要么手工编辑
-  `users.json`.要把这些做进来,先想清楚"授权信息存哪儿".
+**用户就是角色**:`CREATE USER` 建的默认 `LOGIN`,`CREATE ROLE` / `CREATE GROUP`
+建的默认 `NOLOGIN`;`SUPERUSER` / `CREATEDB` / `CREATEROLE` / `INHERIT` 都是属性.
+四条规矩:
+
+- **超级用户不是继承来的**:只有当前角色自己 `is_admin` 才算(与 PostgreSQL 一致).
+  普通权限(连库,`owner` 身份)才沿成员关系继承.
+- **`INHERIT` 逐边判断**:一条 `child → parent` 的边只有 `child` 自己 `INHERIT` 时
+  才走下去([`effective_roles`](roles.rs));`SET ROLE` 借身份**不看**它
+  ([`can_set_role`](roles.rs) 用 [`members_of`](roles.rs)).两个函数的差别就在这里,
+  别合并.
+- **成环直接拒绝**([`would_cycle`](roles.rs)):图是用户自己改出来的,不能假设它无环.
+- **最后一个超级用户**不能删也不能降级(`UserStore::is_last_superuser`):
+  与 bootstrap 那句"否则谁都进不去"同一个道理.
+
+角色那几条语句的**结构**检查在这里(`role_traces` 之外都很轻):
+
+- **改名要过"干净角色"**([`ServiceDir::role_traces`](service.rs)):`users.json` 之外
+  还记着这个名字的地方(库的 `catalog.json` 的 owner,库里的授权)分散在各库目录里,
+  而那些库可能正被别的进程锁着--**改不干净就不改**,报错里点名列出来.
+- **删角色同理**:有库 / 有授权就不删,并点名卡在哪几个库.
+- **判断"谁有资格"不在这里**:那要看会话的当前角色,由 `cmd` 的 `Store` 先判
+  (与 `owner` 检查的既有分工一致).
+
+### `users.json` 的写锁
+
+- 角色那几条(建 / 改 / 删 / 授成员)是**读-改-写** `users.json`,而它是**全局**的:
+  两个 `ysql` 进程(连着不同的库)同时改就会丢更新.
+- 所以写之前先拿 `<server-dist>/.users.lock`(一把 `flock`,`try_lock`),
+  **拿不到就报错,不排队**--与库的单写者锁同一个口径.
+- 用户表还**不许凭空造**:`users.json` 不在时那几条语句明确拒绝(不是当成空表),
+  否则下一次启动会以为早就 bootstrap 过,谁都进不来.首次启动的 bootstrap 在
+  `ysql` 那一条路上([`cmd::cli`](../cmd/cli.rs)).
+
+### 库与用户的口径
+
+- **连一个库**:owner(或 `owner` 在它的**有效角色集**里)或超级用户.
+  授权表(`<库>/grants.json` 里的 `CONNECT`)是第三个放行条件,见下面那节.
 - **一个目录 = 一个库**:库名只能是一个目录名(空,`.`,`..`,含 `/` 或 `\` 一律拒绝,
   否则就跑到服务目录外面去了).
 - `search_path` 本身是**会话状态,不落盘**--但现在库里可以记一个**库级默认值**
@@ -110,6 +159,7 @@
   `UnknownDatabase` / `DuplicateDatabase` / `Denied{message}`(正文写中文缘由),
   文件坏了用 `Format`,IO 用 `Io`.
 - **认证失败用 `AuthError`**(`Display` 直接是中文,`ysql` 原样打出来):
-  `UnknownUser` / `BadPassword` / `Corrupt`.
+  `UnknownUser` / `BadPassword` / `CannotLogin`(NOLOGIN)/ `NoPassword`(没口令)/
+  `Corrupt`.
 - 拒绝的时候要把**为什么**说清楚(谁的库,owner 是谁,缺哪个文件),
   这是这一层唯一的使用者体验.

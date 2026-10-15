@@ -63,6 +63,14 @@
 //!   **两张都空时一个字节的 IO 都不做**(只读语句占绝大多数);
 //! * 内存模式下一行 IO 都不做;**事务开着时直接返回**(提交点是 `COMMIT`).
 //!
+//! # 当前角色与权限(6.4)
+//!
+//! 服务模式下引擎要把**当前角色**(`SymbolTable::role()`,刚连上时是认证过的
+//! 会话用户,`SET ROLE` 之后可能是别人)交给 [`crate::ir::stmt::Server`] 的每一个
+//! 方法:`Store` 拿它去查权限(owner 含继承身份 / 超级用户 / `CREATEDB` /
+//! `CREATEROLE`),查的是**当下那一份** `users.json`.内存模式没有用户,
+//! `check_*` 一律放行,而改服务目录的角色语句一律拒绝.
+//!
 //! # 事务(4.1)与原子提交(4.2)
 //!
 //! `BEGIN` / `COMMIT` / `ROLLBACK` 是真的:撤销记录在 [`SymbolTable`] 里(写前整表
@@ -83,10 +91,10 @@ use std::time::Instant;
 
 use crate::db::phys::PhysTab;
 use crate::db::table::{DbError, Result, TabShape, Table};
-use crate::ir::stmt::Databases;
+use crate::ir::stmt::{AlterRoleRequest, CreateRoleRequest, GrantRoleRequest, Server};
 use crate::ir::{Outcome, Script, StmtResult, Symbol, SymbolTable, TxOp};
 use crate::usr::service::{Database, ServiceDir};
-use crate::usr::User;
+use crate::usr::{PasswordAction, User};
 
 use super::complete::Catalog;
 use super::metacmd::{self, MetaCmd};
@@ -217,12 +225,15 @@ struct Store {
     known_on_disk: BTreeSet<String>,
 }
 
-impl Databases for Store {
-    fn create_database(&mut self, name: &str) -> Result<String> {
+impl Server for Store {
+    fn create_database(&mut self, _role: &str, name: &str) -> Result<String> {
+        // 建出来的库 owner 是**会话用户**(认证过的那个人),不是 `SET ROLE` 借来的
+        // 身份:与 PostgreSQL 的 `current_user` 一致,而且"借一个身份建库再把身份还掉"
+        // 会留下一个谁都不能动的库.
         self.service.create_database(name, &self.user.name)
     }
 
-    fn drop_database(&mut self, name: &str, if_exists: bool) -> Result<String> {
+    fn drop_database(&mut self, role: &str, name: &str, if_exists: bool) -> Result<String> {
         // 正在用的库不能删:会话的锁自己就握着它,删掉之后后面的提交会往一个
         // 不存在的目录里写(而且别人还连着).PostgreSQL 也是这条规矩.
         if name == self.db.name() {
@@ -231,40 +242,198 @@ impl Databases for Store {
             });
         }
 
-        // 别人的库要么是他的,要么自己是管理员--本版没有 GRANT,这就是全部口径.
+        // 别人的库要么是他的(自己或继承来的身份),要么自己是超级用户.
         // **元数据读不出来就报错**,别当成"没有 owner 限制":`catalog.json` 坏了
         // 恰恰是最不该让人随手删库的时候(这条在实现里是"宁可报错"的那一侧).
         if !self.service.exists(name) {
             return self.service.drop_database(name, if_exists);
         }
-        self.check_owner(name, &tr!("cmd.engine.004").into_owned())?;
+        self.check_owner(role, name, &tr!("cmd.engine.004").into_owned())?;
         self.service.drop_database(name, if_exists)
     }
 
-    fn set_database_search_path(&mut self, name: &str, path: &[String]) -> Result<String> {
-        // 与删库同一道闸:别人的库只有管理员能改.库不存在时把
+    fn set_database_search_path(&mut self, role: &str, name: &str, path: &[String]) -> Result<String> {
+        // 与删库同一道闸:别人的库只有 owner / 超级用户能改.库不存在时把
         // `UnknownDatabase` 的报错留给 `usr::service` 给(那里才有目录的信息).
         if self.service.exists(name) {
-            self.check_owner(name, &tr!("cmd.engine.005").into_owned())?;
+            self.check_owner(role, name, &tr!("cmd.engine.005").into_owned())?;
         }
         self.service.set_database_search_path(name, path)
+    }
+
+    fn create_role(&mut self, role: &str, request: &CreateRoleRequest) -> Result<String> {
+        self.require_role_manager(role, request.what)?;
+        self.service.create_role(
+            &request.name,
+            request.password.as_ref().map(|password| password.as_str()),
+            request.attrs,
+            &request.add_to,
+        )
+    }
+
+    fn alter_role(&mut self, role: &str, request: &AlterRoleRequest) -> Result<String> {
+        // 自己改自己的口令:谁都能换自己的口令(与 PostgreSQL 一样);换成别人,
+        // 或者改属性 / 改名,就要超级用户或 `CREATEROLE`.
+        let own_password = request.name == self.user.name;
+        let only_password = request.new_name.is_none()
+            && request.changes.is_empty()
+            && request.password != PasswordAction::Unchanged;
+
+        if !(own_password && only_password) {
+            self.require_role_manager(role, request.what)?;
+        }
+
+        // 改名会把 `users.json` 之外的那些引用(别人手里的会话,库的 owner)留在
+        // 旧名字上,所以碰当前会话用户与当前角色一律拒绝.
+        if request.new_name.is_some() && (request.name == self.user.name || request.name == role) {
+            return Err(DbError::Denied {
+                message: format!("{}", tr!("cmd.engine.075", arg0 =  request.name)),
+            });
+        }
+
+        self.service
+            .alter_role(&request.name, request.new_name.as_deref(), request.password.clone(), &request.changes)
+    }
+
+    fn drop_role(
+        &mut self,
+        role: &str,
+        what: &'static str,
+        names: &[String],
+        if_exists: bool,
+    ) -> Result<String> {
+        self.require_role_manager(role, what)?;
+
+        for name in names {
+            if name == &self.user.name || name == role {
+                return Err(DbError::Denied {
+                    message: format!("{}", tr!("cmd.engine.076", arg0 =  name)),
+                });
+            }
+        }
+        self.service.drop_roles(names, if_exists)
+    }
+
+    fn grant_role(&mut self, role: &str, request: &GrantRoleRequest) -> Result<String> {
+        self.require_role_manager(
+            role,
+            match request.is_grant {
+                true => "GRANT",
+                false => "REVOKE",
+            },
+        )?;
+        self.service
+            .grant_roles(&request.roles, &request.members, request.is_grant)
+    }
+
+    fn resolve_role(&mut self, current: &str, target: Option<&str>) -> Result<String> {
+        // `SET ROLE NONE` / `RESET ROLE`:回到会话用户
+        let Some(target) = target else {
+            return Ok(self.user.name.clone());
+        };
+
+        let me = self.role_record(current)?;
+        // 没有 `users.json`(手工接线的会话)时只认"自己":借身份要有一张真的用户表
+        if !self.service.users_path().is_file() {
+            return Err(DbError::Denied {
+                message: format!("{}", tr!("cmd.engine.078", arg0 =  current, arg1 =  target)),
+            });
+        }
+        let store = self.service.users()?;
+        if store.find(target).is_none() {
+            return Err(DbError::Denied {
+                message: format!("{}", tr!("cmd.engine.077", arg0 =  target)),
+            });
+        }
+        if !me.is_admin && !crate::usr::can_set_role(&store, current, target) {
+            return Err(DbError::Denied {
+                message: format!("{}", tr!("cmd.engine.078", arg0 =  current, arg1 =  target)),
+            });
+        }
+        Ok(target.to_string())
+    }
+
+    fn check_ddl(&mut self, role: &str, what: &str) -> Result<()> {
+        if self.is_superuser(role)? {
+            return Ok(());
+        }
+        if self.service.acts_as(role, self.db.owner())? {
+            return Ok(());
+        }
+        Err(DbError::Denied {
+            message: format!("{}", tr!("cmd.engine.080", arg1 = 
+                self.db.name(), arg2 =  role, arg3 =  what
+            )),
+        })
+    }
+
+    fn check_create_database(&mut self, role: &str) -> Result<()> {
+        let record = self.role_record(role)?;
+        if record.is_admin || record.can_create_db {
+            return Ok(());
+        }
+        Err(DbError::Denied {
+            message: format!("{}", tr!("cmd.engine.079", arg0 =  role)),
+        })
     }
 }
 
 impl Store {
-    /// "这个库要么是他的,要么自己是管理员"--本版没有 GRANT,这就是全部口径.
+    /// "这个库要么是他的(含继承来的身份),要么自己是超级用户".
     ///
     /// 元数据读不出来就报错,别当成"没有 owner 限制".
-    fn check_owner(&self, name: &str, what: &str) -> Result<()> {
+    fn check_owner(&self, role: &str, name: &str, what: &str) -> Result<()> {
         let owner = self.service.catalog(name)?.owner;
-        if owner != self.user.name && !self.user.is_admin {
+        if self.is_superuser(role)? || self.service.acts_as(role, &owner)? {
+            return Ok(());
+        }
+        Err(DbError::Denied {
+            message: format!("{}", tr!("cmd.engine.006", arg0 = 
+                name, arg1 =  owner, arg2 =  role, arg3 =  what
+            )),
+        })
+    }
+
+    /// 当前角色是不是超级用户.
+    ///
+    /// **超级用户不是继承来的**:只有这个角色自己 `is_admin` 才算(与 PostgreSQL
+    /// 一致)--`GRANT superuser_role TO me` 不会让我变成超级用户.
+    fn is_superuser(&self, role: &str) -> Result<bool> {
+        Ok(self.role_record(role)?.is_admin)
+    }
+
+    /// 当前角色能不能管角色(超级用户或 `CREATEROLE`).
+    fn require_role_manager(&self, role: &str, what: &str) -> Result<()> {
+        let record = self.role_record(role)?;
+        if record.is_admin || record.can_create_role {
+            return Ok(());
+        }
+        Err(DbError::Denied {
+            message: format!("{}", tr!("cmd.engine.074", arg0 = 
+                role, arg1 =  what
+            )),
+        })
+    }
+
+    /// 当前角色在 `users.json` 里的记录;没有就报错(照 `users.json` 当下那一份判).
+    ///
+    /// **`users.json` 整个不在**时(手工接线的会话:`tests/usr_service.rs` 直接拿一个
+    /// 手搓的 `User` 开会话)只认"自己"这一条--那个 `User` 就是他的记录.别的名字
+    /// 一律报"没有角色".文件在而不认识这个角色,就是真的没有它(不问会话手里那份
+    /// 过期的记录,那是"另一个进程刚把它删了"应有的答复).
+    fn role_record(&self, role: &str) -> Result<User> {
+        if !self.service.users_path().is_file() {
+            if role == self.user.name {
+                return Ok(self.user.clone());
+            }
             return Err(DbError::Denied {
-                message: format!("{}", tr!("cmd.engine.006", arg0 = 
-                    name, arg1 =  owner, arg2 =  self.user.name, arg3 =  what
-                )),
+                message: format!("{}", tr!("cmd.engine.073", arg0 =  role)),
             });
         }
-        Ok(())
+        let store = self.service.users()?;
+        store.find(role).cloned().ok_or_else(|| DbError::Denied {
+            message: format!("{}", tr!("cmd.engine.073", arg0 =  role)),
+        })
     }
 }
 
@@ -359,6 +528,9 @@ impl Session {
         if !settings.search_path.is_empty() {
             session.symbols.set_search_path(settings.search_path);
         }
+
+        // 当前角色:刚连上时就是**认证过的会话用户**(`SET ROLE` 之后才会变).
+        session.symbols.set_role(user.name.clone());
 
         session.store = Some(Store {
             service,
@@ -673,7 +845,7 @@ impl Session {
         for index in 0..script.len() {
             let began = Instant::now();
             // 服务模式下 `CREATE DATABASE` / `DROP DATABASE` 要落到服务目录,
-            // 所以两条执行入口分开--内存模式那条由 `NoDatabases` 明确拒绝.
+            // 所以两条执行入口分开--内存模式那条由 `NoServer` 明确拒绝.
             let result = match self.store.as_mut() {
                 Some(store) => script.run_one_with(index, &mut self.symbols, store),
                 None => script.run_one(index, &mut self.symbols),
