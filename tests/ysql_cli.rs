@@ -493,3 +493,110 @@ fn users_json_holds_no_plaintext_password() {
     assert!(dir.path().join("bob/catalog.json").is_file());
     assert!(dir.path().join("bob/.lock").is_file());
 }
+
+// ------------------------------------------------------------ 多用户共享(6.4)
+
+/// 验收原文:**表级 `GRANT SELECT` 之后另一个人 `SELECT` 得过,`INSERT` 被拒**.
+///
+/// 这里"另一个人"是**另一个真进程**(`-U alice`),授权与口令轮换也顺带走一遍.
+#[test]
+fn a_granted_user_reads_but_cannot_write_across_processes() {
+    let dir = TempDir::new("share");
+    bootstrap(&dir);
+
+    // bob(超级用户)建库 filmdb 并装一张表,再把 alice 建出来并授权
+    let setup = dir.script(
+        "setup.sql",
+        "CREATE DATABASE filmdb;\n",
+    );
+    let out = run(&dir, &["-U", "bob", "-d", "bob", "-f", setup.to_str().unwrap()], Some(PASSWORD));
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    let setup = dir.script(
+        "load.sql",
+        "CREATE TABLE movies (movie_id INT, title TEXT);\n\
+         INSERT INTO movies VALUES (1, 'Alien'), (2, 'Aliens');\n\
+         CREATE USER alice PASSWORD 'alice-pw';\n\
+         GRANT CONNECT ON DATABASE filmdb TO alice;\n\
+         GRANT SELECT (title) ON movies TO alice;\n",
+    );
+    let out = run(
+        &dir,
+        &["-U", "bob", "-d", "filmdb", "-f", setup.to_str().unwrap()],
+        Some(PASSWORD),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        !stdout(&out).contains("alice-pw"),
+        "口令不许回显:{}",
+        stdout(&out)
+    );
+
+    // alice:读得到(title 是授过的那一列)
+    let query = dir.script("query.sql", "SELECT title FROM movies ORDER BY title;\n");
+    let out = run(
+        &dir,
+        &["-U", "alice", "-d", "filmdb", "-f", query.to_str().unwrap()],
+        Some("alice-pw"),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains("Alien"), "{}", stdout(&out));
+
+    // alice:没授的列读不了
+    let query = dir.script("other-column.sql", "SELECT movie_id FROM movies;\n");
+    let out = run(
+        &dir,
+        &["-U", "alice", "-d", "filmdb", "-f", query.to_str().unwrap()],
+        Some("alice-pw"),
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stdout(&out).contains("SELECT"), "{}", stdout(&out));
+
+    // alice:写不了
+    let insert = dir.script(
+        "insert.sql",
+        "INSERT INTO movies (title) VALUES ('Alien3');\n",
+    );
+    let out = run(
+        &dir,
+        &["-U", "alice", "-d", "filmdb", "-f", insert.to_str().unwrap()],
+        Some("alice-pw"),
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stdout(&out).contains("INSERT"), "{}", stdout(&out));
+
+    // 口令轮换:bob 换掉 alice 的口令,旧口令就不认了
+    let rotate = dir.script(
+        "rotate.sql",
+        "ALTER USER alice PASSWORD 'new-pw';\n",
+    );
+    let out = run(
+        &dir,
+        &["-U", "bob", "-d", "filmdb", "-f", rotate.to_str().unwrap()],
+        Some(PASSWORD),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(!stdout(&out).contains("new-pw"), "{}", stdout(&out));
+
+    let old = run(
+        &dir,
+        &["-U", "alice", "-d", "filmdb", "-f", query.to_str().unwrap()],
+        Some("alice-pw"),
+    );
+    assert_eq!(old.status.code(), Some(1));
+    assert!(stderr(&old).contains("口令不对"), "{}", stderr(&old));
+
+    // 数据一行都没多
+    let check = dir.script("check.sql", "SELECT title FROM movies ORDER BY title;\n");
+    let out = run(
+        &dir,
+        &["-U", "alice", "-d", "filmdb", "-f", check.to_str().unwrap()],
+        Some("new-pw"),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert_eq!(stdout(&out).matches("Aliens").count(), 1, "{}", stdout(&out));
+    assert!(!stdout(&out).contains("Alien3"), "{}", stdout(&out));
+
+    // 授权表就在库目录里
+    assert!(dir.path().join("filmdb/grants.json").is_file());
+}

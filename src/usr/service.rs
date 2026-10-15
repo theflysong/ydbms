@@ -66,6 +66,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::grants::Grants;
 use super::roles;
 use super::{
     now_unix, unknown_role, PasswordAction, RoleAttrChange, RoleAttrs, User, UserStore,
@@ -431,7 +432,13 @@ impl ServiceDir {
 
         // 目录在,`catalog.json` 不在:说清是"这不是本版建的库",而不是含糊的"库不存在"
         let catalog = Catalog::load(&dir)?;
-        if !user.is_admin && !self.acts_as(&user.name, &catalog.owner)? {
+        // 授权表也在这时候读一次(缺文件 = 没有授权):`CONNECT` 是"能不能连"的
+        // 第三个放行条件,把它装进 `Database` 之后,这个会话的表权限也照它判.
+        let grants = Grants::load_or_empty(&dir)?;
+        if !user.is_admin
+            && !self.acts_as(&user.name, &catalog.owner)?
+            && !grants.may_connect(&user.name)
+        {
             return Err(DbError::Denied {
                 message: format!("{}", tr!("usr.service.016", arg0 = 
                     name, arg1 =  catalog.owner, arg2 =  user.name
@@ -455,6 +462,7 @@ impl ServiceDir {
             dir,
             name,
             catalog,
+            grants,
             lock,
         };
 
@@ -463,6 +471,72 @@ impl ServiceDir {
         // 改文件--必须在锁下做.
         database.recover()?;
         Ok(database)
+    }
+
+    // ------------------------------------------------- 借别人的库的锁(6.4)
+
+    /// 借 `name` 这个库的单写者锁,做一次**读-改-写**(跨库的 `GRANT CONNECT` 与
+    /// `ALTER DATABASE ... OWNER TO` 走它).
+    ///
+    /// 三条规矩:
+    ///
+    /// * **拿不到锁就不改**:别人正连着这个库,它自己的会话手里才是最新那一份,
+    ///   我们改就是丢更新--宁可报错(与"第二个写者连不上"同一个口径);
+    /// * **本会话正开着的那个库不走这里**:同进程对同一个文件再 `try_lock` 必然
+    ///   失败(flock 跟着句柄走),那种情况调用方直接用手里那个
+    ///   [`Database::set_grants`];
+    /// * **不跑恢复**:这里只借锁读改写目录里的两个小文件,不碰表文件--上次崩在
+    ///   提交中途的那份现场留给"真正打开这个库"的那一次([`Database::recover`]).
+    pub fn with_grants<T>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut Grants) -> Result<T>,
+    ) -> Result<T> {
+        let name = checked_name(name)?;
+        let dir = self.database_dir(&name);
+        if !dir.join(CATALOG_FILE).is_file() {
+            return Err(DbError::UnknownDatabase { name });
+        }
+        let _lock = self.lock_database(&name, &dir)?;
+
+        let mut grants = Grants::load_or_empty(&dir)?;
+        let outcome = f(&mut grants)?;
+        grants.save(&dir)?;
+        Ok(outcome)
+    }
+
+    /// `ALTER DATABASE name OWNER TO owner`:换库的 owner(借锁读改写 `catalog.json`).
+    ///
+    /// 库在不在,新 owner 存不存在,"谁有资格换"都由调用方先判
+    /// (`cmd` 的 `Store`--那是会话的事).
+    pub fn set_database_owner(&self, name: &str, owner: &str) -> Result<String> {
+        let name = checked_name(name)?;
+        let dir = self.database_dir(&name);
+        if !dir.join(CATALOG_FILE).is_file() {
+            return Err(DbError::UnknownDatabase { name });
+        }
+        let _lock = self.lock_database(&name, &dir)?;
+
+        let mut catalog = Catalog::load(&dir)?;
+        let previous = std::mem::replace(&mut catalog.owner, owner.to_string());
+        catalog.save(&dir)?;
+
+        Ok(format!("{}", tr!("usr.service.036", arg0 = 
+            name, arg1 =  previous, arg2 =  owner
+        )))
+    }
+
+    /// 借一个库目录的锁;拿不到就报错(**不排队**).
+    fn lock_database(&self, name: &str, dir: &Path) -> Result<File> {
+        let path = dir.join(LOCK_FILE);
+        let lock = File::create(&path).map_err(|e| io_err(&path, e))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(lock),
+            Err(TryLockError::WouldBlock) => Err(DbError::Denied {
+                message: format!("{}", tr!("usr.service.037", arg0 =  name)),
+            }),
+            Err(TryLockError::Error(e)) => Err(io_err(&path, e)),
+        }
     }
 
     // ------------------------------------------------------------ 角色(6.4)
@@ -521,11 +595,26 @@ impl ServiceDir {
     pub fn role_traces(&self, role: &str) -> Result<Vec<String>> {
         let mut traces = Vec::new();
         for database in self.databases()? {
-            if self.catalog(&database)?.owner == role {
+            let dir = self.database_dir(&database);
+            let owner = Catalog::load(&dir)?.owner == role;
+            let granted = Grants::load(&dir)?.is_some_and(|grants| grants.mentions(role));
+            if owner || granted {
                 traces.push(database);
             }
         }
         Ok(traces)
+    }
+
+    /// 这个角色必须在(授权 / 换 owner 之前先问一句).
+    ///
+    /// 没有 `users.json` 时**拒绝**:那时没法校验"这个人存在不存在",而授权表里写
+    /// 一个不存在的名字,只是在给以后留一个说不清的幽灵.
+    pub fn require_user(&self, name: &str) -> Result<()> {
+        let store = self.load_users()?;
+        if store.find(name).is_none() {
+            return Err(unknown_role(name));
+        }
+        Ok(())
     }
 
     /// 拿 `<server-dist>/.users.lock`(读-改-写期间持有).
@@ -743,6 +832,11 @@ pub struct Database {
     dir: PathBuf,
     name: String,
     catalog: Catalog,
+    /// 这个库的授权表(打开时读一次;缺文件 = 空的).
+    ///
+    /// **会话手里的这一份就是当下那一份**:它是唯一能改这个库的写者(单写者锁),
+    /// 而跨库改别人库的授权要走 [`ServiceDir::with_grants`].
+    grants: Grants,
     /// 单写者锁.**只是持有**:句柄关掉(含进程退出,被 `kill -9`)内核就释放.
     lock: File,
 }
@@ -766,6 +860,27 @@ impl Database {
     /// 库元数据.
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// 这个库的授权表.
+    pub fn grants(&self) -> &Grants {
+        &self.grants
+    }
+
+    /// 换一份授权表并写回 `<库>/grants.json`(临时文件 + rename).
+    pub fn set_grants(&mut self, mut grants: Grants) -> Result<()> {
+        grants.save(&self.dir)?;
+        self.grants = grants;
+        Ok(())
+    }
+
+    /// 这些表已经没了:把它们名下的授权记录一并删掉(没动过就不写盘).
+    pub fn retire_grants(&mut self, tables: &[String]) -> Result<()> {
+        if !self.grants.prune_tables(tables) {
+            return Ok(());
+        }
+        let grants = self.grants.clone();
+        self.set_grants(grants)
     }
 
     /// 把库里所有表读回内存.

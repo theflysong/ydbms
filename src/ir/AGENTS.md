@@ -173,15 +173,43 @@ PhysTab                          ← db::source::materialize
 
 权限检查全在 `run_stmt` 里(执行的唯一入口),**动数据之前**:
 
-- `SELECT` / `INSERT` / `UPDATE` 按**表与列**查(`check_table`,列集合为空 = "这张表上
-  至少有一列的该权限");
-- `CREATE TABLE` / `CREATE INDEX` / `DROP INDEX` / `CREATE SCHEMA` / `DROP SCHEMA`
-  查 `check_ddl`(owner 含继承,或超级用户);
-- `CREATE DATABASE` 查 `check_create_database`(`CREATEDB` 或超级用户);
-- 库与角色那几条的判定在实现方(它们本来就只走那个口子).
+| 语句 | 查什么 |
+|---|---|
+| `SELECT` | 计划里扫到的每张表,按 [`Plan::used_columns`](plan.rs) 给出的**列**要 `SELECT` |
+| `INSERT` | `Stmt::Insert::columns`(写了哪几列)要 `INSERT` |
+| `UPDATE` | `SET` 写到的列要 `UPDATE`;`SET` 与 `WHERE` **读到**的列要 `SELECT` |
+| `CREATE TABLE` / `CREATE INDEX` / `DROP INDEX` / `CREATE SCHEMA` / `DROP SCHEMA` | `check_ddl`(owner 含继承,或超级用户) |
+| `CREATE DATABASE` | `check_create_database`(`CREATEDB` 或超级用户) |
+| `CREATE TABLE` **建完** | `forget_grants`:同名新表不许继承旧授权 |
+| 库与角色 / `GRANT` / `DROP OWNED BY` / `ALTER DATABASE ... OWNER TO` | 判定在实现方(它们本来就只走那个口子) |
 
-内存模式([`NoServer`](stmt.rs))放行 `check_*`--**这不是"忘了查"**,是内存里没有用户,
-键盘前的人就是主人;而改服务目录的语句在内存模式下一律拒绝.
+`check_table(role, table, want, columns)` 的 `columns` 是**必须覆盖的列名**;
+**空切片有专门的意思**:这张表上至少有一列的该权限(整表授权或者任意一列的授权)--
+`SELECT COUNT(*) FROM t` 这种一列都没读具体值的查询走它.**空切片不是"不用检查"**.
+
+### 列使用分析(`Plan::used_columns`,6.4)
+
+列级授权要问"这条查询**读到了**哪些列",而计划里的列下标是相对每个算子的输入
+schema 的,所以只有从 root 往回推才算得出来([`Plan::used_columns`](plan.rs)):
+
+- `Plan::analyze_shallow` 给出每个节点的输出 schema 与程序输入;`for_each_program`
+  给出每个节点的程序;`Prog::columns()` 给出程序引用到的输入列(含子程序);
+- **I1(输入下标一定更小)**让"从后往前扫一趟"就够:轮到某个节点时,消费它的那些节点
+  的需求都已经推进来了;
+- 逐算子的传法:`Scan` 收下自己的集合(外加 `filter` 与索引路径的列);`Filter`/`Sort`/
+  `Limit` 1:1 传;`Project` 只展开**被用到的那几个** `progs`;`Aggregate` 按
+  "键在前,聚合在后"取对应的程序;`Join` 按 `左 ++ 右` 劈开;`Distinct` 与
+  **去重的 `UNION`** 按"输入那一行的全部列"算(`UNION ALL` 才 1:1);
+- **相关子查询**处保守:程序里有 `spec.correlated` 的子计划时,它所在节点的输入
+  **整层**算被读(`Step::Outer` 读外层行,`Prog::columns()` 看不到);
+- 子计划是另一棵计划,递归进去各算各的;
+- 方向永远是**宁可多要**--少要一次就是一次安静的越权读.
+
+用 `analyze_shallow` 而不是 `analyze`:子计划的外层引用要拿**外层链**才校得动,那是
+`check_subqueries` 的事;在这里用 `analyze` 会把一个合法的相关子计划当成"没有外层行".
+
+内存模式([`NoServer`](stmt.rs))放行 `check_*` 与 `forget_grants`--**这不是"忘了查"**,
+是内存里没有用户,键盘前的人就是主人;而改服务目录的语句在内存模式下一律拒绝.
 
 ### 事务:撤销记录在符号表里,每条语句自成一个隐式事务(4.1)
 

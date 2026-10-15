@@ -80,17 +80,23 @@
 //! [`SymbolTable`] 里;没有显式 `BEGIN` 时引擎给每条语句一个隐式事务,
 //! 成功即提交,失败即回滚),`CREATE SCHEMA`,`SET search_path`(真生效),
 //! `DROP SCHEMA ... CASCADE`,`ALTER DATABASE ... SET search_path`(库级默认值),
-//! 以及角色那几条:`CREATE USER`/`CREATE ROLE`/`CREATE GROUP`,
+//! 以及角色与授权那几条:`CREATE USER`/`CREATE ROLE`/`CREATE GROUP`,
 //! `ALTER USER`/`ALTER ROLE`(`RENAME TO` 也在内),`DROP USER`/`DROP ROLE`,
-//! `GRANT`/`REVOKE <角色>`,`SET ROLE`/`RESET ROLE`(当前角色是**会话状态**,
-//! 记在 [`SymbolTable`] 里,所以能回滚).这些都走 [`Server`] 那个口子--
-//! 语句层只把名字与取值交出去,`users.json` 与权限判定都在实现方.
+//! `GRANT`/`REVOKE <角色>`,`GRANT`/`REVOKE <权限>`(表级 / 列级 / 库上的
+//! `CONNECT`),`DROP OWNED BY`,`ALTER DATABASE ... OWNER TO`,
+//! `SET ROLE`/`RESET ROLE`(当前角色是**会话状态**,记在 [`SymbolTable`] 里,
+//! 所以能回滚).这些都走 [`Server`] 那个口子--语句层只把名字与取值交出去,
+//! `users.json` / `grants.json` 与权限判定都在实现方.
+//!
+//! 权限检查也在语句层这一处([`Stmt`] 的每个分支动数据之前):`SELECT` 按
+//! [`Plan::used_columns`](plan.rs) 给出的**列**要 `SELECT`,`INSERT` / `UPDATE` 按
+//! 写到与读到的列要 `INSERT` / `UPDATE` / `SELECT`,动结构要 `check_ddl`.
 //!
 //! 未实现:**代价估算与连接重排**(策略是定规则挑的);CTE;`INTERSECT`/`EXCEPT`;
 //! `DISTINCT ON`;窗口函数;`RIGHT`/`FULL` JOIN;`LATERAL`;`DELETE`/`DROP TABLE`/
 //! `ALTER TABLE`;`SAVEPOINT` 与嵌套事务(`BEGIN` 套 `BEGIN` 只给警告);唯一索引与
-//! 部分索引;`GRANT` 的 `ADMIN OPTION` / `TO PUBLIC` / 列级清单(`GRANT SELECT (c)`),
-//! `CREATE ROLE` 的 `VALID UNTIL` 那一档选项.(`CHECK` 与索引**不落盘**--它们不是列定义;`DEFAULT` 是列定义的一部分,
+//! 部分索引;`GRANT` 的 `ADMIN OPTION` / `TO PUBLIC`,`CREATE ROLE` 的 `VALID UNTIL`
+//! 那一档选项;`REASSIGN OWNED BY`.(`CHECK` 与索引**不落盘**--它们不是列定义;`DEFAULT` 是列定义的一部分,
 //! 跟着模式文件走.)
 
 pub mod checks;
@@ -111,7 +117,8 @@ pub use plan::{
 };
 pub use stmt::{
     execute_stmt, execute_stmt_with, has_top_level_terminator, run_script, AlterRoleRequest,
-    CreateRoleRequest, GrantRoleRequest, NoServer, Outcome, Script, Server, Stmt, StmtResult, TxOp,
+    CreateRoleRequest, GrantRequest, GrantRoleRequest, GrantTarget, NoServer, Outcome,
+    PrivilegeGrant, Script, Server, Stmt, StmtResult, TxOp,
 };
 pub use symbol::{Symbol, SymbolTable};
 pub use value::{Scalar, ScalarType, Tri};

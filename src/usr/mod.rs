@@ -35,10 +35,12 @@
 //! 所以野外的老文件里没有它们--默认值必须让老文件**行为不变**(能登录,能继承).
 //! `salt` / `password_hash` **可以为空** = 这个角色没有口令(登录时会被明确拒绝).
 
+pub mod grants;
 pub mod hash;
 pub mod roles;
 pub mod service;
 
+pub use grants::{Grants, Privilege, TableGrant};
 pub use hash::{hash_password, random_salt, to_hex, verify, SALT_LEN};
 pub use roles::{can_set_role, effective_roles, members_of, would_cycle};
 pub use service::{Catalog, Database, ServiceDir};

@@ -57,10 +57,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use pg_query::protobuf::{
     a_const::Val, node, AConst, AExpr, AExprKind, AlterDatabaseSetStmt, AlterRoleStmt, BoolExpr,
     BoolExprType, CaseExpr, ConstrType, CreateRoleStmt, CreateSchemaStmt, CreateStmt, CreatedbStmt,
-    DefElem, DropBehavior, DropRoleStmt, DropStmt,
+    DefElem, DropBehavior, DropOwnedStmt, DropRoleStmt, DropStmt,
     DropdbStmt, FuncCall, GrantRoleStmt, InsertStmt,
     JoinExpr, JoinType, LimitOption, Node, NullTestType, ObjectType, OnCommitAction, RangeVar,
-    IndexStmt, RenameStmt, RoleSpec, RoleSpecType, RoleStmtType, SelectStmt, SetOperation, SortBy,
+    AlterOwnerStmt, GrantStmt, GrantTargetType, IndexStmt, RenameStmt, RoleSpec, RoleSpecType,
+    RoleStmtType, SelectStmt, SetOperation, SortBy,
     SortByDir,
     SortByNulls,
     SqlValueFunction, SqlValueFunctionOp, SubLink, SubLinkType, TransactionStmt,
@@ -72,6 +73,7 @@ use crate::db::table::{
     DEFAULT_TIMESTAMP_PRECISION,
     MAX_TIMESTAMP_PRECISION,
 };
+use crate::usr::grants::Privilege;
 use crate::usr::{Password, PasswordAction, RoleAttrChange, RoleAttrs};
 
 use super::checks::Check;
@@ -84,7 +86,10 @@ use super::plan::{
     passthrough_column, plan_has_outer, project_column, AggFunc, AggSpec, JoinKind, JoinStrategy,
     NodeId, Op, Plan, PlanBuilder, SortKey,
 };
-use super::stmt::{AlterRoleRequest, CreateRoleRequest, GrantRoleRequest, Stmt, TxOp};
+use super::stmt::{
+    AlterRoleRequest, CreateRoleRequest, GrantRequest, GrantRoleRequest, GrantTarget, PrivilegeGrant,
+    Stmt, TxOp,
+};
 use super::symbol::SymbolTable;
 
 /// 解析 SQL 并降级成**恰好一条查询**.
@@ -152,6 +157,9 @@ pub fn lower_statement(stmt: &Node, symbols: &SymbolTable) -> Result<Stmt> {
         Some(node::Node::DropRoleStmt(drop)) => lower_drop_role(drop),
         Some(node::Node::GrantRoleStmt(grant)) => lower_grant_role(grant),
         Some(node::Node::RenameStmt(rename)) => lower_rename(rename),
+        Some(node::Node::GrantStmt(grant)) => lower_grant(grant, symbols),
+        Some(node::Node::DropOwnedStmt(drop)) => lower_drop_owned(drop),
+        Some(node::Node::AlterOwnerStmt(owner)) => lower_alter_owner(owner),
         _ => Err(unsupported(tr!("ir.irgen.006").into_owned())),
     }
 }
@@ -686,6 +694,248 @@ fn granted_role_name(node: &Node) -> Result<String> {
         }
         _ => Err(unsupported(format!("{}", tr!("ir.irgen.202")))),
     }
+}
+
+/// `GRANT` / `REVOKE <对象权限>`:表(可选列清单)或者库上的 `CONNECT`.
+///
+/// 只认这三样东西:表级 / 列级的 `SELECT` / `INSERT` / `UPDATE`,以及库级的
+/// `CONNECT`.别的(`DELETE`,`TRUNCATE`,`USAGE`,`ON FUNCTION`...)**显式拒绝**
+/// --本版没有那些能力,授出去就是一张空头支票.
+///
+/// 两条与 PostgreSQL 的差别(如实写在这儿):
+///
+/// * `ALL` 在表上展开成**三种**权限(不是 PostgreSQL 的七种);
+/// * `ALL` 在库上展开成 `CONNECT`(不是 `CREATE`/`CONNECT`/`TEMPORARY`).
+///
+/// 两处都在状态行里如实列出到底授了什么,用户一眼看得见少了哪几样.
+fn lower_grant(grant: &GrantStmt, symbols: &SymbolTable) -> Result<Stmt> {
+    let targtype = GrantTargetType::try_from(grant.targtype).unwrap_or(GrantTargetType::Undefined);
+    if targtype != GrantTargetType::AclTargetObject {
+        return Err(unsupported(tr!("ir.irgen.206").into_owned()));
+    }
+    if grant.grant_option {
+        return Err(unsupported(tr!("ir.irgen.200", arg0 = "WITH GRANT OPTION")));
+    }
+    if grant.grantor.is_some() {
+        return Err(unsupported(tr!("ir.irgen.200", arg0 = "GRANTED BY")));
+    }
+    if DropBehavior::try_from(grant.behavior).unwrap_or(DropBehavior::Undefined)
+        == DropBehavior::DropCascade
+    {
+        return Err(unsupported(tr!("ir.irgen.200", arg0 = "CASCADE")));
+    }
+
+    let mut grantees = Vec::new();
+    for node in &grant.grantees {
+        grantees.push(role_spec(node_role_spec(node))?);
+    }
+    if grantees.is_empty() {
+        return Err(unsupported(tr!("ir.irgen.202").into_owned()));
+    }
+
+    let objtype = ObjectType::try_from(grant.objtype).unwrap_or(ObjectType::Undefined);
+    let (target, wants) = match objtype {
+        // 库上只有 `CONNECT` 一件事可授(它是"进得来"这个权限,不是表权限)
+        ObjectType::ObjectDatabase => {
+            let name = database_name(grant)?;
+            for node in &grant.privileges {
+                let named = match &node.node {
+                    Some(node::Node::AccessPriv(priv_)) => priv_,
+                    _ => return Err(unsupported(tr!("ir.irgen.210").into_owned())),
+                };
+                if !named.cols.is_empty() {
+                    return Err(unsupported(tr!("ir.irgen.209").into_owned()));
+                }
+                // 空 = `ALL`(库上只有 CONNECT,所以也算认了)
+                if !named.priv_name.is_empty() && !named.priv_name.eq_ignore_ascii_case("connect") {
+                    return Err(unsupported(format!("{}", tr!("ir.irgen.209"))));
+                }
+            }
+            (GrantTarget::Database(name), Vec::new())
+        }
+
+        // 表 / 列
+        ObjectType::ObjectTable => {
+            let mut tables = Vec::new();
+            for node in &grant.objects {
+                let range = match &node.node {
+                    Some(node::Node::RangeVar(range)) => range,
+                    _ => return Err(unsupported(tr!("ir.irgen.208").into_owned())),
+                };
+                let name = qualified_name(range)?;
+                // 表必须已经存在:授权对象是**这张表**,不是"以后可能叫这个名字的表"
+                let effective = symbols
+                    .relation(&name)
+                    .ok_or_else(|| DbError::UnknownSymbol { name: name.clone() })?
+                    .name()
+                    .to_string();
+                tables.push((effective, name));
+            }
+            if tables.is_empty() {
+                return Err(unsupported(tr!("ir.irgen.208").into_owned()));
+            }
+
+            let wants = lower_grants(grant)?;
+            for (_, written) in &tables {
+                let all = symbols
+                    .columns(written)
+                    .ok_or_else(|| DbError::UnknownSymbol {
+                        name: written.clone(),
+                    })?;
+                for want in &wants {
+                    for column in &want.columns {
+                        if !all.iter().any(|held| &held.name == column) {
+                            return Err(DbError::UnknownColumn {
+                                name: column.clone(),
+                                available: all.iter().map(|held| held.name.clone()).collect(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            (
+                GrantTarget::Tables(tables.into_iter().map(|(effective, _)| effective).collect()),
+                wants,
+            )
+        }
+
+        other => {
+            return Err(unsupported(format!("{}", tr!("ir.irgen.199", arg0 = 
+                other.as_str_name()
+            ))))
+        }
+    };
+
+    Ok(Stmt::Grant(GrantRequest {
+        is_grant: grant.is_grant,
+        target,
+        grantees,
+        grants: wants,
+    }))
+}
+
+/// `GRANT ... ON DATABASE <名字>` 里那个名字(本版只认一个).
+fn database_name(grant: &GrantStmt) -> Result<String> {
+    let mut names = Vec::new();
+    for node in &grant.objects {
+        match const_string(node) {
+            Some(name) => names.push(name),
+            None => return Err(unsupported(tr!("ir.irgen.208").into_owned())),
+        }
+    }
+    match names.as_slice() {
+        [one] => Ok(one.clone()),
+        _ => Err(unsupported(tr!("ir.irgen.208").into_owned())),
+    }
+}
+
+/// 表上那几种权限连同各自的列清单(`ALL` 展开成三种).
+fn lower_grants(grant: &GrantStmt) -> Result<Vec<PrivilegeGrant>> {
+    let mut wants: Vec<PrivilegeGrant> = Vec::new();
+    for node in &grant.privileges {
+        let named = match &node.node {
+            Some(node::Node::AccessPriv(priv_)) => priv_,
+            _ => return Err(unsupported(tr!("ir.irgen.210").into_owned())),
+        };
+
+        // 列清单:这一条权限只授这几列(`GRANT SELECT (title) ON movies`)
+        let mut columns = Vec::new();
+        for column in &named.cols {
+            match const_string(column) {
+                Some(name) => columns.push(name),
+                None => return Err(unsupported(tr!("ir.irgen.207").into_owned())),
+            }
+        }
+
+        // `priv_name` 为空 = `GRANT ALL ...`:本版只有这三种
+        let kinds: Vec<Privilege> = if named.priv_name.is_empty() {
+            Privilege::all().to_vec()
+        } else {
+            let name = named.priv_name.to_ascii_uppercase();
+            vec![match name.as_str() {
+                "SELECT" => Privilege::Select,
+                "INSERT" => Privilege::Insert,
+                "UPDATE" => Privilege::Update,
+                other => {
+                    return Err(unsupported(format!("{}", tr!("ir.irgen.203", arg0 = other))))
+                }
+            }]
+        };
+
+        for privilege in kinds {
+            match wants.iter_mut().find(|held| held.privilege == privilege) {
+                // 同一种权限写了两遍(或者 `ALL` 与具体的混写):列清单并起来
+                Some(held) => {
+                    for column in &columns {
+                        if !held.columns.contains(column) {
+                            held.columns.push(column.clone());
+                        }
+                    }
+                }
+                None => wants.push(PrivilegeGrant {
+                    privilege,
+                    columns: columns.clone(),
+                }),
+            }
+        }
+    }
+
+    if wants.is_empty() {
+        // 权限列表空着 = `ALL`
+        wants.extend(Privilege::all().into_iter().map(|privilege| PrivilegeGrant {
+            privilege,
+            columns: Vec::new(),
+        }));
+    }
+    for want in &mut wants {
+        want.columns.sort();
+        want.columns.dedup();
+    }
+    wants.sort_by_key(|want| want.privilege);
+    Ok(wants)
+}
+
+/// `DROP OWNED BY <角色>`:把这个角色在**当前库**里的授权收回.
+///
+/// 本版只做当前库(表在同名的库里,别的库的表本会话根本看不到);要清别的库,
+/// 先 `\c` 过去.`CASCADE` / `RESTRICT` 一律拒绝(本版没有依赖可级联).
+fn lower_drop_owned(drop: &DropOwnedStmt) -> Result<Stmt> {
+    if DropBehavior::try_from(drop.behavior).unwrap_or(DropBehavior::Undefined)
+        == DropBehavior::DropCascade
+    {
+        return Err(unsupported(tr!("ir.irgen.200", arg0 = "CASCADE")));
+    }
+    let mut roles = Vec::new();
+    for node in &drop.roles {
+        roles.push(role_spec(node_role_spec(node))?);
+    }
+    if roles.is_empty() {
+        return Err(unsupported(tr!("ir.irgen.208").into_owned()));
+    }
+    Ok(Stmt::DropOwned { roles })
+}
+
+/// `ALTER DATABASE <库> OWNER TO <角色>`:换库的 owner.
+///
+/// 本版**只认这一条** `ALTER DATABASE` 的 owner 写法(`SET search_path` 在
+/// `irgen` 的另一处);`RENAME` 照样拒绝.
+fn lower_alter_owner(owner: &AlterOwnerStmt) -> Result<Stmt> {
+    let objtype = ObjectType::try_from(owner.object_type).unwrap_or(ObjectType::Undefined);
+    if objtype != ObjectType::ObjectDatabase {
+        return Err(unsupported(tr!("ir.irgen.199", arg0 = objtype.as_str_name())));
+    }
+
+    let name = match owner.object.as_deref().and_then(|node| node.node.as_ref()) {
+        Some(node::Node::String(text)) => text.sval.clone(),
+        _ => return Err(unsupported(tr!("ir.irgen.208").into_owned())),
+    };
+    let new_owner = role_spec(owner.newowner.as_ref())?;
+
+    Ok(Stmt::SetDatabaseOwner {
+        name,
+        owner: new_owner,
+    })
 }
 
 /// `ALTER ROLE r RENAME TO s`:语法树里是 [`RenameStmt`],别的 `RENAME` 照旧拒绝.
@@ -1325,6 +1575,14 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
     // 要补 `DEFAULT`(没有默认值就补 NULL,与 PostgreSQL 一致)
     let permutation = column_permutation(insert, &target)?;
 
+    // 这条语句**写了**哪几列(权限检查用):没写列名时是全部列;`DEFAULT` 补出来的
+    // 列不算用户写的(与 PostgreSQL 一致)
+    let written: Vec<usize> = permutation
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| source.map(|_| index))
+        .collect();
+
     let mut rows = Vec::with_capacity(select.values_lists.len());
     for values in &select.values_lists {
         let items = match &values.node {
@@ -1370,7 +1628,11 @@ fn lower_insert(insert: &InsertStmt, symbols: &SymbolTable) -> Result<Stmt> {
         rows.push(row);
     }
 
-    Ok(Stmt::Insert { table, rows })
+    Ok(Stmt::Insert {
+        table,
+        columns: written,
+        rows,
+    })
 }
 
 /// 一条省略列的补值:`DEFAULT`(存的是 CSV 字段形式)或 NULL.

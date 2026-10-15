@@ -35,6 +35,8 @@
 //! `inputs` 的偏移--**没有"派生表"这个算子**,它在外层看来就是一段子计划.
 //! `UNION [ALL]` 则有自己的 [`Op::Union`];`SELECT DISTINCT` 是 [`Op::Distinct`].
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::db::table::{Column, DataType, DbError, Result, TypeFamily};
 
 use super::expr::{Prog, Step, SubMode};
@@ -586,6 +588,230 @@ impl Plan {
         })
     }
 
+    /// 这个计划(含子计划)**读到了**每张被扫到的表的哪些列.
+    ///
+    /// 返回值是 `生效表名 → 用到的列集合`:
+    ///
+    /// * `Some(集合)` -- 具体读到的那几列(可能是空集:`SELECT 1 FROM t` 一列都没读);
+    /// * `None` -- **这张表的全部列**(保守分支:去重,`UNION` 去重,相关子查询那几处
+    ///   算不准,就按"整表"算).
+    ///
+    /// 权限检查用它(`Stmt::Query` 要 `SELECT`):**方向永远是"宁可多要"**--
+    /// 少要一次就是一次安静的越权读,多要一次只是多一句"没权限".
+    ///
+    /// 怎么算:从 root 往回推.`Plan::analyze` 已经给出每个节点的输出 schema 与
+    /// 程序输入 schema,`for_each_program` 给出每个节点的程序,`Prog::columns()`
+    /// 给出程序引用到的输入列(含子程序).**I1(输入的下标一定更小)**让"从后往前
+    /// 扫一趟"就够:轮到某个节点时,所有消费它的节点的需求都已经推进来了.
+    pub fn used_columns(
+        &self,
+        symbols: &SymbolTable,
+    ) -> Result<BTreeMap<String, Option<BTreeSet<String>>>> {
+        let mut raw: BTreeMap<String, Option<BTreeSet<usize>>> = BTreeMap::new();
+        self.collect_used_columns(symbols, &mut raw)?;
+
+        // 列号 → 列名(取不到那张表就按"全部"算:保守那一边)
+        let mut named = BTreeMap::new();
+        for (table, columns) in raw {
+            let names = match (columns, symbols.columns(&table)) {
+                (Some(indices), Some(all)) => Some(
+                    indices
+                        .iter()
+                        .filter_map(|index| all.get(*index))
+                        .map(|column| column.name.clone())
+                        .collect::<BTreeSet<String>>(),
+                ),
+                _ => None,
+            };
+            named.insert(table, names);
+        }
+        Ok(named)
+    }
+
+    /// [`Plan::used_columns`] 的递归实现:这一棵计划扫过的表都并进 `out`.
+    fn collect_used_columns(
+        &self,
+        symbols: &SymbolTable,
+        out: &mut BTreeMap<String, Option<BTreeSet<usize>>>,
+    ) -> Result<()> {
+        // **`analyze_shallow`,不是 `analyze`**:子计划是"挂在别人身上"的计划,它的
+        // `Step::Outer` 要拿**外层链**才校得动,而外层链是绑定器与 `check_subqueries`
+        // 的事.这里只要 schema 与"程序面对哪份输入",浅层那一半就够--用 `analyze`
+        // 反而会把一个合法的相关子计划当成"没有外层行"报错.
+        let analysis = self.analyze_shallow(symbols)?;
+        let mut used: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.nodes.len()];
+        let mut all = vec![false; self.nodes.len()];
+        if !self.nodes.is_empty() {
+            all[self.root] = true;
+        }
+
+        // 从后往前:轮到某个节点时,消费它的那些节点(下标更大)都已经把需求放进来了
+        for id in (0..self.nodes.len()).rev() {
+            if all[id] {
+                used[id] = (0..analysis.schemas[id].len()).collect();
+            }
+
+            // 先把需求算出来,再往输入上推(免得一边借 self.nodes 一边改 used)
+            let mut wants: Vec<(NodeId, BTreeSet<usize>)> = Vec::new();
+            let mut wants_all: Vec<NodeId> = Vec::new();
+
+            match &self.nodes[id].op {
+                Op::Scan {
+                    table,
+                    filter,
+                    index,
+                } => {
+                    let mut columns = used[id].clone();
+                    let mut everything = all[id];
+                    if let Some(prog) = filter {
+                        columns.extend(prog.columns());
+                        everything |= needs_every_column(prog);
+                    }
+                    if let Some(path) = index {
+                        // 索引路径本身要读那一列(哪怕上层没引用它)
+                        columns.insert(path.column);
+                    }
+                    let name = symbols
+                        .relation(table)
+                        .map(|relation| relation.name().to_string())
+                        .unwrap_or_else(|| table.clone());
+                    merge_used(out, name, if everything { None } else { Some(columns) });
+                }
+                Op::Filter { predicate } => {
+                    let mut columns = used[id].clone();
+                    columns.extend(predicate.columns());
+                    if needs_every_column(predicate) {
+                        wants_all.push(self.nodes[id].inputs[0]);
+                    }
+                    wants.push((self.nodes[id].inputs[0], columns));
+                }
+                Op::Project { progs, .. } => {
+                    let mut columns = BTreeSet::new();
+                    for index in &used[id] {
+                        if let Some(prog) = progs.get(*index) {
+                            columns.extend(prog.columns());
+                        }
+                    }
+                    wants.push((self.nodes[id].inputs[0], columns));
+                }
+                Op::Sort { keys } => {
+                    let mut columns = used[id].clone();
+                    for key in keys {
+                        columns.extend(key.prog.columns());
+                    }
+                    wants.push((self.nodes[id].inputs[0], columns));
+                }
+                Op::Limit { .. } => wants.push((self.nodes[id].inputs[0], used[id].clone())),
+                // 去重要看整行,所以把输入的全部列都算上
+                Op::Distinct => wants_all.push(self.nodes[id].inputs[0]),
+                Op::Union { all: keep_all } => {
+                    let (left, right) = (self.nodes[id].inputs[0], self.nodes[id].inputs[1]);
+                    if *keep_all {
+                        wants.push((left, used[id].clone()));
+                        wants.push((right, used[id].clone()));
+                    } else {
+                        // `UNION` 去重:两边都按整行算
+                        wants_all.push(left);
+                        wants_all.push(right);
+                    }
+                }
+                Op::Aggregate { group_by, aggs, .. } => {
+                    let mut columns = BTreeSet::new();
+                    for index in &used[id] {
+                        match group_by.get(*index) {
+                            Some(prog) => columns.extend(prog.columns()),
+                            None => {
+                                if let Some(spec) = aggs.get(index - group_by.len()) {
+                                    if let Some(arg) = &spec.arg {
+                                        columns.extend(arg.columns());
+                                    }
+                                    if let Some(filter) = &spec.filter {
+                                        columns.extend(filter.columns());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    wants.push((self.nodes[id].inputs[0], columns));
+                }
+                Op::Join { on, strategy, .. } => {
+                    let (left, right) = (self.nodes[id].inputs[0], self.nodes[id].inputs[1]);
+                    let left_len = analysis.schemas[left].len();
+
+                    // 输出是 `左 ++ 右`:被用到的下标按这个分界劈开
+                    let mut left_columns = BTreeSet::new();
+                    let mut right_columns = BTreeSet::new();
+                    for index in &used[id] {
+                        if *index < left_len {
+                            left_columns.insert(*index);
+                        } else {
+                            right_columns.insert(*index - left_len);
+                        }
+                    }
+                    if let Some(prog) = on {
+                        // 连接条件面对的是 `左 ++ 右`
+                        for index in prog.columns() {
+                            if index < left_len {
+                                left_columns.insert(index);
+                            } else {
+                                right_columns.insert(index - left_len);
+                            }
+                        }
+                        if needs_every_column(prog) {
+                            wants_all.push(left);
+                            wants_all.push(right);
+                        }
+                    }
+                    match strategy {
+                        JoinStrategy::NestedLoop => {}
+                        JoinStrategy::Hash { keys } => {
+                            for key in keys {
+                                left_columns.extend(key.outer.columns());
+                                right_columns.extend(key.inner.columns());
+                            }
+                        }
+                        JoinStrategy::IndexNestedLoop { key } => {
+                            left_columns.extend(key.outer.columns());
+                            right_columns.extend(key.inner.columns());
+                        }
+                    }
+
+                    if all[id] {
+                        wants_all.push(left);
+                        wants_all.push(right);
+                    } else {
+                        wants.push((left, left_columns));
+                        wants.push((right, right_columns));
+                    }
+                }
+                Op::SingleRow => {}
+            }
+
+            for target in wants_all {
+                all[target] = true;
+            }
+            for (target, columns) in wants {
+                if all[target] {
+                    continue;
+                }
+                used[target].extend(columns);
+            }
+        }
+
+        // 子计划是**另一棵计划**,各自从头走一遍(外层需求与它无关:它扫的是自己的表)
+        for node in &self.nodes {
+            let mut subplans = Vec::new();
+            for_each_program(&node.op, &mut |prog| {
+                subplans.extend(prog.subplans());
+            });
+            for spec in subplans {
+                spec.plan.collect_used_columns(symbols, out)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// root 的输出 schema.
     pub fn schema(&self, symbols: &SymbolTable) -> Result<Vec<Column>> {
         let analysis = self.analyze(symbols)?;
@@ -896,10 +1122,32 @@ fn at(node: NodeId, e: DbError) -> DbError {
 
 // ------------------------------------------------------------ 子查询的校验
 
+/// 把一张表的需求并进总表:`None`(全部列)压过具体集合.
+fn merge_used(
+    out: &mut BTreeMap<String, Option<BTreeSet<usize>>>,
+    table: String,
+    columns: Option<BTreeSet<usize>>,
+) {
+    let slot = out.entry(table).or_insert_with(|| Some(BTreeSet::new()));
+    match (&mut *slot, columns) {
+        (slot @ None, _) => *slot = None,
+        (slot, None) => *slot = None,
+        (Some(held), Some(columns)) => held.extend(columns),
+    }
+}
+
+/// 这个程序(含子程序)里有**相关**子查询吗?有就得把这一层的列全算上.
+///
+/// 相关子查询读外层行走的是 `Step::Outer`,而 `Prog::columns()` 看不到它
+/// (它只数"本程序引用的输入列")--所以这里保守一次:整层都算读到.
+fn needs_every_column(prog: &Prog) -> bool {
+    prog.subplans().iter().any(|spec| spec.correlated)
+}
+
 /// 把一个 [`Op`] 里**所有** [`Prog`] 交给 `visit`.
 ///
 /// 穷尽 match:加新算子时会编译报错,不会漏掉某个程序的子查询校验.
-fn for_each_program(op: &Op, visit: &mut dyn FnMut(&Prog)) {
+fn for_each_program<'a>(op: &'a Op, visit: &mut dyn FnMut(&'a Prog)) {
     match op {
         Op::SingleRow | Op::Distinct | Op::Union { .. } => {}
         Op::Scan { filter, index, .. } => {

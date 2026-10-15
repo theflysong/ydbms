@@ -927,6 +927,23 @@ impl Prog {
         })
     }
 
+    /// 这个程序(含子程序)里**直接挂着**的子计划,按出现顺序.
+    ///
+    /// 嵌套的那种(子计划里还有子计划)由调用方递归--它拿到的是一整份 [`SubPlan`],
+    /// 里面还有一棵计划.
+    pub fn subplans(&self) -> Vec<&SubPlan> {
+        let mut out = Vec::new();
+        for step in &self.steps {
+            if let Step::Subquery { spec, .. } = step {
+                out.push(&**spec);
+            }
+            for sub in subprograms(step) {
+                out.extend(sub.subplans());
+            }
+        }
+        out
+    }
+
     /// 这个程序引用外层行吗.
     pub fn has_outer(&self) -> bool {
         self.steps.iter().any(|step| match step {

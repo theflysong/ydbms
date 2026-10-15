@@ -28,6 +28,8 @@
 //! [`has_top_level_terminator`] 是给 REPL 用的:判断"这段输入里有没有一句说完",
 //! 于是多行 SQL 能攒到分号才提交,而字符串/注释里的分号不会被误切.
 
+use std::collections::BTreeSet;
+
 use pg_query::protobuf::RawStmt;
 
 use crate::db::phys::PhysTab;
@@ -41,6 +43,7 @@ use super::expr::Prog;
 use super::plan::Plan;
 use super::symbol::{SymbolTable, TxKind};
 use super::{exec, irgen};
+use crate::usr::grants::Privilege;
 use crate::usr::{Password, PasswordAction, RoleAttrChange, RoleAttrs};
 
 /// 一条语句.
@@ -73,6 +76,11 @@ pub enum Stmt {
     Insert {
         /// 表名.
         table: String,
+        /// 这条语句**写了**哪几列(表内列下标,升序).
+        ///
+        /// 权限检查用:`INSERT ... VALUES (...)` 没写列名时是**全部列**;写了列表
+        /// 就只算那几列(`DEFAULT` 补出来的值不算用户写的--与 PostgreSQL 一致).
+        columns: Vec<usize>,
         /// 每一行按**表的列序**给出全部列的值.
         ///
         /// 降级时已经按语句里的列名表重排过了,所以这里的位置是确定的;值表达式
@@ -203,6 +211,32 @@ pub enum Stmt {
     /// `GRANT <角色> TO <成员>` / `REVOKE <角色> FROM <成员>`:成员关系.
     GrantRole(GrantRoleRequest),
 
+    /// `GRANT` / `REVOKE <对象权限>`(表 / 列,或者库上的 `CONNECT`).
+    ///
+    /// 与角色那几条一样只把"名字,权限,受权人"交出去;授权表长什么样,谁能授,
+    /// 都在实现方.
+    Grant(GrantRequest),
+
+    /// `DROP OWNED BY <角色>`:把这个角色在**当前库**里的授权全部收回.
+    ///
+    /// 它存在的理由是 [`Stmt::DropRole`]:有授权的角色不许删,先 `DROP OWNED BY`
+    /// 清干净才能删(PostgreSQL 也是这个配套).
+    DropOwned {
+        /// 要清哪些角色.
+        roles: Vec<String>,
+    },
+
+    /// `ALTER DATABASE <库> OWNER TO <角色>`:换库的 owner.
+    ///
+    /// 写的是**另一个库**的 `catalog.json`(可能不是本会话连着的那个),
+    /// 所以实现方要借那个库的单写者锁.
+    SetDatabaseOwner {
+        /// 库名.
+        name: String,
+        /// 新 owner 的角色名.
+        owner: String,
+    },
+
     /// `SET ROLE <角色>` / `SET ROLE NONE` / `RESET ROLE`.
     ///
     /// `None` 表示回到**会话用户**(也就是连接时认证的那个人).这是**会话状态**,
@@ -238,6 +272,37 @@ pub struct AlterRoleRequest {
     pub password: PasswordAction,
     /// 要改的属性(只改列出来的这几条).
     pub changes: Vec<RoleAttrChange>,
+}
+
+/// `GRANT` / `REVOKE <对象权限>` 降级出来的东西.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRequest {
+    /// `true` 是 `GRANT`,`false` 是 `REVOKE`.
+    pub is_grant: bool,
+    /// 授给谁 / 从谁那里收.
+    pub target: GrantTarget,
+    /// 受权人(角色名).
+    pub grantees: Vec<String>,
+    /// 授哪几种权限,每种各带一份列清单(空 = 整表).
+    pub grants: Vec<PrivilegeGrant>,
+}
+
+/// `GRANT <权限> [(<列>)]`:一种权限,外加它自己的列清单.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegeGrant {
+    /// 哪一种权限.
+    pub privilege: Privilege,
+    /// **空 = 整表**;非空 = 只有这几列.
+    pub columns: Vec<String>,
+}
+
+/// `GRANT ... ON <什么>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantTarget {
+    /// `ON DATABASE <库>`:本版只认 `CONNECT` 这一个库级权限.
+    Database(String),
+    /// `ON <表>[, <表>]`:表级 / 列级权限(名字是**生效名**).
+    Tables(Vec<String>),
 }
 
 /// `GRANT <角色> TO <成员>` / `REVOKE <角色> FROM <成员>`.
@@ -344,6 +409,35 @@ pub trait Server {
 
     /// 当前角色能不能建库(`CREATE DATABASE`).
     fn check_create_database(&mut self, role: &str) -> Result<()>;
+
+    /// 当前角色对 `table`(生效名)有没有 `want` 这个权限.
+    ///
+    /// `columns` 是**必须覆盖的列名**;它为空有专门的意思:**这张表上至少有一列的
+    /// 该权限**(整表授权或者任意一列的授权)--给 `SELECT count(*) FROM t` 这种
+    /// "没读具体列"的查询用.空切片**不是**"不用检查".
+    fn check_table(
+        &mut self,
+        role: &str,
+        table: &str,
+        want: Privilege,
+        columns: &[String],
+    ) -> Result<()>;
+
+    /// 授 / 收对象权限(表 / 列,或者库上的 `CONNECT`),返回一行状态.
+    fn grant(&mut self, role: &str, request: &GrantRequest) -> Result<String>;
+
+    /// `DROP OWNED BY`:收回这些角色在**当前库**里的授权,返回一行状态.
+    fn drop_owned(&mut self, role: &str, roles: &[String]) -> Result<String>;
+
+    /// `ALTER DATABASE <库> OWNER TO <角色>`,返回一行状态.
+    fn set_database_owner(&mut self, role: &str, name: &str, owner: &str) -> Result<String>;
+
+    /// 这张表刚建出来(或者已经没了):把它名下的旧授权记录清掉.
+    ///
+    /// 两处调它:`DROP SCHEMA ... CASCADE` 之后(提交点里表文件被删时)与
+    /// **新建同名表**之前--否则删过的表名又被建出来,旧授权会**悄悄生效**.
+    /// 两处都只会让权限变少,不会变多.
+    fn forget_grants(&mut self, table: &str) -> Result<()>;
 }
 
 /// 没有服务目录时的 [`Server`]:这些语句都**明确拒绝**.
@@ -407,12 +501,41 @@ impl Server for NoServer {
         Err(no_service_dir("SET ROLE"))
     }
 
-    // 内存里没有用户,键盘前的人就是主人:权限检查**放行**.
+    fn grant(&mut self, _role: &str, request: &GrantRequest) -> Result<String> {
+        Err(no_service_dir(match request.is_grant {
+            true => "GRANT",
+            false => "REVOKE",
+        }))
+    }
+
+    fn drop_owned(&mut self, _role: &str, _roles: &[String]) -> Result<String> {
+        Err(no_service_dir("DROP OWNED BY"))
+    }
+
+    fn set_database_owner(&mut self, _role: &str, _name: &str, _owner: &str) -> Result<String> {
+        Err(no_service_dir("ALTER DATABASE ... OWNER TO"))
+    }
+
+    // 内存里没有用户,键盘前的人就是主人:权限检查**放行**,清授权记录也**无操作**.
     fn check_ddl(&mut self, _role: &str, _what: &str) -> Result<()> {
         Ok(())
     }
 
     fn check_create_database(&mut self, _role: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn check_table(
+        &mut self,
+        _role: &str,
+        _table: &str,
+        _want: Privilege,
+        _columns: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn forget_grants(&mut self, _table: &str) -> Result<()> {
         Ok(())
     }
 }
@@ -554,7 +677,10 @@ pub fn execute_stmt_with(
 /// 一条语句的实际执行([`execute_stmt_with`] 去掉隐式事务那一层).
 fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Result<Outcome> {
     match stmt {
-        Stmt::Query(plan) => Ok(Outcome::Rows(exec::execute(plan, symbols)?)),
+        Stmt::Query(plan) => {
+            check_query_privileges(plan, symbols, dbs)?;
+            Ok(Outcome::Rows(exec::execute(plan, symbols)?))
+        }
 
         Stmt::CreateTable {
             name,
@@ -605,6 +731,9 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
                 symbols.define(name.clone(), CheckedTable::new(table, checks.clone()))?;
             }
 
+            // 新表**先清同名残留**:删过的表名又被建出来时,旧授权不许悄悄生效
+            dbs.forget_grants(&name)?;
+
             Ok(Outcome::Created {
                 name,
                 unenforced: unenforced.clone(),
@@ -612,7 +741,11 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             })
         }
 
-        Stmt::Insert { table, rows } => {
+        Stmt::Insert {
+            table,
+            columns: written,
+            rows,
+        } => {
             // 先把每一行算出来(值表达式没有输入行),再逐行落库:
             // 索引要的键必须在行搬进表**之前**取出来,所以不能一边借表一边算.
             let mut values: Vec<Row> = Vec::with_capacity(rows.len());
@@ -637,6 +770,10 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
                 .relation(table)
                 .map(|relation| relation.name().to_string())
                 .unwrap_or_else(|| table.clone());
+
+            // 写入的列(没写列名时是全部列):要 `INSERT` 权限
+            let written = column_names(symbols, table, written);
+            dbs.check_table(symbols.role(), &effective, Privilege::Insert, &written)?;
 
             let mut inserted = 0usize;
             for row in values {
@@ -678,6 +815,31 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
                     name: table.clone(),
                 })?
                 .to_vec();
+
+            // 权限:写到的列要 `UPDATE`;`SET` 表达式与 `WHERE` 读到的列要 `SELECT`
+            // (与 PostgreSQL 一致).一列都没读(例如 `SET x = 1`)就不查 `SELECT`.
+            let written: Vec<String> = sets
+                .iter()
+                .filter_map(|(index, _)| columns.get(*index))
+                .map(|column| column.name.clone())
+                .collect();
+            dbs.check_table(symbols.role(), &effective, Privilege::Update, &written)?;
+
+            let mut read: BTreeSet<usize> = BTreeSet::new();
+            if let Some(prog) = filter {
+                read.extend(prog.columns());
+            }
+            for (_, prog) in sets {
+                read.extend(prog.columns());
+            }
+            if !read.is_empty() {
+                let names: Vec<String> = read
+                    .iter()
+                    .filter_map(|index| columns.get(*index))
+                    .map(|column| column.name.clone())
+                    .collect();
+                dbs.check_table(symbols.role(), &effective, Privilege::Select, &names)?;
+            }
 
             // **先**让这张表上的索引全部失效:万一中途出错(约束,短读),
             // 已经改过的行也不会留下一份错的索引--宁可下次重建一遍
@@ -914,6 +1076,33 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             })
         }
 
+        Stmt::Grant(request) => {
+            reject_in_transaction(
+                symbols,
+                match request.is_grant {
+                    true => "GRANT",
+                    false => "REVOKE",
+                },
+            )?;
+            Ok(Outcome::NoOp {
+                message: dbs.grant(symbols.role(), request)?,
+            })
+        }
+
+        Stmt::DropOwned { roles } => {
+            reject_in_transaction(symbols, "DROP OWNED BY")?;
+            Ok(Outcome::NoOp {
+                message: dbs.drop_owned(symbols.role(), roles)?,
+            })
+        }
+
+        Stmt::SetDatabaseOwner { name, owner } => {
+            reject_in_transaction(symbols, "ALTER DATABASE")?;
+            Ok(Outcome::NoOp {
+                message: dbs.set_database_owner(symbols.role(), name, owner)?,
+            })
+        }
+
         // `SET ROLE` 是**会话状态**,不是服务目录:先在实现方问出"能借哪个身份",
         // 再把它记进符号表(于是它能被 `ROLLBACK` 盖回去).事务里**允许**--
         // 与 `SET search_path` 同一档.
@@ -925,6 +1114,43 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             })
         }
     }
+}
+
+/// 这个计划扫到的每张表,按**真正读到的列**要 `SELECT`.
+///
+/// `Plan::used_columns` 的保守分支(`None` = 整表)在这里展开成"这张表的全部列",
+/// 于是下游只剩一种问法:`check_table(..., &列名)`;空切片 = "这张表上至少有一列的
+/// 该权限"(`SELECT count(*) FROM t` 这种).
+fn check_query_privileges(
+    plan: &Plan,
+    symbols: &SymbolTable,
+    dbs: &mut dyn Server,
+) -> Result<()> {
+    let role = symbols.role().to_string();
+    for (table, columns) in plan.used_columns(symbols)? {
+        let wanted: Vec<String> = match columns {
+            Some(columns) => columns.into_iter().collect(),
+            None => symbols
+                .columns(&table)
+                .map(|all| all.iter().map(|column| column.name.clone()).collect())
+                .unwrap_or_default(),
+        };
+        dbs.check_table(&role, &table, Privilege::Select, &wanted)?;
+    }
+    Ok(())
+}
+
+/// 一组表内列下标 → 列名(取不到的列直接跳过:那是"这张表已经不存在了"的信号,
+/// 后面的写路径自己会报 `UnknownSymbol`).
+fn column_names(symbols: &SymbolTable, table: &str, indices: &[usize]) -> Vec<String> {
+    let Some(all) = symbols.columns(table) else {
+        return Vec::new();
+    };
+    indices
+        .iter()
+        .filter_map(|index| all.get(*index))
+        .map(|column| column.name.clone())
+        .collect()
 }
 
 /// 这几条语句在事务里一律拒绝(见调用处的理由).

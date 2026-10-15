@@ -59,6 +59,7 @@
 //! `Session::run_sql` 在每条语句之后调 [`Session::commit`],它做三件事:
 //!
 //! * 只写**脏表**(`CREATE TABLE` / `INSERT` / `UPDATE` 碰过的那几张),不是整库重写;
+//!   删掉的表**先清它的授权**(`retire_grants`),再提交表文件;
 //! * 顺手删掉"磁盘上有,符号表里已经没了"的表文件(`DROP SCHEMA ... CASCADE` 的落点);
 //!   **两张都空时一个字节的 IO 都不做**(只读语句占绝大多数);
 //! * 内存模式下一行 IO 都不做;**事务开着时直接返回**(提交点是 `COMMIT`).
@@ -91,7 +92,10 @@ use std::time::Instant;
 
 use crate::db::phys::PhysTab;
 use crate::db::table::{DbError, Result, TabShape, Table};
-use crate::ir::stmt::{AlterRoleRequest, CreateRoleRequest, GrantRoleRequest, Server};
+use crate::ir::stmt::{
+    AlterRoleRequest, CreateRoleRequest, GrantRequest, GrantRoleRequest, GrantTarget, Server,
+};
+use crate::usr::grants::Privilege;
 use crate::ir::{Outcome, Script, StmtResult, Symbol, SymbolTable, TxOp};
 use crate::usr::service::{Database, ServiceDir};
 use crate::usr::{PasswordAction, User};
@@ -324,6 +328,153 @@ impl Server for Store {
         )?;
         self.service
             .grant_roles(&request.roles, &request.members, request.is_grant)
+    }
+
+
+    fn check_table(
+        &mut self,
+        role: &str,
+        table: &str,
+        want: Privilege,
+        columns: &[String],
+    ) -> Result<()> {
+        if self.is_superuser(role)? || self.service.acts_as(role, self.db.owner())? {
+            return Ok(());
+        }
+
+        let grants = self.db.grants();
+        let allowed = if columns.is_empty() {
+            // "这张表上至少有一列的该权限":`SELECT count(*) FROM t` 这种一列都没读
+            grants.allows_any(role, table, want)
+        } else {
+            columns
+                .iter()
+                .all(|column| grants.allows(role, table, want, column))
+        };
+        if allowed {
+            return Ok(());
+        }
+
+        Err(DbError::Denied {
+            message: match columns.is_empty() {
+                true => format!("{}", tr!("cmd.engine.082", arg0 = 
+                    role, arg1 =  table, arg2 =  want.as_str()
+                )),
+                false => format!("{}", tr!("cmd.engine.081", arg0 = 
+                    role, arg1 = 
+                    table, arg2 = 
+                    want.as_str(), arg3 = 
+                    columns.join(",")
+                )),
+            },
+        })
+    }
+
+    fn grant(&mut self, role: &str, request: &GrantRequest) -> Result<String> {
+        for grantee in &request.grantees {
+            self.service.require_user(grantee)?;
+        }
+
+        match &request.target {
+            // 库级的 `CONNECT`:授权对象是**那个库**,所以 owner 判定看的是它
+            GrantTarget::Database(name) => {
+                self.check_owner(role, name, &tr!("cmd.engine.083").into_owned())?;
+
+                if name == self.db.name() {
+                    // 本会话连着的库:直接改手里那一份(锁就在手上)
+                    let mut grants = self.db.grants().clone();
+                    for grantee in &request.grantees {
+                        grants.set_connect(grantee, request.is_grant);
+                    }
+                    self.db.set_grants(grants)?;
+                } else {
+                    // 别的库:借一次它的单写者锁(拿不到就不改)
+                    let grantees = request.grantees.clone();
+                    let is_grant = request.is_grant;
+                    self.service.with_grants(name, |grants| {
+                        for grantee in &grantees {
+                            grants.set_connect(grantee, is_grant);
+                        }
+                        Ok(())
+                    })?;
+                }
+
+                Ok(match request.is_grant {
+                    true => format!("{}", tr!("cmd.engine.084", arg0 = 
+                        request.grantees.join(","), arg1 =  name
+                    )),
+                    false => format!("{}", tr!("cmd.engine.085", arg0 = 
+                        request.grantees.join(","), arg1 =  name
+                    )),
+                })
+            }
+
+            // 表 / 列:表在**本会话连着的库**里,所以 owner 判定看的是本库
+            GrantTarget::Tables(tables) => {
+                self.check_owner(role, self.db.name(), &tr!("cmd.engine.083").into_owned())?;
+
+                let mut grants = self.db.grants().clone();
+                for table in tables {
+                    for grantee in &request.grantees {
+                        for want in &request.grants {
+                            grants.set_table(
+                                table,
+                                grantee,
+                                want.privilege,
+                                &want.columns,
+                                request.is_grant,
+                            );
+                        }
+                    }
+                }
+                self.db.set_grants(grants)?;
+
+                let shown: Vec<String> = request
+                    .grants
+                    .iter()
+                    .map(|want| match want.columns.is_empty() {
+                        true => want.privilege.as_str().to_string(),
+                        false => format!("{}({})", want.privilege.as_str(), want.columns.join(",")),
+                    })
+                    .collect();
+                let tables = tables.join(",");
+                Ok(match request.is_grant {
+                    true => format!("{}", tr!("cmd.engine.086", arg0 = 
+                        request.grantees.join(","), arg1 =  tables, arg2 =  shown.join(",")
+                    )),
+                    false => format!("{}", tr!("cmd.engine.087", arg0 = 
+                        request.grantees.join(","), arg1 =  tables, arg2 =  shown.join(",")
+                    )),
+                })
+            }
+        }
+    }
+
+    fn drop_owned(&mut self, role: &str, roles: &[String]) -> Result<String> {
+        self.require_role_manager(role, "DROP OWNED BY")?;
+
+        let mut grants = self.db.grants().clone();
+        for name in roles {
+            grants.set_owned_away(name);
+        }
+        self.db.set_grants(grants)?;
+        Ok(format!("{}", tr!("cmd.engine.088", arg0 = 
+            roles.join(","), arg1 =  self.db.name()
+        )))
+    }
+
+    fn set_database_owner(&mut self, role: &str, name: &str, owner: &str) -> Result<String> {
+        // 换 owner 是超级用户或那个库当前的 owner 的事(与 PostgreSQL 一致)
+        if !self.is_superuser(role)? {
+            self.check_owner(role, name, &tr!("cmd.engine.089").into_owned())?;
+        }
+        self.service.require_user(owner)?;
+        self.service.set_database_owner(name, owner)
+    }
+
+    fn forget_grants(&mut self, table: &str) -> Result<()> {
+        let tables = vec![table.to_string()];
+        self.db.retire_grants(&tables)
     }
 
     fn resolve_role(&mut self, current: &str, target: Option<&str>) -> Result<String> {
@@ -749,6 +900,13 @@ impl Session {
                 // 没有东西要写,也不算错(它的文件压根没落过盘)
                 None => continue,
             }
+        }
+
+        // 表文件要删了:它们名下的授权记录一并清掉.**先清授权再提交表文件**,
+        // 顺序有意--万一提交随后失败,错的是"权限少了"(owner 一句 GRANT 就能补回来),
+        // 而不是"旧授权落在了一张同名的新表上"(那是权限泄漏).
+        if !gone.is_empty() {
+            store.db.retire_grants(&gone)?;
         }
 
         store.db.commit(&tables, &gone)?;
