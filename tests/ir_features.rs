@@ -347,6 +347,48 @@ fn concat_refuses_a_non_text_side() {
 }
 
 #[test]
+fn coalesce_picks_the_first_non_null() {
+    // 期望值逐条对照过 PostgreSQL 18.6
+    let symbols = db();
+    let out = q(
+        &symbols,
+        "SELECT COALESCE(NULL, 'a') AS a,
+                COALESCE(NULL, NULL) AS nn,
+                COALESCE('a', 'b') AS ab,
+                COALESCE(score, 0) AS s
+         FROM t WHERE id = 4",
+    );
+    assert_eq!(out.value(0, 0), Some(Value::Text("a".to_string())));
+    assert_eq!(out.value(0, 1), Some(Value::Null));
+    assert_eq!(out.value(0, 2), Some(Value::Text("a".to_string())));
+    // 第 4 行的 score 是 NULL → 取 0(一侧是 NUMERIC,按 `CASE` 那条规则放大)
+    assert_eq!(out.value(0, 3), Some(Value::Numeric("0".to_string())));
+}
+
+#[test]
+fn coalesce_unifies_argument_types_like_case() {
+    let symbols = db();
+
+    // 两侧都是 INT 就不放大(`COALESCE(id, 0)` 的类型仍是 INT)
+    let out = q(&symbols, "SELECT COALESCE(id, 0) AS x FROM t WHERE id = 1");
+    assert_eq!(out.columns()[0].ty, DataType::Int);
+    assert_eq!(out.value(0, 0), Some(Value::Int(1)));
+
+    // INT 与 NUMERIC 统一成 NUMERIC,取到 INT 那一侧要真的转
+    // (PostgreSQL 18.6 上 `SELECT COALESCE(NULL, 1, 2.5)` 就是 `1`,类型 numeric)
+    let out = q(&symbols, "SELECT COALESCE(NULL, 1, 2.5) AS x");
+    assert_eq!(out.columns()[0].ty, DataType::NumericAny);
+    assert_eq!(out.value(0, 0), Some(Value::Numeric("1".to_string())));
+
+    let out = q(&symbols, "SELECT COALESCE(NULL, 2.5, 1) AS x");
+    assert_eq!(out.value(0, 0), Some(Value::Numeric("2.5".to_string())));
+
+    // 统一不了的组合要拒绝(PostgreSQL 也说 COALESCE 的 text 与 integer 对不上)
+    let err = rejected(&symbols, "SELECT COALESCE(NULL, 'a', 1)");
+    assert!(err.to_string().contains("COALESCE"), "{err}");
+}
+
+#[test]
 fn extract_year_reads_the_first_four_digits() {
     let symbols = db();
     // 入学年份(`enrolled_at` 是定宽 TIMESTAMP 文本,取前 4 位即可)

@@ -569,3 +569,30 @@ fn star_in_a_grouped_query_is_rejected_with_a_hint() {
     let err = failure(&mut db, "SELECT * FROM t GROUP BY g");
     assert!(err.to_string().contains("GROUP BY"), "{err}");
 }
+
+#[test]
+fn coalesce_can_be_a_group_key() {
+    // `GROUP BY COALESCE(...)`(tests.sql 的 14.3 那个形状):分组要真按那个表达式分,
+    // 不是只在投影里算一遍.NULL 单独成一组.
+    let mut db = db(
+        "CREATE TABLE u (k INT, v INT);
+         INSERT INTO u VALUES (1, 1), (1, 2), (NULL, 3), (2, 4);",
+    );
+
+    let table = q(&mut db, "SELECT COALESCE(k, -1) AS key, COUNT(*) AS n FROM u GROUP BY COALESCE(k, -1) ORDER BY key");
+    assert_eq!(pairs(&table, 0, 1), vec!["-1=1", "1=2", "2=1"]);
+
+    // 反向对照:投影里的表达式与分组键**不同**就得拒绝(`k` 既不是分组键,
+    // 也没被聚合包住).这条能证明上面那条真的把 COALESCE 认成了分组键--
+    // 否则它就只是"投影里另算了一遍"
+    let err = failure(&mut db, "SELECT k, COUNT(*) FROM u GROUP BY COALESCE(k, -1)");
+    assert!(err.to_string().contains("GROUP BY"), "{err}");
+}
+
+#[test]
+fn coalesce_over_an_aggregate_is_still_a_grouped_query() {
+    // `COALESCE(COUNT(*), 0)` 的参数里有聚合 -- "是不是分组查询"要判对,
+    // 否则这个聚合会被当成"出现在了不能出现的位置"
+    let mut db = db(FIXTURE);
+    assert_eq!(one(&mut db, "SELECT COALESCE(COUNT(*), 0) FROM t"), "5");
+}

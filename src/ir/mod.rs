@@ -58,6 +58,7 @@
 //! `LIMIT`/`OFFSET`,`DISTINCT`),聚合与 `GROUP BY`/`HAVING`/`COUNT(*) FILTER`,
 //! `CASE`,`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`~*`,`||`(文本连接,两侧必须都是文本--
 //! 这条与 PostgreSQL 的 `text || anynonarray` 是**已知偏差**,见 `expr::BinOp`),
+//! `COALESCE`(变参,惰性,类型按 `CASE` 那条规则统一),
 //! `ROUND`/`UPPER`/`LEFT`/`CONCAT_WS`/
 //! `LENGTH`/`EXTRACT(YEAR FROM ...)`/`CURRENT_DATE`,`::numeric`,
 //! `CREATE TABLE`(`NOT NULL` / `DEFAULT` / `CHECK` 真强制;`PRIMARY KEY` / `UNIQUE` /

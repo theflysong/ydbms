@@ -329,6 +329,27 @@ pub enum Step {
         /// 左侧不是 TRUE 时才求值的右侧子程序.
         right_prog: Prog,
     },
+    /// `regs[dst] = COALESCE(args...)`,**逐个求值,取第一个非 NULL**.
+    ///
+    /// 每个参数都是**自足子程序**(自己的寄存器空间),只有前面那些都是 NULL 时才求值
+    /// --与 [`Step::Case`] 的分支是同一条惰性口径:`COALESCE(1, 1/0)` 是 1,
+    /// 死参数里的除零不该冒出来.全 NULL 得 NULL.
+    ///
+    /// > "这一侧是 NULL 吗"与 [`Step::IsNull`] 同一条判据:`Scalar::Value(Value::Null)`
+    /// > 与 `Scalar::Truth(Tri::Unknown)` 都算 NULL(后者对应 SQL 里 `COALESCE(x > 1,
+    /// > false)` 的 UNKNOWN 那一项).
+    Coalesce {
+        /// 目的寄存器.
+        dst: Reg,
+        /// 参数子程序,按书写顺序求值.
+        args: Vec<Prog>,
+        /// 统一后的类型是 `NUMERIC`(取到 `INT` 时要**真的转**).
+        ///
+        /// 与 [`Step::Case::widen`] 同一个约定,也同一条理由:类型放行之后运行时必须
+        /// 真转,否则物化时会以 `TypeMismatch` 报错.由**降级**算不出来(它要拿所有
+        /// 参数的类型),所以 [`Prog::verify`] 强制它与 `unify_branches` 的结果一致.
+        widen: bool,
+    },
     /// 标量函数调用.
     Call {
         /// 目的寄存器.
@@ -690,6 +711,29 @@ impl Prog {
                     require(right_prog.verify(input)?, ScalarType::Bool, at, what)?;
                     write_reg(&mut defined, *dst, ScalarType::Bool, at)?;
                 }
+                Step::Coalesce { dst, args, widen } => {
+                    // 参数的类型按 `CASE` 那条规则统一(同族 / NULL / INT↔NUMERIC),
+                    // 报错用 COALESCE 自己的说法,不借 `CASE` 的文案
+                    let mut unified = ScalarType::Null;
+                    for (index, arg) in args.iter().enumerate() {
+                        let ty = arg.verify(input)?;
+                        unified = unify_branches(unified, ty, at).map_err(|_| {
+                            invalid(format!("{}", tr!("ir.expr.046", arg0 = 
+                                at, arg1 = 
+                                index, arg2 = 
+                                unified, arg3 = 
+                                ty
+                            )))
+                        })?;
+                    }
+                    let needs_widen = unified == ScalarType::Value(TypeFamily::Numeric);
+                    if *widen != needs_widen {
+                        return Err(invalid(format!("{}", tr!("ir.expr.017", arg0 = 
+                            at, arg1 =  widen, arg2 =  unified, arg3 =  unified, arg4 =  needs_widen
+                        ))));
+                    }
+                    write_reg(&mut defined, *dst, unified, at)?;
+                }
                 Step::Call { dst, func, args } => {
                     let mut types = Vec::with_capacity(args.len());
                     for reg in args {
@@ -848,6 +892,24 @@ impl Prog {
                         t.or(r.as_truth().ok_or(EvalError::NotABool)?)
                     };
                     put(&mut regs, *dst, Scalar::Truth(v), self.nregs)?;
+                }
+                Step::Coalesce { dst, args, widen } => {
+                    // **只有前面都是 NULL 才继续求值**:死参数里的运行期错误不该冒出来
+                    let mut picked = Scalar::Value(Value::Null);
+                    for arg in args {
+                        let value = arg.eval_with(left, right, env)?;
+                        // "是 NULL 吗"与 `IS NULL` 同一条判据:真值里的 `Unknown` 也算
+                        let is_null = match &value {
+                            Scalar::Value(v) => v.is_null(),
+                            Scalar::Truth(t) => *t == Tri::Unknown,
+                        };
+                        if !is_null {
+                            picked = value;
+                            break;
+                        }
+                    }
+                    let picked = if *widen { widen_branches(picked) } else { picked };
+                    put(&mut regs, *dst, picked, self.nregs)?;
                 }
                 Step::Call { dst, func, args } => {
                     let mut values = Vec::with_capacity(args.len());
@@ -1052,6 +1114,15 @@ impl Prog {
                     left: *left,
                     right_prog: right_prog.rebase_columns(offset)?,
                 }),
+                // `COALESCE` 的每个参数也是按**同一个输入 schema** 编的,要一起平移
+                Step::Coalesce { dst, args, widen } => Ok(Step::Coalesce {
+                    dst: *dst,
+                    args: args
+                        .iter()
+                        .map(|arg| arg.rebase_columns(offset))
+                        .collect::<Result<Vec<_>>>()?,
+                    widen: *widen,
+                }),
                 other => Ok(other.clone()),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1130,6 +1201,13 @@ impl Prog {
                     };
                     set(&mut texts, *dst, format!("{} {} {}", l, op, r));
                     set(&mut compound, *dst, true);
+                }
+                Step::Coalesce { dst, args, .. } => {
+                    // 参数是自足程序:各自渲染一遍(寄存器名互不相干)
+                    let rendered: Vec<String> =
+                        args.iter().map(|arg| arg.explain(input)).collect();
+                    set(&mut texts, *dst, format!("COALESCE({})", rendered.join(", ")));
+                    set(&mut compound, *dst, false);
                 }
                 Step::Call { dst, func, args } => {
                     let rendered: Vec<String> =
@@ -1298,6 +1376,15 @@ impl ProgBuilder {
         dst
     }
 
+    /// `COALESCE(args...)`:逐个求值,取第一个非 NULL(**短路**).
+    ///
+    /// `widen` 见 [`Step::Coalesce`]:统一后的类型是 `NUMERIC` 时为 `true`.
+    pub fn coalesce(&mut self, args: Vec<Prog>, widen: bool) -> Reg {
+        let dst = self.fresh();
+        self.steps.push(Step::Coalesce { dst, args, widen });
+        dst
+    }
+
     /// 类型转换(`x::numeric`).
     pub fn cast(&mut self, src: Reg, to: DataType) -> Reg {
         let dst = self.fresh();
@@ -1361,6 +1448,7 @@ fn step_dst(step: &Step) -> Option<Reg> {
         | Step::Case { dst, .. }
         | Step::And { dst, .. }
         | Step::Or { dst, .. }
+        | Step::Coalesce { dst, .. }
         | Step::Call { dst, .. }
         | Step::Cast { dst, .. }
         | Step::Subquery { dst, .. }
@@ -1383,7 +1471,7 @@ fn result_is_compound(prog: &Prog) -> bool {
         .is_some_and(|step| matches!(step, Step::Binary { .. } | Step::And { .. } | Step::Or { .. }))
 }
 
-/// 一条指令里的**子程序**(`CASE` 的两个分支,`AND`/`OR` 的右侧).
+/// 一条指令里的**子程序**(`CASE` 的两个分支,`AND`/`OR` 的右侧,`COALESCE` 的每个参数).
 ///
 /// 它们与外层程序面对同一个输入行,但有**自己的寄存器空间**--所以遍历一个
 /// 程序时(校验,求值,渲染,收集列下标)必须走进它们,寄存器平移却不必.
@@ -1401,6 +1489,7 @@ fn subprograms(step: &Step) -> impl Iterator<Item = &Prog> {
         Step::And { right_prog, .. } | Step::Or { right_prog, .. } => {
             branches.push(right_prog);
         }
+        Step::Coalesce { args, .. } => branches.extend(args.iter()),
         _ => {}
     }
     branches.into_iter()

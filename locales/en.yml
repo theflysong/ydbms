@@ -289,6 +289,7 @@ ir.expr.042: "step %{arg0}: an argument of CONCAT_WS cannot be %{arg1}"
 ir.expr.043: "argument"
 ir.expr.044: "step %{arg0}: the argument of EXTRACT must be TIMESTAMP / DATE or date text, but it is %{arg1}"
 ir.expr.045: "step %{arg0}: cannot cast %{arg1} to %{arg2}"
+ir.expr.046: "step %{arg0}: argument %{arg1} of COALESCE has type %{arg3}, which cannot be unified with %{arg2}"
 
 # ---- src/ir/irgen.rs ----
 ir.irgen.001: "no statement was parsed"

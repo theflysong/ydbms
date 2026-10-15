@@ -281,19 +281,40 @@ schema 的,所以只有从 root 往回推才算得出来([`Plan::used_columns`](
 
 ### 表达式内部也有惰性:分支是自足子程序
 
-拉取式管**行**,`CASE`/`AND`/`OR` 的惰性管**表达式内部**,两件事不冲突:
+拉取式管**行**,`CASE`/`AND`/`OR`/`COALESCE` 的惰性管**表达式内部**,两件事不冲突:
 
 - `Step::Case` 的 `then_prog` / `else_prog`,`Step::And` / `Step::Or` 的
-  `right_prog` 都是**自足子程序**(自己的寄存器空间),只有被选中时才求值;
+  `right_prog`,`Step::Coalesce` 的每个 `args` 都是**自足子程序**(自己的寄存器空间),
+  只有被选中时才求值;
 - 于是 `CASE WHEN 1 = 0 THEN 1/0 ELSE 42 END` 是 42,`WHERE false AND (1/0 = 1)`
-  是 0 行--死分支里的运行期错误不再冒出来;
-- **`AND`/`OR` 的顺序就是书写顺序**(左侧先算).降级不重排,规划也不重排;
+  是 0 行,`COALESCE(1, 1/0)` 是 1--死分支/死参数里的运行期错误不再冒出来;
+- **`AND`/`OR` 的顺序就是书写顺序**(左侧先算),`COALESCE` 按参数顺序;
+  降级不重排,规划也不重排;
+- `COALESCE` 的"这一侧是 NULL 吗"与 `Step::IsNull` 同一条判据:
+  `Scalar::Value(Value::Null)` 与 `Scalar::Truth(Tri::Unknown)` 都算 NULL;
 - 代价是求值多了一层**有界递归**(深度 = 表达式嵌套深度).降级阶段本来就在这个
   嵌套上递归,所以没有引入新的失败类别;
 - 遍历程序时别忘了子程序:校验,求值,渲染,`columns()`/`has_subquery()`/
-  `has_outer()`/`rebase_columns()` 都要走进去(`Prog::and` 也只是一个 `Step::And`).
+  `has_outer()`/`rebase_columns()`/`plan::program_has_outer`/`plan::check_program`
+  都要走进去(`Prog::and` 也只是一个 `Step::And`).
 
 `Step::Binary` 的 `And`/`Or` **保留**(手写程序用),语义仍是"两侧都算完".
+
+### `COALESCE(a, b, ...)`:参数类型按 `CASE` 那条规则统一
+
+语法树里它是 `CoalesceExpr`(**不是 `FuncCall`**),而且裸语法树里**不带类型**
+(`coalescetype` 是 0),所以类型统一只能自己做:
+
+- 逐个 `unify_branches` 折叠(同族 / NULL / INT↔NUMERIC),从 `ScalarType::Null` 起;
+- 统一不了报 `ir.expr.046`(**不借 `CASE` 的文案**--那是另一条语句的说法);
+- `Step::Coalesce::widen` 与 `Step::Case::widen` 同一个约定:统一成 `NUMERIC` 且取到
+  `Int` 时要**真的转**,`Prog::verify` 负责对账(对不上报 `IrInvalid`);
+- 降级时每个参数走 `branch_prog`(`CASE` 的分支用的同一个函数),`widen` 用扩展后的
+  `irgen::widen_flag`(它现在收一串程序,`CASE` 传两个分支,`COALESCE` 传全部参数);
+- `irgen::contains_aggregate` 要走进 `CoalesceExpr`,否则 `COALESCE(COUNT(*), 0)` 会把
+  "是不是分组查询"判错;
+- `GROUP BY COALESCE(...)` 能当分组键:`AggLowering::match_group` 按**程序相等**认同,
+  所以投影里写同一个表达式就落到同一个键上(不是"另算一遍").
 
 ### 子查询:表达式层的一个 `Step` + 执行期的一层环境
 

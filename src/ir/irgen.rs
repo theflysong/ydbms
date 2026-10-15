@@ -56,7 +56,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pg_query::protobuf::{
     a_const::Val, node, AConst, AExpr, AExprKind, AlterDatabaseSetStmt, AlterRoleStmt, BoolExpr,
-    BoolExprType, CaseExpr, ConstrType, CreateRoleStmt, CreateSchemaStmt, CreateStmt, CreatedbStmt,
+    BoolExprType, CaseExpr, CoalesceExpr, ConstrType, CreateRoleStmt, CreateSchemaStmt, CreateStmt,
+    CreatedbStmt,
     DefElem, DropBehavior, DropOwnedStmt, DropRoleStmt, DropStmt,
     DropdbStmt, FuncCall, GrantRoleStmt, InsertStmt,
     JoinExpr, JoinType, LimitOption, Node, NullTestType, ObjectType, OnCommitAction, RangeVar,
@@ -2761,6 +2762,9 @@ fn lower_expr_in(
         }
         Some(node::Node::SubLink(link)) => lower_sublink(link, scope, agg.as_deref_mut(), p),
         Some(node::Node::CaseExpr(case)) => lower_case(case, scope, agg.as_deref_mut(), p),
+        Some(node::Node::CoalesceExpr(coal)) => {
+            lower_coalesce(coal, scope, agg.as_deref_mut(), p)
+        }
         Some(node::Node::Param(_)) => Err(unsupported(tr!("ir.irgen.143").into_owned())),
         Some(node::Node::SetToDefault(_)) => Err(unsupported(tr!("ir.irgen.144").into_owned())),
         Some(node::Node::AStar(_)) => Err(unsupported(tr!("ir.irgen.145").into_owned())),
@@ -2939,14 +2943,14 @@ fn lower_case(
             let cond = lower_expr_in(cond_node, scope, None, agg.as_deref_mut(), p)?;
             let then_prog = branch_prog(value_node, scope, agg.as_deref_mut())?;
             // 探针必须在这两支都降级完之后:它们用到的聚合都已经登记了
-            let widen = widen_flag(&then_prog, &else_prog, scope, agg.as_deref());
+            let widen = widen_flag([&then_prog, &else_prog], scope, agg.as_deref());
             return Ok(p.case(cond, then_prog, else_prog, widen));
         }
 
         let mut inner = ProgBuilder::new();
         let cond = lower_expr_in(cond_node, scope, None, agg.as_deref_mut(), &mut inner)?;
         let then_prog = branch_prog(value_node, scope, agg.as_deref_mut())?;
-        let widen = widen_flag(&then_prog, &else_prog, scope, agg.as_deref());
+        let widen = widen_flag([&then_prog, &else_prog], scope, agg.as_deref());
         let dst = inner.case(cond, then_prog, else_prog, widen);
         else_prog = inner.finish(dst);
     }
@@ -2955,7 +2959,34 @@ fn lower_case(
     unreachable!("{}", tr!("ir.irgen.156"))
 }
 
-/// 把一个表达式降级成**自足的子程序**(`CASE` 的分支,`AND`/`OR` 的右侧).
+/// `COALESCE(a, b, ...)`:变参,逐个求值,取第一个非 NULL.
+///
+/// 语法树里它是一个 `CoalesceExpr`(不是 `FuncCall`),而且**不带类型信息**
+/// (`coalescetype` 在裸语法树里是 0),所以参数类型统一那件事留给
+/// [`crate::ir::expr::Step::Coalesce`] 的校验去做.
+///
+/// 每个参数都降级成**自足子程序**(与 `CASE` 的分支走同一个 `branch_prog`),于是
+/// 惰性是结构性的:`COALESCE(1, 1/0)` 里的除零根本不会被求值.分组查询里参数照样
+/// 能是聚合(`COALESCE(SUM(x), 0)`),`agg` 一路传下去就行.
+fn lower_coalesce(
+    coal: &CoalesceExpr,
+    scope: &Scope<'_>,
+    mut agg: Option<&mut AggLowering>,
+    p: &mut ProgBuilder,
+) -> Result<Reg> {
+    let mut args = Vec::with_capacity(coal.args.len());
+    for arg in &coal.args {
+        args.push(branch_prog(arg, scope, agg.as_deref_mut())?);
+    }
+
+    // 放大标志由**参数类型**算出来(与 `CASE` 的 `widen_flag` 同一条理由):
+    // `Prog::verify` 会拿它跟 `unify_branches` 的结果对账
+    let widen = widen_flag(args.iter(), scope, agg.as_deref());
+
+    Ok(p.coalesce(args, widen))
+}
+
+/// 把一个表达式降级成**自足的子程序**(`CASE` 的分支,`AND`/`OR` 的右侧,`COALESCE` 的参数).
 fn branch_prog(
     node: &Node,
     scope: &Scope<'_>,
@@ -2973,7 +3004,11 @@ fn value_prog(value: Value) -> Prog {
     p.finish(reg)
 }
 
-/// 这一层 `CASE` 要不要放大:`INT` 与 `NUMERIC` 两个分支统一成 `NUMERIC`.
+/// 这一层的值要不要放大:这些程序统一后的类型是 `NUMERIC` 吗(`INT` 与 `NUMERIC`
+/// 统一成 `NUMERIC`).
+///
+/// `CASE` 传它的两个分支,`COALESCE` 传全部参数--两者是同一条规则(N 个类型逐个
+/// `unify_branches`),所以合成一个函数.
 ///
 /// 类型探针面对的程序输入 schema 与 `Plan::analyze` 用的是同一个:
 ///
@@ -2986,9 +3021,8 @@ fn value_prog(value: Value) -> Prog {
 /// 探针拿不到类型就给 `false`:那种程序本来就过不了 `analyze`(同一套规则),
 /// 而 [`Prog::verify`](super::expr::Prog::verify) 还会核对这个标志--
 /// 对不上就报 `IrInvalid`,不会静默少转.
-fn widen_flag(
-    then_prog: &Prog,
-    else_prog: &Prog,
+fn widen_flag<'a>(
+    progs: impl IntoIterator<Item = &'a Prog>,
     scope: &Scope<'_>,
     agg: Option<&AggLowering>,
 ) -> bool {
@@ -3013,13 +3047,22 @@ fn widen_flag(
         }
     };
 
-    let (Ok(then_ty), Ok(else_ty)) = (then_prog.verify(&input), else_prog.verify(&input)) else {
-        return false;
-    };
-    matches!(
-        unified_branch_type(then_ty, else_ty),
-        Some(ScalarType::Value(TypeFamily::Numeric))
-    )
+    let mut unified: Option<ScalarType> = None;
+    for prog in progs {
+        let Ok(ty) = prog.verify(&input) else {
+            return false;
+        };
+        unified = match unified {
+            None => Some(ty),
+            // 统一不了也给 `false`:那种程序过不了 `analyze`,而 `verify` 还会拿这个
+            // 标志对账,不会静默少转
+            Some(prev) => match unified_branch_type(prev, ty) {
+                Some(next) => Some(next),
+                None => return false,
+            },
+        };
+    }
+    matches!(unified, Some(ScalarType::Value(TypeFamily::Numeric)))
 }
 
 /// 标量函数调用.目前只认 `ROUND`.
@@ -3220,6 +3263,9 @@ fn contains_aggregate(node: &Node) -> bool {
             c.args.iter().any(contains_aggregate)
                 || c.defresult.as_deref().is_some_and(contains_aggregate)
         }
+        // `COALESCE` 的参数里也可能有聚合(`COALESCE(COUNT(*), 0)`),漏掉这一支会让
+        // "是不是分组查询"判错,于是那个聚合被当成"出现在了不能出现的位置"
+        Some(node::Node::CoalesceExpr(c)) => c.args.iter().any(contains_aggregate),
         // `CASE WHEN <条件> THEN <值>` 的**条件和值都可能是聚合**:
         // `CASE WHEN COUNT(*) > 0 THEN ...` 就是一个分组查询.漏掉这一支会让"是不是
         // 分组查询"判错,于是聚合被当成"出现在了不能出现的位置".

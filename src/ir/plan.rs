@@ -1219,6 +1219,8 @@ fn program_has_outer(prog: &Prog) -> bool {
             ..
         } => program_has_outer(then_prog) || program_has_outer(else_prog),
         Step::And { right_prog, .. } | Step::Or { right_prog, .. } => program_has_outer(right_prog),
+        // `COALESCE` 的每个参数都是自足程序,也要走进去
+        Step::Coalesce { args, .. } => args.iter().any(program_has_outer),
         _ => false,
     })
 }
@@ -1370,6 +1372,12 @@ fn check_program(
             }
             Step::And { right_prog, .. } | Step::Or { right_prog, .. } => {
                 check_program(right_prog, symbols, input, chain, id)?;
+            }
+            // `COALESCE` 的每个参数都是自足程序,面对的是同一个输入行
+            Step::Coalesce { args, .. } => {
+                for arg in args {
+                    check_program(arg, symbols, input, chain, id)?;
+                }
             }
             _ => {}
         }

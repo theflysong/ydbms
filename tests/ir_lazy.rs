@@ -74,6 +74,30 @@ fn a_live_branch_still_reports_its_errors() {
     assert!(err.to_string().contains("除以零"), "{err}");
 }
 
+// ---------------------------------------------------------------- COALESCE
+
+#[test]
+fn coalesce_only_evaluates_the_arguments_it_needs() {
+    let mut db = db();
+
+    // PostgreSQL 18.6 上 `SELECT COALESCE(1, 1/0)` 也是 1:非严格函数按需求值
+    let out = q(&mut db, "SELECT COALESCE(1, 1/0) AS a");
+    assert_eq!(out.value(0, 0), Some(Value::Int(1)));
+
+    // 列上同理:`x` 不是 NULL 的那些行里,`1/0` 根本不该被求值
+    let out = q(&mut db, "SELECT COALESCE(x, 1/0) AS v FROM t ORDER BY x");
+    assert_eq!(ints(&out), vec![0, 5, 20]);
+}
+
+#[test]
+fn coalesce_reports_an_error_from_the_argument_it_reaches() {
+    let mut db = db();
+
+    // 前面全是 NULL 时才轮到 `1/0`--那一次真的除零(不是把错误吞掉)
+    let err = failure(&mut db, "SELECT COALESCE(NULL, 1/0) AS a");
+    assert!(err.to_string().contains("除以零"), "{err}");
+}
+
 #[test]
 fn case_conditions_are_evaluated_in_order() {
     let mut db = db();
