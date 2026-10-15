@@ -16,6 +16,10 @@
 //! 表文件的读写规则**只在 [`crate::pers`] 一处**:这里只负责"库有哪些表,
 //! 谁建的,现在能不能打开",一次 `TablePath::new(dir, 表名)` 就把两者接上.
 //!
+//! `<server-dist>` 是**相对路径**也一样:`ServiceDir::resolve` 在定下服务目录的那一刻
+//! 就把它按当时的工作目录补成绝对路径(理由见那儿)--会话里的 `\cd` 改的是工作目录,
+//! 改不动已经定下的服务目录.
+//!
 //! # 谁能连:owner(含继承来的身份)或超级用户
 //!
 //! `catalog.json` 的 `owner` 是一个**角色名**;判定看的是
@@ -271,6 +275,12 @@ impl ServiceDir {
     /// `home` 由调用方从环境里取(不在这儿读环境,于是可测).**没有 `HOME` 也不给
     /// `--server-dist` 就报错**--猜一个目录出来比报错糟糕得多.首次使用会自己把
     /// 目录树建出来.
+    ///
+    /// 相对路径**在这里当场按当时的工作目录定成绝对路径**:工作目录是会话里会被改
+    /// 掉的东西(`\cd`,见 [`crate::cmd::engine`]),root 要是留着相对形式,`\cd` 之后
+    /// 每一条 `join` 出来的路径(库目录,表文件,`catalog.json`)都跟着挪窝--库看起来
+    /// "搬了家",表文件还会写到新目录下面去,与元数据分家.所以这个类型的不变量是
+    /// **`root` 一定是绝对路径**([`ServiceDir::root`] 原样交给调用方显示).
     pub fn resolve(root: Option<PathBuf>, home: Option<PathBuf>) -> Result<Self> {
         let root = match root {
             Some(root) => root,
@@ -289,6 +299,9 @@ impl ServiceDir {
                 message: tr!("usr.service.009").into_owned(),
             });
         }
+
+        // 纯词法操作:不碰文件系统(此刻目录可能还不存在),也不追符号链接
+        let root = std::path::absolute(&root).map_err(|e| io_err(&root, e))?;
 
         fs::create_dir_all(&root).map_err(|e| io_err(&root, e))?;
         Ok(ServiceDir { root })

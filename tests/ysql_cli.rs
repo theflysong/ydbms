@@ -731,3 +731,73 @@ fn a_script_may_switch_databases() {
     let out = run(&dir, &["-U", "bob", "-d", "bob", "-f", query.to_str().unwrap()], Some(PASSWORD));
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
 }
+
+// ------------------------------------------- 相对 `--server-dist` 与 `\cd`
+
+/// 在**指定的工作目录**里跑一次 `ysql`:`--server-dist` 由调用方原样给出(要测的正是
+/// 相对路径),标准输入给 `input`.
+fn run_in(cwd: &Path, dist: &str, args: &[&str], input: &str) -> Output {
+    let mut command = Command::new(bin());
+    command
+        .current_dir(cwd)
+        .arg("--server-dist")
+        .arg(dist)
+        .args(args)
+        .env_remove("PGPASSWORD")
+        .env("PGPASSWORD", PASSWORD)
+        .env("YDBMS_LANG", "zh-CN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("起不了 ysql");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("喂输入");
+    child.wait_with_output().expect("收输出")
+}
+
+/// `--server-dist` 给的是**相对路径**时,它在启动那一刻就按当时的工作目录定死:
+/// 之后 `\cd` 换了目录,服务目录还在原地--库不跟着搬走.
+///
+/// 这是"库看起来搬了家"的回归测试:服务目录要是留着相对形式,`\cd` 之后 `join` 出来
+/// 的表文件会写到新工作目录下面,`catalog.json` 却留在老地方,同一个库就此分家.
+#[test]
+fn a_relative_server_dist_does_not_move_with_cd() {
+    let dir = TempDir::new("relative-dist");
+    // 调用时的工作目录是 base,服务目录给它的子目录 `srv`(相对路径)
+    let base = dir.path().join("base");
+    let srv = base.join("srv");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&srv).expect("建 base/srv");
+    std::fs::create_dir_all(&elsewhere).expect("建 elsewhere");
+    let empty = dir.script("empty.sql", "");
+
+    let out = run_in(&base, "srv", &["-U", "bob", "-f", empty.to_str().unwrap()], "");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(srv.join("users.json").is_file(), "服务目录该落在 base/srv");
+
+    // `\cd` 出去之后建表写数据
+    let input = format!(
+        "\\cd {}\nCREATE TABLE t (a int);\nINSERT INTO t VALUES (7);\n",
+        elsewhere.display()
+    );
+    let out = run_in(&base, "srv", &["-U", "bob"], &input);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        !elsewhere.join("srv").exists(),
+        "服务目录跟着 `\\cd` 搬到了 {}:{}",
+        elsewhere.display(),
+        stdout(&out)
+    );
+
+    // 表文件与 `catalog.json` 在同一个库目录里,再起一个进程也读得回来
+    let csv = std::fs::read_to_string(srv.join("bob/t.csv")).expect("表文件该在 base/srv/bob");
+    assert!(csv.contains('7'), "{csv}");
+    let out = run_in(&base, "srv", &["-U", "bob"], "SELECT a FROM t;\n");
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains('7'), "{}", stdout(&out));
+}
