@@ -65,7 +65,7 @@ use pg_query::protobuf::{
     SortByDir,
     SortByNulls,
     SqlValueFunction, SqlValueFunctionOp, SubLink, SubLinkType, TransactionStmt,
-    TransactionStmtKind, TypeName, UpdateStmt, VariableSetKind, VariableSetStmt,
+    TransactionStmtKind, TypeName, UpdateStmt, VacuumStmt, VariableSetKind, VariableSetStmt,
 };
 
 use crate::db::table::{
@@ -151,6 +151,7 @@ pub fn lower_statement(stmt: &Node, symbols: &SymbolTable) -> Result<Stmt> {
         }
         Some(node::Node::TransactionStmt(tx)) => lower_transaction(tx),
         Some(node::Node::VariableSetStmt(set)) => lower_set(set),
+        Some(node::Node::VacuumStmt(vacuum)) => lower_vacuum(vacuum),
         Some(node::Node::CreateRoleStmt(role)) => lower_create_role(role),
         Some(node::Node::AlterRoleStmt(role)) => lower_alter_role(role),
         Some(node::Node::AlterRoleSetStmt(_)) => Err(unsupported("ALTER ROLE ... IN DATABASE")),
@@ -481,6 +482,40 @@ fn set_name_string(set: &VariableSetStmt) -> Option<String> {
         [only] => const_string(only),
         _ => None,
     }
+}
+
+/// `VACUUM` / `ANALYZE`:收下所有变体,交给执行期**空转**.
+///
+/// 为什么这一版只能空转:统计信息还没有(基数估算与代价模型是 3.4 的待办),空间回收
+/// 也不需要(`UPDATE` 是原地替换,没有死元组).收下的是:
+///
+/// * `VACUUM` / `VACUUM ANALYZE` / `VACUUM (ANALYZE)` / `ANALYZE [VERBOSE]`;
+/// * **选项列表一律接受并忽略**(`FULL`,`VERBOSE`,`FREEZE` 这些全是空转);
+/// * 不带表(整库)与多表列表都收,表名原样交给执行期去认
+///   (`Stmt::Vacuum::tables`)--`VACUUM typos` 不能安静地成功.
+///
+/// 两处**有意**的偏差:选项的取值不解释(反正都是空转),事务块里**不**拒绝
+/// (PostgreSQL 的 `VACUUM` 不能在事务里跑).两条都写在 `src/ir/AGENTS.md`.
+fn lower_vacuum(vacuum: &VacuumStmt) -> Result<Stmt> {
+    let what = match vacuum.is_vacuumcmd {
+        true => "VACUUM",
+        false => "ANALYZE",
+    };
+
+    let mut tables = Vec::with_capacity(vacuum.rels.len());
+    for rel in &vacuum.rels {
+        let relation = match &rel.node {
+            Some(node::Node::VacuumRelation(entry)) => entry.relation.as_ref(),
+            // 这一支里只装 `VacuumRelation`;万一不是,照旧显式拒绝
+            _ => return Err(unsupported(tr!("ir.irgen.006").into_owned())),
+        };
+        // 不带表的整库形式是 `rels` 空,`relation` 不会是 `None`
+        if let Some(rv) = relation {
+            tables.push(qualified_name(rv)?);
+        }
+    }
+
+    Ok(Stmt::Vacuum { what, tables })
 }
 
 // --------------------------------------------------------------- 角色(6.4)

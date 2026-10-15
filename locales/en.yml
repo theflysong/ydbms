@@ -570,6 +570,7 @@ ir.stmt.015: "%{arg0} cannot run inside a transaction: it changes the service di
 ir.stmt.016: "empty statement"
 ir.stmt.017: "%{arg0}(this session has no service directory: use ysql --server-dist <dir>)"
 ir.stmt.018: "current role: %{arg0}"
+ir.stmt.019: "%{arg0} is a no-op: this version keeps no statistics and has no space to reclaim (%{arg1} table(s) named)"
 
 # ---- src/ir/symbol.rs ----
 ir.symbol.001: "the transaction snapshot lost table `%{arg0}` (a drop path missed the snapshot)"

@@ -135,6 +135,22 @@ PhysTab                          ← db::source::materialize
 `CHECK` 与索引**不落盘**(它们不是列定义:`CHECK` 是程序,索引是会话级目录对象).
 `DEFAULT` 在 [`Column`](crate::db::table::Column) 里,跟着模式文件走.
 
+### `VACUUM` / `ANALYZE`:接受,但是**空转**
+
+本版**没有统计信息**(基数估算与代价模型还是 3.4 的待办),也**没有要回收的空间**
+(`UPDATE` 是原地替换,没有死元组),所以这两条语句只能空转.收下的是全部变体:
+`VACUUM` / `VACUUM ANALYZE` / `VACUUM (ANALYZE)` / `ANALYZE [VERBOSE]`,**选项列表
+一律接受并忽略**(`FULL`,`VERBOSE`,`FREEZE` 都是空转),不带表(整库)与多表列表都收.
+
+三条必须守住的:
+
+- **空转不等于安静**:点名的表逐张在符号表里认一遍,认不出来报
+  `UnknownSymbol`--否则 `VACUUM typos` 会成功地骗人(`Stmt::Vacuum::tables`);
+- **报文要说清是空转**(`ir.stmt.019`):将来 3.4 落地时,同一个入口用来收真实统计,
+  那时候改的是这条报文,而不是"偷偷开始做事";
+- **不查权限**,也**不在事务里拒绝**:它是空转,没有要保护的东西--后一条与
+  PostgreSQL 有意不同(`VACUUM` 在 PostgreSQL 里不能在事务块里跑).
+
 ### 库与角色(`CREATE/DROP/ALTER DATABASE`,`CREATE/ALTER/DROP ROLE`,`GRANT`):一个口子,不是文件系统
 
 语句层**不认识文件系统**:`Stmt::CreateDatabase` / `DropDatabase` /

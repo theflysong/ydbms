@@ -158,6 +158,19 @@ pub enum Stmt {
         path: Vec<String>,
     },
 
+    /// `VACUUM` / `ANALYZE`:接受,但本版**什么都不做**.
+    ///
+    /// 统计信息还没有(基数估算与代价模型是 3.4 的待办),空间回收也不需要(`UPDATE`
+    /// 是原地替换,没有死元组),所以这一版只能空转.但**不接受"安静地什么都不做"**:
+    /// 语句里点名的表要逐张认一遍,认不出来照实报错(与 PostgreSQL 一致),否则
+    /// `VACUUM typos` 会成功地骗人.表名是**生效名**,由方括号里的那几句话解释.
+    Vacuum {
+        /// 语句里那个词(`VACUUM` / `ANALYZE`),给用户看状态时照实说.
+        what: &'static str,
+        /// 语句点名的表(不带表的 `VACUUM` / `ANALYZE` 是整库,这里为空).
+        tables: Vec<String>,
+    },
+
     /// `CREATE DATABASE name`:在**服务目录**下建一个库.
     ///
     /// 语句层不认识文件系统,也不该认识:这里只把名字交出去,真正建目录,写
@@ -1003,6 +1016,20 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             symbols.set_search_path(path.clone());
             Ok(Outcome::NoOp {
                 message: format!("search_path = {}", path.join(", ")),
+            })
+        }
+
+        Stmt::Vacuum { what, tables } => {
+            // 空转,但**不安静**:点名的表要认出来.权限不查--它是空转,没有要保护的
+            // 东西;事务里也照收(PostgreSQL 会拒绝 `VACUUM` 在事务块里,这条偏差写在
+            // `src/ir/AGENTS.md`).
+            for name in tables {
+                if symbols.relation(name).is_none() {
+                    return Err(DbError::UnknownSymbol { name: name.clone() });
+                }
+            }
+            Ok(Outcome::NoOp {
+                message: format!("{}", tr!("ir.stmt.019", arg0 = what, arg1 = tables.len())),
             })
         }
 

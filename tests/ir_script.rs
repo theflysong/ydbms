@@ -1097,3 +1097,69 @@ fn drop_table_is_still_rejected() {
     let err = one(&mut db, "DROP TABLE t");
     assert!(matches!(err, Err(DbError::Unsupported { .. })), "got {err:?}");
 }
+
+// -------------------------------------------------- VACUUM / ANALYZE(空转)
+
+/// 本版没有统计信息,也没有要回收的空间,所以 `VACUUM` / `ANALYZE` 的所有变体都
+/// **接受但不做任何事**;报文里要如实说清是空转(别让"跑过了"被读成"有统计信息了").
+#[test]
+fn vacuum_and_analyze_are_accepted_and_are_no_ops() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE t1 (a INT); CREATE TABLE t2 (a INT);");
+
+    for sql in [
+        "VACUUM",
+        "VACUUM t1",
+        "VACUUM ANALYZE t1",
+        "VACUUM (ANALYZE) t1, t2",
+        "VACUUM (VERBOSE, ANALYZE) t1",
+        "VACUUM FULL t1",
+        "VACUUM (FULL, FREEZE) t2",
+        "ANALYZE",
+        "ANALYZE t1, t2",
+        "ANALYZE VERBOSE t1",
+    ] {
+        let outcome = one(&mut db, sql).unwrap_or_else(|e| panic!("`{sql}` 本应接受:{e}"));
+        match outcome {
+            Outcome::NoOp { message } => {
+                assert!(message.contains("空转"), "`{sql}` 要说清是空转:{message}")
+            }
+            other => panic!("`{sql}` 期望 NoOp,得到 {other:?}"),
+        }
+    }
+}
+
+/// 空转的验收口径:加它 / 不加它,查询结果**逐行相同**.
+#[test]
+fn vacuum_does_not_change_what_a_query_returns() {
+    let mut db = SymbolTable::new();
+    run_ok(
+        &mut db,
+        "CREATE TABLE t (a INT); INSERT INTO t VALUES (3), (1), (2);",
+    );
+    let before = col_i32(
+        rows_of(&one(&mut db, "SELECT a FROM t ORDER BY a").unwrap()),
+        0,
+    );
+
+    run_ok(&mut db, "VACUUM (ANALYZE) t; ANALYZE t;");
+
+    let after = col_i32(
+        rows_of(&one(&mut db, "SELECT a FROM t ORDER BY a").unwrap()),
+        0,
+    );
+    assert_eq!(before, after);
+}
+
+/// 空转**不等于安静**:点名的表认不出来就得报错,否则 `VACUUM typos` 会成功地骗人.
+#[test]
+fn vacuum_on_an_unknown_table_is_reported() {
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE t1 (a INT);");
+
+    let err = one(&mut db, "VACUUM (ANALYZE) t1, nope").expect_err("本应报错");
+    assert!(
+        matches!(err, DbError::UnknownSymbol { ref name } if name == "nope"),
+        "got {err:?}"
+    );
+}

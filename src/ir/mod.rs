@@ -88,6 +88,11 @@
 //! 所以能回滚).这些都走 [`Server`] 那个口子--语句层只把名字与取值交出去,
 //! `users.json` / `grants.json` 与权限判定都在实现方.
 //!
+//! `VACUUM` / `ANALYZE` 也收下,但**是空转**:本版没有统计信息(基数估算与代价模型
+//! 是 3.4 的待办),也没有要回收的空间,所以所有变体(含 `(ANALYZE)`,`FULL` 那类选项,
+//! 多表列表)都只做一件事--把点名的表认一遍,认不出来照实报错.口径见
+//! [`Stmt::Vacuum`](stmt::Stmt::Vacuum) 与 `irgen` 的 `lower_vacuum`.
+//!
 //! 权限检查也在语句层这一处([`Stmt`] 的每个分支动数据之前):`SELECT` 按
 //! [`Plan::used_columns`](plan.rs) 给出的**列**要 `SELECT`,`INSERT` / `UPDATE` 按
 //! 写到与读到的列要 `INSERT` / `UPDATE` / `SELECT`,动结构要 `check_ddl`.
