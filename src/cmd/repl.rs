@@ -4,6 +4,12 @@
 //! **"这一句够了吗"**（[`is_complete`]）。剩下的——SQL、元命令、两路输出——都在
 //! [`Session`] 里，交互输入与 `\i` 读进来的内容在引擎看来是同一件事。
 //!
+//! # 两个入口
+//!
+//! [`run`] 是内存模式的 `ydbms`（空库、退出即丢）；[`run_session`] 是服务模式的
+//! `ysql`（会话**已经**打开了一个库，见 [`Session::open`]）。两者共用 [`interact`]：
+//! 换了会话与提示符，别的（多行、补全、非 tty 回退）一个字没变。
+//!
 //! # 多行怎么判断
 //!
 //! rustyline 的 `Validator` 每次回车都问一次"够了吗"：不够就继续收行（这就是
@@ -34,13 +40,26 @@ use crate::ir;
 use super::complete::{self, Catalog};
 use super::engine::Session;
 
-/// 交互式终端入口：打横幅、读输入、交给引擎，`\q`（或 Ctrl-D）退出。
+/// 内存模式的入口（`ydbms`）：一个空库，数据退出即丢。
 pub fn run() -> io::Result<()> {
     let mut session = Session::new();
-    banner();
+    banner_memory();
+    interact(&mut session, "sql> ")
+}
 
+/// 服务模式的入口（`ysql`）：会话**已经**打开了一个库（见 [`Session::open`]）。
+///
+/// 提示符由调用方给（`ysql` 用 `<库> => `）；横幅写清用户、库与服务目录，
+/// 因为这几样决定了"数据写到哪儿去了"。
+pub fn run_session(session: &mut Session, prompt: &str) -> io::Result<()> {
+    banner_session(session);
+    interact(session, prompt)
+}
+
+/// 读输入、交给引擎，直到 `\q`（或 Ctrl-D / EOF）。两种入口共用这一套。
+fn interact(session: &mut Session, prompt: &str) -> io::Result<()> {
     if !io::stdin().is_terminal() {
-        return run_plain(&mut session);
+        return run_plain(session);
     }
 
     let config = Config::builder()
@@ -61,10 +80,10 @@ pub fn run() -> io::Result<()> {
             helper.catalog = session.catalog();
         }
 
-        match editor.readline("sql> ") {
+        match editor.readline(prompt) {
             Ok(line) => {
                 let _ = editor.add_history_entry(line.as_str());
-                submit(&mut session, &line);
+                submit(session, &line);
                 if session.should_quit() {
                     break;
                 }
@@ -223,9 +242,37 @@ fn strip_command<'a>(text: &'a str, command: &str) -> Option<&'a str> {
     }
 }
 
-fn banner() {
+/// 内存模式的横幅。
+fn banner_memory() {
     println!("ydbms — 空库（没有任何内置表）。");
     println!();
+    banner_commands();
+    println!("路径按当前工作目录解析。脚本遇错会继续跑并逐条报错——没有事务，不回滚。");
+    println!("数据只在内存里，退出即丢。要带用户、连磁盘上的库，用 ysql。");
+    println!();
+}
+
+/// 服务模式的横幅：写清用户、库、服务目录与提交口径。
+fn banner_session(session: &Session) {
+    let db = session.database().unwrap_or("?");
+    let user = session.user().unwrap_or("?");
+
+    println!("ydbms — 库 `{}`，用户 `{}`。", db, user);
+    if let Some(root) = session.service_root() {
+        println!("服务目录：{}", root.display());
+        println!("  users.json                      用户表（加盐哈希，没有明文）");
+        println!("  {}/catalog.json                库的元数据（owner、创建时间）", db);
+        println!("  {}/<表>.csv + <表>.schema.json  表数据与模式", db);
+    }
+    println!();
+    banner_commands();
+    println!("写是**提交即落盘**：一次提交 = 敲进来的一段、或 \\i 读进来的一个文件。");
+    println!("没有真事务：报错不回滚前面已经执行的语句；多表提交崩在中间会留下改了一半的库。");
+    println!();
+}
+
+/// 两种模式共用的那串元命令说明。
+fn banner_commands() {
     println!("  <SQL>              直接回车执行；多行会攒到分号才执行");
     println!("  Tab                补全（元命令、关键字、表名、列名、路径）");
     println!("  EXPLAIN <SQL>      只打印降级出来的线性 IR");
@@ -242,8 +289,5 @@ fn banner() {
     println!("  \\echo <文本>       原样回显");
     println!("  \\! <shell 命令>    只在交互终端可用（脚本里禁用）");
     println!("  \\q / exit          退出（Ctrl-D 也行，Ctrl-C 丢掉这一行）");
-    println!();
-    println!("路径按当前工作目录解析。脚本遇错会继续跑并逐条报错——没有事务，不回滚。");
-    println!("数据只在内存里，退出即丢。");
     println!();
 }

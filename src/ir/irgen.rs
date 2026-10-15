@@ -48,7 +48,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pg_query::protobuf::{
     a_const::Val, node, AConst, AExpr, AExprKind, BoolExpr, BoolExprType, CaseExpr,
-    ConstrType, CreateSchemaStmt, CreateStmt, DropBehavior, DropStmt, FuncCall, InsertStmt,
+    ConstrType, CreateSchemaStmt, CreateStmt, CreatedbStmt, DropBehavior, DropStmt, DropdbStmt,
+    FuncCall, InsertStmt,
     JoinExpr, JoinType, LimitOption, Node, NullTestType, ObjectType, OnCommitAction, RangeVar,
     IndexStmt, SelectStmt, SetOperation, SortBy, SortByDir, SortByNulls,
     SqlValueFunction, SqlValueFunctionOp, SubLink, SubLinkType, TransactionStmt,
@@ -126,6 +127,8 @@ pub fn lower_statement(stmt: &Node, symbols: &SymbolTable) -> Result<Stmt> {
         Some(node::Node::IndexStmt(index)) => lower_create_index(index, symbols),
         Some(node::Node::ViewStmt(_)) => Err(unsupported("CREATE VIEW")),
         Some(node::Node::CreateSchemaStmt(schema)) => lower_create_schema(schema),
+        Some(node::Node::CreatedbStmt(db)) => lower_create_database(db),
+        Some(node::Node::DropdbStmt(db)) => lower_drop_database(db),
         Some(node::Node::TransactionStmt(tx)) => lower_transaction(tx),
         Some(node::Node::VariableSetStmt(set)) => lower_set(set),
         _ => Err(unsupported("这种语句")),
@@ -218,6 +221,41 @@ fn lower_transaction(tx: &TransactionStmt) -> Result<Stmt> {
         )),
         other => Err(unsupported(format!("事务语句 {}", other.as_str_name()))),
     }
+}
+
+/// `CREATE DATABASE name`：只留名字，建目录 / 写 `catalog.json` 是 [`Databases`] 的事。
+///
+/// [`Databases`]: super::stmt::Databases
+fn lower_create_database(db: &CreatedbStmt) -> Result<Stmt> {
+    if !db.options.is_empty() {
+        return Err(unsupported(
+            "CREATE DATABASE 的选项（ENCODING / OWNER / TEMPLATE / LC_COLLATE…）",
+        ));
+    }
+    if db.dbname.is_empty() {
+        return Err(unsupported("CREATE DATABASE 没有名字"));
+    }
+
+    Ok(Stmt::CreateDatabase {
+        name: db.dbname.clone(),
+    })
+}
+
+/// `DROP DATABASE [IF EXISTS] name`。
+///
+/// [`Databases`]: super::stmt::Databases
+fn lower_drop_database(db: &DropdbStmt) -> Result<Stmt> {
+    if !db.options.is_empty() {
+        return Err(unsupported("DROP DATABASE 的选项（WITH FORCE…）"));
+    }
+    if db.dbname.is_empty() {
+        return Err(unsupported("DROP DATABASE 没有名字"));
+    }
+
+    Ok(Stmt::DropDatabase {
+        name: db.dbname.clone(),
+        if_exists: db.missing_ok,
+    })
 }
 
 /// `CREATE SCHEMA name`：只登记名字（限定名本来就能用，见 [`crate::ir::symbol`]）。

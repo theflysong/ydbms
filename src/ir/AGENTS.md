@@ -135,6 +135,21 @@ PhysTab                          ← db::source::materialize
 `CHECK` 与索引**不落盘**（它们不是列定义：`CHECK` 是程序、索引是会话级目录对象）。
 `DEFAULT` 在 [`Column`](crate::db::table::Column) 里，跟着模式文件走。
 
+### 库（`CREATE DATABASE` / `DROP DATABASE`）：一个口子，不是文件系统
+
+语句层**不认识文件系统**：`Stmt::CreateDatabase` / `DropDatabase` 只把名字交给
+[`Databases`](stmt.rs)（`create_database` / `drop_database`，返回**给用户看的一行状态**
+——owner 是谁不归语句层管），建目录、写 `catalog.json`、owner 检查都在实现方
+（`cmd` 的 `Store`，背后是 `usr::service`）。三条规矩：
+
+- **内存模式明确拒绝**：`NoDatabases` 报 `DbError::Denied`。不假装成功、也不"接受但记下来"
+  ——库不在任何人的磁盘上，那样会让同一份脚本在 `ysql` 里行为完全不同；
+- **现有签名不动**：`execute_stmt` / `Script::run_one` / `run_script` 都保持原样
+  （内部转调 `*_with`，默认实现就是 `NoDatabases`），于是几十处调用方与测试一行不用改；
+  加新的"外部世界"语句时照这个办法办；
+- **选项一律显式拒绝**（`ENCODING` / `OWNER` / `WITH FORCE`…）：本版只建**空库**，
+  建出来的库目录里只有 `catalog.json`。
+
 ### 降级（`irgen.rs`）
 
 - **不认识的写法一律显式拒绝**（`DbError::Unsupported`），绝不猜。宁可拒绝，也不要

@@ -1178,6 +1178,27 @@ pub enum DbError {
         /// 具体原因。
         reason: String,
     },
+    /// 服务目录里没有这个库。
+    ///
+    /// 与 [`UnknownSymbol`](DbError::UnknownSymbol) 分开：那条是**一个库内部**的
+    /// 名字空间（表/别名/索引），这条是 `CREATE DATABASE` 那一层。
+    UnknownDatabase {
+        /// 库名。
+        name: String,
+    },
+    /// 服务目录里已经有这个库了。
+    DuplicateDatabase {
+        /// 库名。
+        name: String,
+    },
+    /// 操作被**策略**拒绝：库或用户的权限、正在被使用的库、非法的库名……
+    ///
+    /// `message` 是给人看的一句中文说明（与 [`Unsupported`](DbError::Unsupported)
+    /// 的 `feature` 同一套写法：框架是英文，正文是中文）。
+    Denied {
+        /// 为什么拒绝。
+        message: String,
+    },
 }
 
 impl fmt::Display for DbError {
@@ -1262,6 +1283,11 @@ impl fmt::Display for DbError {
                 ),
                 None => write!(f, "value `{}` does not fit {}: {}", value, ty, reason),
             },
+            DbError::UnknownDatabase { name } => write!(f, "unknown database `{}`", name),
+            DbError::DuplicateDatabase { name } => {
+                write!(f, "database `{}` already exists", name)
+            }
+            DbError::Denied { message } => write!(f, "denied: {}", message),
         }
     }
 }
@@ -1270,6 +1296,25 @@ impl std::error::Error for DbError {}
 
 /// 本 crate 通用的 [`Result`](std::result::Result) 别名。
 pub type Result<T> = std::result::Result<T, DbError>;
+
+/// 这个名字能不能当**文件名主干**（或目录名）用？
+///
+/// 本版的**表名就是磁盘上的文件名主干**（见 [`crate::pers`]）、**库名就是服务目录下
+/// 的目录名**（见 [`crate::usr::service`]），所以空、`.`、`..`、路径分隔符（`/`、`\`）
+/// 与 NUL 一律不行——放过去就等于允许名字里带 `../` 跑到库目录（甚至服务目录）外面，
+/// 那不只是写错地方，是**写坏别人的库**。
+///
+/// 判定只有这一处：`ir` 建表时拒一次（早报错）、`usr::service` 落盘与删文件前再挡
+/// 一次（真正碰文件系统的那道闸）。逗号、空格、引号这些**都允许**——它们在文件名里
+/// 是普通字符，`pers` 的暂存文件与 CSV 引号逻辑本来就按这个假设写。
+pub fn is_file_stem_safe(name: &str) -> bool {
+    !(name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0'))
+}
 
 /// 表的抽象行为。
 ///

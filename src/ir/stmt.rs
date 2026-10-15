@@ -31,7 +31,9 @@
 use pg_query::protobuf::RawStmt;
 
 use crate::db::phys::PhysTab;
-use crate::db::table::{Column, ColumnsShape, DataType, DbError, Result, Row, TypeFamily, Value};
+use crate::db::table::{
+    is_file_stem_safe, Column, ColumnsShape, DataType, DbError, Result, Row, TypeFamily, Value,
+};
 
 use super::checks::{Check, CheckedTable};
 
@@ -149,6 +151,68 @@ pub enum Stmt {
         /// 新的搜索路径。
         path: Vec<String>,
     },
+
+    /// `CREATE DATABASE name`：在**服务目录**下建一个库。
+    ///
+    /// 语句层不认识文件系统，也不该认识：这里只把名字交出去，真正建目录、写
+    /// `catalog.json`（含 owner）的是 [`Databases`] 的实现。
+    CreateDatabase {
+        /// 库名。
+        name: String,
+    },
+
+    /// `DROP DATABASE [IF EXISTS] name`。
+    DropDatabase {
+        /// 库名。
+        name: String,
+        /// 语句里写了 `IF EXISTS`。
+        if_exists: bool,
+    },
+}
+
+/// `CREATE DATABASE` / `DROP DATABASE` 的落点。
+///
+/// **为什么是一个 trait**：这两条语句改的是**服务目录**（目录树、`catalog.json`、
+/// owner），而语句层只认识符号表。于是这里留一个最小的口子，由会话那一层
+/// （`cmd` 的 `Session`，背后是 `usr::service::{ServiceDir, Database}`）实现；
+/// 内存模式（`ydbms` 那个实验终端、以及各处的测试）用 [`NoDatabases`]
+/// **明确拒绝**这两条语句——不是静默无操作，也不是假装成功。
+///
+/// 返回值是**给用户看的一行状态**（例：`库 filmdb 已建（owner bob）`），
+/// 语句层把它包成 [`Outcome::NoOp`]——语句层不该知道 owner 是谁。
+pub trait Databases {
+    /// 建库，返回一行状态。
+    fn create_database(&mut self, name: &str) -> Result<String>;
+
+    /// 删库，返回一行状态。
+    fn drop_database(&mut self, name: &str, if_exists: bool) -> Result<String>;
+}
+
+/// 没有服务目录时的 [`Databases`]：两条语句都**明确拒绝**。
+///
+/// 内存模式的 `ydbms` 与所有单元测试都走它。之所以不"接受但记下来"：库不在任何人
+/// 的磁盘上，假装建了会让脚本在换到 `ysql` 时行为完全不同。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDatabases;
+
+impl Databases for NoDatabases {
+    fn create_database(&mut self, name: &str) -> Result<String> {
+        Err(DbError::Denied {
+            message: format!(
+                "CREATE DATABASE {}（这个会话没有服务目录：请用 ysql --server-dist <目录>）",
+                name
+            ),
+        })
+    }
+
+    fn drop_database(&mut self, name: &str, _if_exists: bool) -> Result<String> {
+        Err(DbError::Denied {
+            message: format!(
+                "DROP DATABASE {}（这个会话没有服务目录：请用 ysql --server-dist <目录>）",
+                name
+            ),
+        })
+    }
 }
 
 /// 把一个值按目标列的类型**真的转一下**。
@@ -214,14 +278,28 @@ pub struct StmtResult {
     pub outcome: Result<Outcome>,
 }
 
-/// 在符号表上执行一条语句。
+/// 在符号表上执行一条语句，**没有服务目录**（见 [`execute_stmt_with`]）。
 ///
-/// 会改东西的只有三种：[`Stmt::CreateTable`]（往符号表里加表）、[`Stmt::Insert`]
-/// （改表内容）与几条 schema / `SET` 语句（改的是**名字空间**，不是数据）。
+/// 内存模式与绝大多数调用方走它：`CREATE DATABASE` / `DROP DATABASE` 由
+/// [`NoDatabases`] 明确拒绝。
+pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
+    execute_stmt_with(stmt, symbols, &mut NoDatabases)
+}
+
+/// 在符号表上执行一条语句，`CREATE DATABASE` / `DROP DATABASE` 交给 `dbs`。
+///
+/// 会改东西的只有四种：[`Stmt::CreateTable`]（往符号表里加表）、[`Stmt::Insert`]
+/// / [`Stmt::Update`]（改表内容）、几条 schema / `SET` 语句（改的是**名字空间**，
+/// 不是数据），以及 [`Stmt::CreateDatabase`] / [`Stmt::DropDatabase`]（改的是
+/// **服务目录**，本函数不碰，整件事在 `dbs` 那边）。
 /// [`Stmt::Transaction`] 什么都不改——本版没有事务，见它的文档。
 /// 语句自己的失败不会留下半拉状态——建表是"要么登记要么报错"，
 /// 插入是逐行过 [`Table::insert`](crate::db::table::Table::insert) 的校验。
-pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
+pub fn execute_stmt_with(
+    stmt: &Stmt,
+    symbols: &mut SymbolTable,
+    dbs: &mut dyn Databases,
+) -> Result<Outcome> {
     match stmt {
         Stmt::Query(plan) => Ok(Outcome::Rows(exec::execute(plan, symbols)?)),
 
@@ -236,6 +314,19 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
             // 判重的都是**它**——不然 `CREATE TABLE movies` 会说成 `movies`，
             // 而表其实叫 `study.movies`。
             let name = symbols.effective_name(name);
+
+            // 表名就是磁盘上的文件名主干（见 `db::table::is_file_stem_safe`），
+            // 所以**建的时候就**拒掉带路径的名字：等到落盘才报错就已经晚了一步
+            // （建表在内存里已经成功，用户会以为没事）。内存模式一并拒，免得同一句
+            // SQL 换到 `ysql` 才炸。
+            if !is_file_stem_safe(&name) {
+                return Err(DbError::Denied {
+                    message: format!(
+                        "表名 `{}` 里有不能当文件名用的东西（本版的表名就是磁盘上的文件名主干：不能为空、`.`、`..`，也不能含 `/` 或 `\\`）",
+                        name
+                    ),
+                });
+            }
 
             if symbols.lookup(&name).is_some() {
                 if *if_not_exists {
@@ -282,6 +373,15 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
                 values.push(row);
             }
 
+            // 报告里用**表自己的名字**（生效名，可能带 schema 前缀）：脏表标记与
+            // 落盘都按它来，`INSERT INTO movies`（`search_path` 是 `study`）要报
+            // `study.movies`——不然提交点按 `movies` 去精确取表会取不到（见
+            // `SymbolTable::relation_exact`）。值都算完了再解名字，错误顺序不变。
+            let effective = symbols
+                .relation(table)
+                .map(|relation| relation.name().to_string())
+                .unwrap_or_else(|| table.clone());
+
             let mut inserted = 0usize;
             for row in values {
                 // 索引要的键先取出来（行马上要搬进表里了）
@@ -298,7 +398,7 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
             }
 
             Ok(Outcome::Inserted {
-                table: table.clone(),
+                table: effective,
                 rows: inserted,
             })
         }
@@ -308,12 +408,14 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
             sets,
             filter,
         } => {
-            let nrows = symbols
+            // 同 `INSERT`：报告（以及提交点的脏表标记）用表自己的生效名
+            let target = symbols
                 .relation(table)
                 .ok_or_else(|| DbError::UnknownSymbol {
                     name: table.clone(),
-                })?
-                .nrows();
+                })?;
+            let effective = target.name().to_string();
+            let nrows = target.nrows();
             let columns: Vec<Column> = symbols
                 .columns(table)
                 .ok_or_else(|| DbError::UnknownSymbol {
@@ -369,7 +471,7 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
             }
 
             Ok(Outcome::Updated {
-                table: table.clone(),
+                table: effective,
                 rows: updated,
             })
         }
@@ -443,6 +545,15 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
                 message: format!("search_path = {}", path.join(", ")),
             })
         }
+
+        // 服务目录那一层的事：一个字的文件系统知识都不在这边
+        Stmt::CreateDatabase { name } => Ok(Outcome::NoOp {
+            message: dbs.create_database(name)?,
+        }),
+
+        Stmt::DropDatabase { name, if_exists } => Ok(Outcome::NoOp {
+            message: dbs.drop_database(name, *if_exists)?,
+        }),
     }
 }
 
@@ -514,13 +625,25 @@ impl Script {
     ///
     /// 调用方按 `0..len()` 循环，所以下标一定在界内。**失败不中止**后续语句——
     /// 要不要停由调用方决定（`ON_ERROR_STOP`）。
+    ///
+    /// 没有服务目录的会话走它（见 [`Script::run_one_with`]）。
     pub fn run_one(&self, index: usize, symbols: &mut SymbolTable) -> StmtResult {
+        self.run_one_with(index, symbols, &mut NoDatabases)
+    }
+
+    /// 同 [`Script::run_one`]，但把 `CREATE DATABASE` / `DROP DATABASE` 交给 `dbs`。
+    pub fn run_one_with(
+        &self,
+        index: usize,
+        symbols: &mut SymbolTable,
+        dbs: &mut dyn Databases,
+    ) -> StmtResult {
         let raw = &self.statements[index];
 
         // 逐条来：后面的语句依赖前面建出来的表，不能先全降级。
         let outcome = match raw.stmt.as_deref() {
             Some(node) => match irgen::lower_statement(node, symbols) {
-                Ok(stmt) => execute_stmt(&stmt, symbols),
+                Ok(stmt) => execute_stmt_with(&stmt, symbols, dbs),
                 Err(e) => Err(e),
             },
             None => Err(DbError::Parse {

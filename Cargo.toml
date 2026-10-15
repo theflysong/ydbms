@@ -15,3 +15,4 @@ bigdecimal = "0.4.11"
 # 不开 with-file-history（历史只在内存里）、不开 with-dirs、不开自定义键位。
 rustyline = { version = "18", default-features = false }
 regex = "1.13.1"
+sha2 = "0.10"

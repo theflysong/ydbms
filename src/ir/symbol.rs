@@ -210,6 +210,20 @@ impl SymbolTable {
         }
     }
 
+    /// 名字 → 关系，但**按存进来的名字精确取**：不认 `search_path`、不穿别名。
+    ///
+    /// 与 [`relation`](SymbolTable::relation) 的差别只在一处：名字**不**按当前
+    /// `search_path` 展开。提交点（`Session::commit`）必须用这一个——脏表记的是
+    /// **这张表自己的生效名**，若按当时的 `search_path` 再解一次，就可能解到另一张
+    /// 同名的表上（`s.t` 与 `t` 都在、`search_path` 指向 `s`），于是**改了 A 却存了 B**、
+    /// 真正的 A 悄悄地没落盘。
+    pub fn relation_exact(&self, name: &str) -> Option<&dyn Table> {
+        self.symbols.iter().find_map(|symbol| match symbol {
+            Symbol::Relation { name: stored, table } if stored == name => Some(&**table),
+            _ => None,
+        })
+    }
+
     /// 名字 → **可变**的表句柄（穿透别名）。
     ///
     /// `INSERT` 要改表内容，而 [`relation`](SymbolTable::relation) 是只读的。

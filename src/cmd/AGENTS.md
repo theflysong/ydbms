@@ -6,19 +6,43 @@
 管住两路输出。任务的来源只有三种，在引擎里**没有区别**：
 
 - 交互式终端敲进来的一段（`repl.rs`）；
-- `\i <文件>` 读进来的内容（`Session::run_file`）；
+- `\i <文件>` 读进来的内容（`Session::run_file`）——`ysql -f <脚本>` 也走它；
 - 元命令本身（`metacmd.rs`）。
 
 - `engine.rs` —— [`Session`](engine.rs)：状态（符号表、两路输出、`\i` 递归深度、
-  `\timing` / `ON_ERROR_STOP` 两个开关）、输入切分、元命令的**语义**、SQL 的执行与报告。
+  `\timing` / `ON_ERROR_STOP` 两个开关、服务模式下的提交点）、输入切分、元命令的**语义**、
+  SQL 的执行与报告。
 - `metacmd.rs` —— 元命令的**语法**：把一行拆成命令名与参数，认不出来的也照样返回
   `MetaCmd::Unknown`。命令名只有一份（`NAMES`），补全与错误提示都从它取。
 - `repl.rs` —— 交互式终端：rustyline 接线、[`is_complete`](repl.rs)（多行判定）、非 tty 回退。
 - `complete.rs` —— Tab 补全的候选，**纯逻辑**，不认识终端。
+- `cli.rs` —— `ysql` 的命令行：参数解析（纯函数）、认证、决定连哪个库、退出码。
 
-`main.rs` 只把控制权交给 `cmd::repl::run`，真正的状态都在这儿。
+`main.rs` 只把控制权交给 `cmd::repl::run`（内存模式），`src/bin/ysql.rs` 交给
+`cmd::cli::run`（服务模式）；真正的状态都在这儿。
 
 ## 特殊规则
+
+### 内存模式与服务模式：同一个 `Session`
+
+- `Session::new` / `with_sinks` 是**内存**会话（数据退出即丢）；`Session::open` /
+  `open_with_sinks` 绑着磁盘上的一个库（`usr::service::Database`，已经上过单写者锁）。
+  两种模式在引擎里**只有 `store` 一个字段的差别**，别为服务模式另开一套循环。
+- **一次 `run_with` 就是一次提交**（一个 piece：敲进来的一段、`\i`/`-f` 的一个文件）。
+  它末尾调 `Session::commit`：只写 `dirty` 里的表，并把"磁盘上有、符号表里已经没了"的
+  表文件删掉（`DROP SCHEMA … CASCADE` 靠这条落盘，**不需要语句报告删了谁**）。
+- 脏标记只认 `Outcome::Created / Inserted / Updated` 三种（唯一的写路径），
+  加新的写语句时**必须同时**把这个 `match` 补上，否则那条路悄悄不落盘。
+- 提交失败**保留 `dirty`**（下次再试）并走 `Session::error`；多表提交**不是原子的**，
+  崩在中间会留下改了一半的库——这是 4.2（`commit.json`）要解决的，别在这里假装解决。
+- `CREATE DATABASE` / `DROP DATABASE` 的文件系统那一半在 `usr`，引擎只把 `store`
+  作为 `ir::stmt::Databases` 递进去；内存模式由 `NoDatabases` 明确拒绝。
+
+### 退出码与错误计数
+
+- **报错一律走 `Session::error`**（它同时给 `failed` 计数）；语句自己的失败走
+  `Outcome::Err` 那条路，`run_sql` 里也要计入 `failed`。`ysql -f` 的退出码靠它，
+  漏一处就会"报了错还退出 0"。
 
 ### 与 `ir` 的分工：这里是引擎，那里是 SQL
 

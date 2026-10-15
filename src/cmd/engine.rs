@@ -37,15 +37,43 @@
 //! `\timing` 与 `\set ON_ERROR_STOP on` 都是**会话状态**（不是某一段脚本的），所以
 //! `\i` 里设的会一直生效到会话结束。逐条执行靠 [`Script`]：引擎自己驱动循环，于是
 //! "每条语句计时"与"第一条错误就停"都是自然的。
+//!
+//! # 内存模式与服务模式
+//!
+//! [`Session::new`] 造出来的是**内存**会话（`ydbms` 那个实验终端、以及测试）：
+//! 数据只在内存里、退出即丢。`ysql` 走的是 [`Session::open`]——它绑着磁盘上的
+//! 一个库（[`Database`]：库目录 + `catalog.json` + 单写者锁），库里的表在打开时
+//! 一次载入符号表，**提交点**再把改动写回去。
+//!
+//! # 提交点：一次 `run_with` = 一次提交
+//!
+//! [`Session::run_with`] 就是"一次提交"（一个 piece：交互式敲进来的一段、`\i`
+//! 读进来的一个文件、管道里攒够的一句）。它末尾调 [`Session::commit`]：
+//!
+//! * 只写**脏表**（`CREATE TABLE` / `INSERT` / `UPDATE` 碰过的那几张），不是整库重写；
+//! * 顺手删掉"磁盘上有、符号表里已经没了"的表文件（`DROP SCHEMA … CASCADE` 的落点）；
+//! * 内存模式下一行 IO 都不做。
+//!
+//! 于是 `ysql -f filmdb.sql` 那种一整段装载只在末尾落一次盘，而交互式敲一条
+//! `INSERT` 一返回就已经在磁盘上了。
+//!
+//! **没有真事务**（阶段 4）：一条 `UPDATE` 中途出错会留下前面已经改过的行，
+//! 一个 piece 里前半段跑的语句也**不会**因为后半段报错而回滚；多表提交是逐表
+//! `rename`，崩在中间会留下"改了一半"的库（阶段 4.2 的 `commit.json` 要解决的
+//! 就是它，本版不做）。这些都在 [`Session::commit`] 与各语句的文档里写着。
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::db::phys::PhysTab;
-use crate::db::table::{TabShape, Table};
-use crate::ir::{Outcome, Script, StmtResult, SymbolTable};
+use crate::db::table::{DbError, Result, TabShape, Table};
+use crate::ir::stmt::Databases;
+use crate::ir::{Outcome, Script, StmtResult, Symbol, SymbolTable};
+use crate::usr::service::{Database, ServiceDir};
+use crate::usr::User;
 
 use super::complete::Catalog;
 use super::metacmd::{self, MetaCmd};
@@ -158,6 +186,58 @@ enum SinkHome {
     Buffer,
 }
 
+/// 服务模式下会话绑着的那个库。
+///
+/// 内存模式是 `None`（见 [`Session::new`]）。字段都在这儿，是因为它们只在提交点
+/// 一起用：`dirty` 说"要写哪几张"，`known_on_disk` 说"磁盘上应该有哪些"，
+/// 两者的差集就是要删的表文件。
+struct Store {
+    /// 服务目录（`CREATE DATABASE` / `DROP DATABASE` 的落点）。
+    service: ServiceDir,
+    /// 打开的库：库目录 + 元数据 + 单写者锁。
+    db: Database,
+    /// 认证过的用户（owner 判定用它）。
+    user: User,
+    /// 这次提交要写的表（生效名）。
+    dirty: BTreeSet<String>,
+    /// 磁盘上**应该有**的表名：载入时那份，加上已经写成功的。
+    known_on_disk: BTreeSet<String>,
+}
+
+impl Databases for Store {
+    fn create_database(&mut self, name: &str) -> Result<String> {
+        self.service.create_database(name, &self.user.name)
+    }
+
+    fn drop_database(&mut self, name: &str, if_exists: bool) -> Result<String> {
+        // 正在用的库不能删：会话的锁自己就握着它，删掉之后后面的提交会往一个
+        // 不存在的目录里写（而且别人还连着）。PostgreSQL 也是这条规矩。
+        if name == self.db.name() {
+            return Err(DbError::Denied {
+                message: format!("不能删掉正在使用的库 `{}`（换个库再删它）", name),
+            });
+        }
+
+        // 别人的库要么是他的、要么自己是管理员——本版没有 GRANT，这就是全部口径。
+        // **元数据读不出来就报错**，别当成"没有 owner 限制"：`catalog.json` 坏了
+        // 恰恰是最不该让人随手删库的时候（这条在实现里是"宁可报错"的那一侧）。
+        if !self.service.exists(name) {
+            return self.service.drop_database(name, if_exists);
+        }
+        let owner = self.service.catalog(name)?.owner;
+        if owner != self.user.name && !self.user.is_admin {
+            return Err(DbError::Denied {
+                message: format!(
+                    "库 `{}` 的 owner 是 `{}`，`{}` 不是管理员，不能删",
+                    name, owner, self.user.name
+                ),
+            });
+        }
+
+        self.service.drop_database(name, if_exists)
+    }
+}
+
 /// 一个数据库会话。
 pub struct Session {
     symbols: SymbolTable,
@@ -173,6 +253,10 @@ pub struct Session {
     on_error_stop: bool,
     /// 上一次提交里 `ON_ERROR_STOP` 有没有让步（见 [`Session::stopped`]）。
     stopped: bool,
+    /// 这个会话报过多少次错。`ysql -f` 的退出码用它（见 [`Session::failed`]）。
+    failed: usize,
+    /// 服务模式：绑着磁盘上的一个库；内存模式是 `None`。
+    store: Option<Store>,
 }
 
 impl Default for Session {
@@ -182,7 +266,7 @@ impl Default for Session {
 }
 
 impl Session {
-    /// 新建会话：两路输出都到标准输出，两个开关都关着。
+    /// 新建**内存**会话：两路输出都到标准输出，两个开关都关着，数据退出即丢。
     pub fn new() -> Self {
         Session {
             symbols: SymbolTable::new(),
@@ -194,26 +278,59 @@ impl Session {
             timing: false,
             on_error_stop: false,
             stopped: false,
+            failed: 0,
+            store: None,
         }
     }
 
     /// 指定两路输出去向（测试用）。查询输出给 `Buffer` 时，`\o` 无参会回到它。
     pub fn with_sinks(query_out: Sink, messages: Sink) -> Self {
-        let home = match query_out {
+        let mut session = Session::new();
+        session.home = match query_out {
             Sink::Buffer(_) => SinkHome::Buffer,
             _ => SinkHome::Stdout,
         };
-        Session {
-            symbols: SymbolTable::new(),
-            query_out,
-            messages,
-            home,
-            depth: 0,
-            quit: false,
-            timing: false,
-            on_error_stop: false,
-            stopped: false,
+        session.query_out = query_out;
+        session.messages = messages;
+        session
+    }
+
+    /// 打开磁盘上的一个库：库里的表一次载入符号表，两路输出到标准输出。
+    ///
+    /// `db` 已经上过单写者锁（见 [`ServiceDir::open`]）——**先上锁再载入**，
+    /// 否则会在载入的半途被另一个写者改文件。
+    pub fn open(db: Database, user: User, service: ServiceDir) -> Result<Self> {
+        Session::open_with_sinks(db, user, service, Sink::stdout(), Sink::stdout())
+    }
+
+    /// 同 [`Session::open`]，但指定两路输出去向（测试用）。
+    pub fn open_with_sinks(
+        db: Database,
+        user: User,
+        service: ServiceDir,
+        query_out: Sink,
+        messages: Sink,
+    ) -> Result<Self> {
+        let mut session = Session::with_sinks(query_out, messages);
+        let tables = db.load_tables()?;
+
+        // 整批原子：任何一张读不回来就整体失败，不留下装了一半的符号表
+        let mut known_on_disk = BTreeSet::new();
+        let mut batch = Vec::with_capacity(tables.len());
+        for table in tables {
+            known_on_disk.insert(table.name().to_string());
+            batch.push(Symbol::relation(table.name().to_string(), table));
         }
+        session.symbols.extend(batch)?;
+
+        session.store = Some(Store {
+            service,
+            db,
+            user,
+            dirty: BTreeSet::new(),
+            known_on_disk,
+        });
+        Ok(session)
     }
 
     /// 符号表（只读）。
@@ -258,6 +375,29 @@ impl Session {
     /// ——psql 在 `ON_ERROR_STOP` 命中时也是整个脚本停下。
     pub fn stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// 这个会话报过多少次错（含元命令与 `\i` 读文件失败）。
+    ///
+    /// 报错一律走 [`Session::error`]，所以它就是"这次会话干净不干净"的计数：
+    /// `ysql -f` 拿它决定退出码，交互式不看它。
+    pub fn failed(&self) -> usize {
+        self.failed
+    }
+
+    /// 服务模式下打开的库名；内存模式是 `None`。
+    pub fn database(&self) -> Option<&str> {
+        self.store.as_ref().map(|store| store.db.name())
+    }
+
+    /// 服务目录的根；内存模式是 `None`。
+    pub fn service_root(&self) -> Option<&Path> {
+        self.store.as_ref().map(|store| store.service.root())
+    }
+
+    /// 这个会话的用户名；内存模式是 `None`。
+    pub fn user(&self) -> Option<&str> {
+        self.store.as_ref().map(|store| store.user.name.as_str())
     }
 
     /// Tab 补全用的目录：现在有哪些表、哪些列。
@@ -332,11 +472,87 @@ impl Session {
             };
             if flow == Flow::Stop {
                 self.flush();
-                return Flow::Stop;
+                // 停下来也要提交：前面跑成功的语句**没有**回滚（本版没有事务），
+                // 不落盘就等于"报了错、还把已经改好的数据丢了"
+                return match self.commit() {
+                    Ok(()) => Flow::Stop,
+                    Err(e) => self.error(&format!("错误：提交失败：{}\n", e)),
+                };
             }
         }
+
         self.flush();
-        Flow::Continue
+        match self.commit() {
+            Ok(()) => Flow::Continue,
+            Err(e) => self.error(&format!("错误：提交失败：{}\n", e)),
+        }
+    }
+
+    /// 提交点：把**脏表**写回磁盘，并把已经不在符号表里的表文件删掉。
+    ///
+    /// 见文件头的「提交点」一节。内存模式直接返回。写完一张、认一张（失败时
+    /// `dirty` 里留着它，下次提交再试），所以**一次提交不是原子的**——多张表
+    /// 崩在中间会留下"改了一半"的库。
+    pub fn commit(&mut self) -> Result<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(());
+        };
+
+        // 磁盘上应该有、符号表里已经没有的表：`DROP SCHEMA … CASCADE` 删掉的那些。
+        // 别名不在磁盘上，所以只数关系符号（`relation_exact` 不认 `search_path`、
+        // 也不穿别名，判的正是"这个名字下有没有一张真表"）。
+        let live: BTreeSet<String> = self
+            .symbols
+            .names()
+            .into_iter()
+            .filter(|name| self.symbols.relation_exact(name).is_some())
+            .map(|name| name.to_string())
+            .collect();
+        let gone: Vec<String> = store.known_on_disk.difference(&live).cloned().collect();
+
+        for name in store.dirty.clone() {
+            // **精确**取表：脏表记的是它自己的生效名，不能再按当时的 `search_path`
+            // 解一次——`s.t` 与 `t` 都在、`search_path` 又指向 `s` 时，那会把表存错
+            let table = match self.symbols.relation_exact(&name) {
+                Some(table) => table,
+                // 这一段里刚建出来又被 `DROP SCHEMA … CASCADE` 清掉的表：
+                // 没有东西要写，也不算错（它的文件压根没落过盘）
+                None => {
+                    store.dirty.remove(&name);
+                    continue;
+                }
+            };
+            store.db.save_table(table)?;
+            store.dirty.remove(&name);
+            store.known_on_disk.insert(name);
+        }
+
+        for name in gone {
+            store.db.remove_table_files(&name)?;
+            store.known_on_disk.remove(&name);
+        }
+
+        Ok(())
+    }
+
+    /// 记下这次提交要写哪张表。
+    ///
+    /// 只有三条语句会改表内容或表的存在性：`CREATE TABLE` / `INSERT` / `UPDATE`
+    /// ——它们的 [`Outcome`] 正好带着生效名，于是脏标记不需要额外的钩子。
+    /// `DROP SCHEMA … CASCADE` 不用记：那些表从符号表里消失，[`Session::commit`]
+    /// 靠"磁盘上有、符号表里没有"把它们找出来。
+    fn mark_dirty(&mut self, result: &StmtResult) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+
+        let name = match &result.outcome {
+            Ok(Outcome::Created { name, .. }) => name,
+            Ok(Outcome::Inserted { table, .. }) => table,
+            Ok(Outcome::Updated { table, .. }) => table,
+            _ => return,
+        };
+        store.dirty.insert(name.clone());
     }
 
     fn flush(&mut self) {
@@ -354,8 +570,10 @@ impl Session {
 
     /// 报一个错。`ON_ERROR_STOP` 开着就**停下**。
     ///
-    /// 错误一律走这里、别直接 `msg`——否则"遇错就停"这件事迟早有地方漏掉。
+    /// 错误一律走这里、别直接 `msg`——否则"遇错就停"这件事迟早有地方漏掉，
+    /// 而且 [`Session::failed`] 的计数也会漏（`ysql -f` 的退出码靠它）。
     fn error(&mut self, text: &str) -> Flow {
+        self.failed += 1;
         self.msg(text);
         if self.on_error_stop {
             self.msg("（ON_ERROR_STOP：已停止后续语句）\n");
@@ -390,10 +608,16 @@ impl Session {
         let mut failed = 0usize;
         for index in 0..script.len() {
             let began = Instant::now();
-            let result = script.run_one(index, &mut self.symbols);
+            // 服务模式下 `CREATE DATABASE` / `DROP DATABASE` 要落到服务目录，
+            // 所以两条执行入口分开——内存模式那条由 `NoDatabases` 明确拒绝。
+            let result = match self.store.as_mut() {
+                Some(store) => script.run_one_with(index, &mut self.symbols, store),
+                None => script.run_one(index, &mut self.symbols),
+            };
             let elapsed = began.elapsed();
 
             self.report(&result);
+            self.mark_dirty(&result);
             if self.timing {
                 // 自己乘而不是 `as_millis`：毫秒下面还要三位小数
                 self.msg(&format!("耗时 {:.3} ms\n", elapsed.as_secs_f64() * 1e3));
@@ -401,6 +625,9 @@ impl Session {
 
             if result.outcome.is_err() {
                 failed += 1;
+                // 语句自己的失败不走 `Session::error`（那是引擎级错误的漏斗），
+                // 所以这里也要给 `failed` 计数——`ysql -f` 的退出码靠它
+                self.failed += 1;
                 if self.on_error_stop {
                     // 停在 `index` 条上，前面 index 条（0 起）都成功了
                     self.msg(&format!("成功 {} 条，失败 {} 条\n", index, failed));

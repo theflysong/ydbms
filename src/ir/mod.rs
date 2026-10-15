@@ -102,7 +102,8 @@ pub use plan::{
     Analysis, EqKey, IndexPath, JoinKind, JoinStrategy, Node, NodeId, Op, Plan, PlanBuilder, SortKey,
 };
 pub use stmt::{
-    execute_stmt, has_top_level_terminator, run_script, Outcome, Script, Stmt, StmtResult,
+    execute_stmt, execute_stmt_with, has_top_level_terminator, run_script, Databases,
+    NoDatabases, Outcome, Script, Stmt, StmtResult,
 };
 pub use symbol::{Symbol, SymbolTable};
 pub use value::{Scalar, ScalarType, Tri};
