@@ -1055,7 +1055,7 @@ fn drop_schema_if_exists_is_idempotent_but_plain_drop_is_not() {
 
 #[test]
 fn an_init_script_like_the_projects_runs_twice() {
-    // `ydbms-test/init.sql` 的形状:DROP → CREATE → SET search_path → 建表 → 装数据
+    // `tests/script/filmdb/init.sql` 的形状:DROP → CREATE → SET search_path → 建表 → 装数据
     const INIT: &str = "
         BEGIN;
         DROP SCHEMA IF EXISTS study CASCADE;

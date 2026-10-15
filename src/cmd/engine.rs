@@ -1638,7 +1638,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 /// `\echo` 的参数:整行被**一对单引号**包住时把它们去掉,`''` 折成 `'`.
 ///
 /// 这是照 psql 的行为来的:脚本里的 `\echo 'Test 1: Baseline tests'` 在 psql 下打出来
-/// 是**不带引号**的 `Test 1: Baseline tests`(`ydbms-test/` 那套输出就靠这个对齐).
+/// 是**不带引号**的 `Test 1: Baseline tests`(`tests/script/filmdb/` 那套输出就靠这个对齐).
 ///
 /// 已知偏差:psql 是**逐个参数**去引号的(`\echo a 'b c'` → `a b c`),这里只认"整行被
 /// 一对单引号包住"这一种写法;双引号也不去.要真按 psql 那样切词,得先在
