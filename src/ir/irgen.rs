@@ -3750,6 +3750,8 @@ fn binop_of(op: &str) -> Result<BinOp> {
         "-" => BinOp::Sub,
         "*" => BinOp::Mul,
         "/" => BinOp::Div,
+        // 文本连接:PostgreSQL 把 `||` 也叫"运算符",语法树里与算术同级
+        "||" => BinOp::Concat,
         // `LIKE` 族在语法树里是这几个内部运算符名(pg_query 的 `AexprLike` /
         // `AexprIlike` 分支)
         "~~" => BinOp::Like,

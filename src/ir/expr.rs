@@ -50,6 +50,17 @@ pub enum BinOp {
     Mul,
     /// 除
     Div,
+    /// `||`:文本连接.
+    ///
+    /// 两侧必须是**文本**(或 NULL);任一侧是 NULL,结果就是 NULL.非文本的一侧
+    /// **不隐式转文本**.
+    ///
+    /// **已知偏差**:PostgreSQL 的 `||` 还有 `text || anynonarray` 这类重载,于是
+    /// 那边 `'a' || 1` 是 `a1`(非文本的一侧按它的渲染文本接上去,`true || 'a'` 就是
+    /// `truea`),而 `1 || 2` 没有运算符.本版只认"两侧都是文本":`1 || 'a'` 以
+    /// `ir.expr.027` 拒绝.脚本里用到的两处(`COALESCE(writers, '') || ','` 与
+    /// `'(' || CAST(... AS TEXT) || ')'`)都是文本接文本,不受这条偏差影响.
+    Concat,
     /// 等于
     Eq,
     /// 不等于
@@ -92,6 +103,7 @@ impl BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::Concat => "||",
             BinOp::Eq => "=",
             BinOp::Ne => "<>",
             BinOp::Lt => "<",
@@ -1466,6 +1478,12 @@ fn binary_type(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<Sca
     if op.is_pattern() {
         return pattern_type(op, l, r, at);
     }
+    if op == BinOp::Concat {
+        // `||`:两侧都必须是文本(或 NULL),结果是文本.非文本的一侧**不隐式转**--
+        // 这是一条**已知偏差**,口径与理由见 [`BinOp::Concat`].
+        require_text_pair(op, l, r, at)?;
+        return Ok(ScalarType::Value(TypeFamily::Text));
+    }
     if op.is_comparison() {
         // NULL 与任何可存储的大类都相容:`x = NULL` 是合法写法,结果是 UNKNOWN.
         // 另外 INT 与 NUMERIC 可以直接比--见 [`numeric_pair`].
@@ -1498,6 +1516,15 @@ fn binary_type(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<Sca
 /// 结果是布尔.别的家族(`timestamp LIKE ...`,`int ~* ...`)在这里就被拒绝--
 /// 与比较运算一样,宁可拒绝也不要安静地按大类排名去比.
 fn pattern_type(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<ScalarType> {
+    require_text_pair(op, l, r, at)?;
+    Ok(ScalarType::Bool)
+}
+
+/// "两侧都必须是 **TEXT**(或 NULL)"--文本运算共同的参数规则.
+///
+/// `LIKE` 族,正则族与 `||` 都走它:三者的差别只在结果类型(前两组是布尔,它是文本),
+/// 参数规则是同一条.认不出来的大类(`int ~* ...`,`timestamp LIKE ...`)在这里拒绝.
+fn require_text_pair(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<()> {
     let is_text = |ty: ScalarType| {
         matches!(ty, ScalarType::Value(TypeFamily::Text) | ScalarType::Null)
     };
@@ -1509,7 +1536,7 @@ fn pattern_type(op: BinOp, l: ScalarType, r: ScalarType, at: usize) -> Result<Sc
             r
         ))));
     }
-    Ok(ScalarType::Bool)
+    Ok(())
 }
 
 /// 算术操作数只能是 INT 或 NUMERIC,返回它的大类.
@@ -1546,6 +1573,20 @@ pub(crate) fn apply(op: BinOp, l: Scalar, r: Scalar) -> std::result::Result<Scal
             Tri::False
         };
         return Ok(Scalar::Truth(truth));
+    }
+
+    if op == BinOp::Concat {
+        // NULL 传播:任一侧是 NULL,结果就是 NULL(与算术同一条规矩)
+        if l.is_null() || r.is_null() {
+            return Ok(Scalar::Value(Value::Null));
+        }
+        // 类型检查已经拦掉真值与非文本,这里只给手写程序兜底
+        return match (&l, &r) {
+            (Scalar::Value(a), Scalar::Value(b)) => {
+                Ok(Scalar::Value(Value::Text(format!("{}{}", a, b))))
+            }
+            _ => Err(EvalError::MixedTypes),
+        };
     }
 
     if op.is_arithmetic() {

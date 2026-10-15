@@ -314,6 +314,39 @@ fn upper_left_and_concat_ws_work_like_postgresql() {
 }
 
 #[test]
+fn concat_builds_text_from_text_and_propagates_null() {
+    // 期望值逐条对照过 PostgreSQL 18.6
+    let symbols = db();
+
+    let out = q(
+        &symbols,
+        "SELECT 'a' || 'b' AS ab,
+                'a' || 'b' || 'c' AS abc,
+                NULL || 'a' AS n_left,
+                'a' || NULL AS n_right,
+                name || '!' AS on_a_column
+         FROM t WHERE id = 1",
+    );
+    assert_eq!(out.value(0, 0), Some(Value::Text("ab".to_string())));
+    assert_eq!(out.value(0, 1), Some(Value::Text("abc".to_string())));
+    // NULL 传播:任一侧是 NULL,结果就是 NULL
+    assert_eq!(out.value(0, 2), Some(Value::Null));
+    assert_eq!(out.value(0, 3), Some(Value::Null));
+    assert_eq!(out.value(0, 4), Some(Value::Text("Alice!".to_string())));
+}
+
+#[test]
+fn concat_refuses_a_non_text_side() {
+    // 已知偏差:PostgreSQL 有 `text || anynonarray`,于是那边 `'a' || 1` 是 `a1`;
+    // 本版只认"两侧都是文本",这里拒绝.口径写在 `BinOp::Concat` 的文档里.
+    let symbols = db();
+    for sql in ["SELECT 'a' || 1", "SELECT 1 || 'a'", "SELECT 1 || 2"] {
+        let err = rejected(&symbols, sql);
+        assert!(err.to_string().contains("必须是 TEXT"), "`{sql}`:{err}");
+    }
+}
+
+#[test]
 fn extract_year_reads_the_first_four_digits() {
     let symbols = db();
     // 入学年份(`enrolled_at` 是定宽 TIMESTAMP 文本,取前 4 位即可)

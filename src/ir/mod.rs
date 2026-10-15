@@ -56,7 +56,9 @@
 //!
 //! 已实现:`SELECT`(多表内连接与左外连接,`WHERE`,`ORDER BY` 含**输出列序号**,
 //! `LIMIT`/`OFFSET`,`DISTINCT`),聚合与 `GROUP BY`/`HAVING`/`COUNT(*) FILTER`,
-//! `CASE`,`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`~*`,`ROUND`/`UPPER`/`LEFT`/`CONCAT_WS`/
+//! `CASE`,`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`~*`,`||`(文本连接,两侧必须都是文本--
+//! 这条与 PostgreSQL 的 `text || anynonarray` 是**已知偏差**,见 `expr::BinOp`),
+//! `ROUND`/`UPPER`/`LEFT`/`CONCAT_WS`/
 //! `LENGTH`/`EXTRACT(YEAR FROM ...)`/`CURRENT_DATE`,`::numeric`,
 //! `CREATE TABLE`(`NOT NULL` / `DEFAULT` / `CHECK` 真强制;`PRIMARY KEY` / `UNIQUE` /
 //! `FOREIGN KEY` 接受并**如实记录为未强制**),`INSERT`,`UPDATE`,

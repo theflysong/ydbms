@@ -110,6 +110,10 @@ PhysTab                          ← db::source::materialize
   放大(`int → numeric`);`text = int`,`timestamp = text` 必须继续拒绝.
   放宽比较时**必须同时在运行时把 `Int` 转成 `Numeric`**--只改类型检查会让比较掉进
   `Value::cmp` 的"按大类排名"兜底,给出安静的错答案.
+- **`||` 只放行文本**:两侧必须是 `TEXT`(或 `NULL`),结果是 `TEXT`,任一侧 NULL 就得
+  NULL.非文本的一侧**不隐式转文本**--这是与 PostgreSQL 的**已知偏差**(那边有
+  `text || anynonarray`,于是 `'a' || 1` 是 `a1`);脚本里用到的两处都是文本接文本.
+  这条规则与 `LIKE` 族共用 `require_text_pair`(见 `expr.rs`).
 - **`CASE` 的两分支走同一条放大规则**:`INT` 与 `NUMERIC` 统一成 `NUMERIC`,
   一侧是 `NULL` 就取另一侧(**不放大**).分支变惰性之后,另一侧的值不再是现成的,
   所以这条决策搬到了**降级**:`Step::Case::widen` 由那次类型探针算出来
