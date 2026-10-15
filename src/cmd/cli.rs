@@ -223,10 +223,13 @@ pub fn run() -> i32 {
         }
     };
 
-    // `-f`:脚本跑完就退.与 `\i` 是同一条路(`Session::run_file`),所以
-    // 两种用法给出的输出逐字一致;失败靠 Session::failed 计数变成非零退出.
+    // `-f`:脚本跑完就退.与 `\i` 是同一条执行路径(`Session::run_file`),差别只有一处:
+    // **脚本模式默认安静**(`VERBOSE` 关)--像 psql 的 `-f`,脚本的输出应该是脚本自己
+    // 说了算(状态行与汇总都归 `\set VERBOSE on` 管).失败靠 Session::failed 计数
+    // 变成非零退出.
     match &args.script {
         Some(script) => {
+            session.set_verbose(false);
             session.run_file(script);
             i32::from(session.failed() > 0)
         }

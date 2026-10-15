@@ -4,7 +4,7 @@
 _version: 1
 
 # ---- src/cmd/cli.rs ----
-cmd.cli.001: "ysql -- command line with user and database (ydbms service mode)\n\nUsage:\n  ysql [-U user] [-d db] [-f script] [--server-dist dir]\n\nOptions:\n  -U <user>             who to connect as (default $USER)\n  -d <db>               which database to connect to (default the same name as -U)\n  -f <script>           run this script and exit (default: interactive terminal)\n  --server-dist <dir>   service directory: users.json and the databases live here (default $HOME/.ydbms);\n                        a relative path is pinned to the working directory\n                        at startup, so a later \\cd cannot move it\n  -h, --help            this help\n\nThe password comes from the PGPASSWORD environment variable; without it, an interactive run prompts for it and a non-interactive run fails immediately.\nWhen users.json does not exist (first use), this -U is created as an administrator and the default database is created along with it.\nWithout -d, a missing default database is created automatically (the owner is -U); with an explicit -d the database must already exist.\nWithout -f you get the interactive terminal; `ysql < script.sql` also reads from standard input.\n\nWrites are persisted on commit: with no transaction every statement commits by itself. Wrap bulk loading in\nBEGIN; ... COMMIT; -- otherwise every write statement rewrites the whole table.\nExiting with a transaction still open throws it away (the same as disconnecting from PostgreSQL).\n\nExit codes: 0 normal; 1 usage / authentication / failure to open the database, or the -f script reported an error.\n"
+cmd.cli.001: "ysql -- command line with user and database (ydbms service mode)\n\nUsage:\n  ysql [-U user] [-d db] [-f script] [--server-dist dir]\n\nOptions:\n  -U <user>             who to connect as (default $USER)\n  -d <db>               which database to connect to (default the same name as -U)\n  -f <script>           run this script and exit (default: interactive terminal);\n                        in script mode the per-statement status lines are off by default,\n                        turn them on with \\set VERBOSE on\n  --server-dist <dir>   service directory: users.json and the databases live here (default $HOME/.ydbms);\n                        a relative path is pinned to the working directory\n                        at startup, so a later \\cd cannot move it\n  -h, --help            this help\n\nThe password comes from the PGPASSWORD environment variable; without it, an interactive run prompts for it and a non-interactive run fails immediately.\nWhen users.json does not exist (first use), this -U is created as an administrator and the default database is created along with it.\nWithout -d, a missing default database is created automatically (the owner is -U); with an explicit -d the database must already exist.\nWithout -f you get the interactive terminal; `ysql < script.sql` also reads from standard input.\n\nWrites are persisted on commit: with no transaction every statement commits by itself. Wrap bulk loading in\nBEGIN; ... COMMIT; -- otherwise every write statement rewrites the whole table.\nExiting with a transaction still open throws it away (the same as disconnecting from PostgreSQL).\n\nExit codes: 0 normal; 1 usage / authentication / failure to open the database, or the -f script reported an error.\n"
 cmd.cli.002: "`%{arg0}` must be followed by a value\n\n%{arg1}"
 cmd.cli.003: "Unrecognized argument `%{arg0}`\n\n%{arg1}"
 cmd.cli.004: "Error: the -U user name cannot be empty"
@@ -70,8 +70,8 @@ cmd.engine.034: "Error: \\timing accepts only on / off (got `%{arg0}`)\n"
 cmd.engine.035: "Timing: %{arg0}\n"
 cmd.engine.036: "on"
 cmd.engine.037: "off"
-cmd.engine.038: "Error: \\set accepts only ON_ERROR_STOP (got `%{arg0}`)\n"
-cmd.engine.039: "Error: \\set ON_ERROR_STOP accepts only on / off (got `%{arg0}`)\n"
+cmd.engine.038: "Error: \\set accepts only ON_ERROR_STOP / VERBOSE (got `%{arg0}`)\n"
+cmd.engine.039: "Error: \\set %{arg0} accepts only on / off (got `%{arg1}`)\n"
 cmd.engine.040: "on"
 cmd.engine.041: "off"
 cmd.engine.042: "Error: no $HOME, please give a directory\n"
@@ -160,6 +160,7 @@ cmd.repl.028: "  \\c [database]      switch database (the old lock is released a
 cmd.repl.029: "  \\l                 list the databases and their owners"
 cmd.repl.030: "  \\du                list the roles (attributes, memberships)"
 cmd.repl.031: "  %{arg0}/grants.json                 grants (who may connect; who may SELECT / INSERT / UPDATE a table)"
+cmd.repl.032: "  \\set VERBOSE on|off   per-statement status lines and summaries (on interactively, off under -f)"
 
 # ---- src/db/index.rs ----
 db.index.001: "cannot read row %{arg0} column %{arg1} while building the index"

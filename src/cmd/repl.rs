@@ -293,6 +293,7 @@ fn banner_commands() {
     println!("{}", tr!("cmd.repl.019"));
     println!("{}", tr!("cmd.repl.020"));
     println!("{}", tr!("cmd.repl.021"));
+    println!("{}", tr!("cmd.repl.032"));
     println!("{}", tr!("cmd.repl.022"));
     println!("{}", tr!("cmd.repl.023"));
     println!("{}", tr!("cmd.repl.024"));

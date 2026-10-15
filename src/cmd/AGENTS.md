@@ -10,8 +10,8 @@
 - 元命令本身(`metacmd.rs`).
 
 - `engine.rs` -- [`Session`](engine.rs):状态(符号表,两路输出,`\i` 递归深度,
-  `\timing` / `ON_ERROR_STOP` 两个开关,服务模式下的提交点),输入切分,元命令的**语义**,
-  SQL 的执行与报告.
+  `\timing` / `ON_ERROR_STOP` / `VERBOSE` 三个开关,服务模式下的提交点),输入切分,
+  元命令的**语义**,SQL 的执行与报告.
 - `metacmd.rs` -- 元命令的**语法**:把一行拆成命令名与参数,认不出来的也照样返回
   `MetaCmd::Unknown`.命令名只有一份(`NAMES`),补全与错误提示都从它取.
 - `repl.rs` -- 交互式终端:rustyline 接线,[`is_complete`](repl.rs)(多行判定),非 tty 回退.
@@ -125,6 +125,31 @@
 **`\o` 只换 `query_out`,永远不影响 `messages`.** 所以"`\o` 仅限于查询输出"这句话
 是**结构上**成立的,不是靠约定.**不要把状态行,错误,汇总写进 `query_out`** --
 那会立刻破坏 `\o` 的含义.
+
+### `VERBOSE`:哪些算"状态行"
+
+`\set VERBOSE on|off` 只管**引擎自己的聊天**,一律走 `Session::info`(off 就不打):
+
+- `\i` 的"读入 ...(N 字节)";
+- 每条语句的状态行(`report` 的六个成功分支:`Rows` / `Created` / `Inserted` /
+  `Updated` / `NoOp` / `Transaction`);
+- 每段 SQL 的汇总("成功 N 条,失败 M 条",含 `ON_ERROR_STOP` 打断时那一条);
+- `\o` 的去向提示;
+- `\set` 自己的回显(`ON_ERROR_STOP:开` / `VERBOSE:开`).所以 `\set VERBOSE on` 会报
+  一声,`\set VERBOSE off` 是静悄悄的--它自己已经把状态行关掉了.
+
+**不归它管的两样**:错误(一律 `Session::error` / `report` 的 `Err` 分支,**永远打**--
+否则脚本会静悄悄地什么都没干),查询结果表(`query_out`),以及用户点着名要的输出
+(`\timing` 的回显,`\echo` / `\d` / `\dt` / `\l` / `\du` / `\c` / `\pwd` / `\ls` /
+`EXPLAIN`).加新的状态行时**走 `info`**,别走 `msg`.
+
+默认 **开**;只有 `ysql -f <脚本>` 由 `cli.rs` 在 `run_file` 之前关掉(**脚本模式默认
+安静**,照 psql 的 `-f`).所以"`-f` 与 `\i` 输出逐字一致"这句话不再成立:同一条执行
+路径,但 `-f` 默认安静(脚本里 `\set VERBOSE on` 随时能打开).
+
+`\echo` 的**去引号**也在引擎里(`unquote_echo`),不在 `metacmd.rs`--那一层只拆词,
+不解释参数.只处理"整行被一对单引号包住",psql 那种逐参数去引号不做(与参考实现
+的已知偏差,写在函数注释里).
 
 ### 服务目录那三条元命令(`\l` / `\du` / `\c`,6.4)
 

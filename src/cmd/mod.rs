@@ -15,7 +15,7 @@
 //! # 各文件
 //!
 //! - `engine.rs` -- [`Session`]:符号表,两路输出,元命令的**语义**,
-//!   `\timing` / `ON_ERROR_STOP` 两个开关,以及服务模式下的**提交点**.
+//!   `\timing` / `ON_ERROR_STOP` / `VERBOSE` 三个开关,以及服务模式下的**提交点**.
 //! - `metacmd.rs` -- 元命令的**语法**(只拆词,不校验).
 //! - `repl.rs` -- 交互式终端:rustyline 接线,多行判定,非 tty 回退.
 //! - `complete.rs` -- Tab 补全的候选(纯逻辑,不认识终端).

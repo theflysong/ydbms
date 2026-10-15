@@ -8,8 +8,8 @@
 //! | `\` 开头,还在敲命令名 | 元命令([`crate::cmd::metacmd::NAMES`],唯一一份) |
 //! | `\d ` | 表名 |
 //! | `\i ` `\o ` `\ls ` `\cd ` | 文件路径(目录补 `/`) |
-//! | `\timing ` `\set ON_ERROR_STOP ` | `on` / `off` |
-//! | `\set ` | 变量名(本版只有 `ON_ERROR_STOP`) |
+//! | `\timing ` `\set ON_ERROR_STOP ` `\set VERBOSE ` | `on` / `off` |
+//! | `\set ` | 变量名(本版有 `ON_ERROR_STOP` 与 `VERBOSE`) |
 //! | SQL | 关键字 ∪ 表名 ∪ 列名;`别名.` 之后只补那个表的列 |
 //!
 //! 前缀匹配**不分大小写**(`sel` 能补出 `SELECT`),写进去的关键字统一是大写.
@@ -39,7 +39,7 @@ const KEYWORDS: &[&str] = &[
 const SWITCHES: &[&str] = &["on", "off"];
 
 /// 本版认的 `\set` 变量(与 [`crate::cmd::engine`] 的判断一致).
-const VARIABLES: &[&str] = &["ON_ERROR_STOP"];
+const VARIABLES: &[&str] = &["ON_ERROR_STOP", "VERBOSE"];
 
 /// 补全的候选来源:现在有哪些表,哪些列,服务目录里有哪些库.
 ///

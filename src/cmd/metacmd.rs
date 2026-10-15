@@ -33,7 +33,7 @@ pub enum MetaCmd {
     Ls(Option<PathBuf>),
     /// `\cd [目录]` -- 切换目录;无参回 `$HOME`.
     Cd(Option<PathBuf>),
-    /// `\echo <文本>` -- 原样回显.
+    /// `\echo <文本>` -- 原样回显(整行被一对单引号包住时由执行层去掉引号).
     Echo(String),
     /// `\dt` -- 列出所有表.
     ListTables,

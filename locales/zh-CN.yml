@@ -4,7 +4,7 @@
 _version: 1
 
 # ---- src/cmd/cli.rs ----
-cmd.cli.001: "ysql -- 带用户与库的命令行(ydbms 的服务模式)\n\n用法:\n  ysql [-U 用户] [-d 库] [-f 脚本] [--server-dist 目录]\n\n选项:\n  -U <用户>             以谁连(默认 $USER)\n  -d <库>               连哪个库(默认与 -U 同名)\n  -f <脚本>             跑完这个脚本就退出(默认进交互式终端)\n  --server-dist <目录>   服务目录:users.json 与各个库放在这儿(默认 $HOME/.ydbms);\n                        相对路径按启动时的工作目录定死,\n                        之后的 \\cd 改不动它\n  -h, --help            这份帮助\n\n口令从 PGPASSWORD 环境变量来;没有它时,交互式提示输入,非交互直接报错.\nusers.json 不存在时(首次使用),这次 -U 会被建成管理员,默认库也一起建出来.\n没给 -d 时默认库不存在会自动建(owner 就是 -U);显式给 -d 时库必须已存在.\n没有 -f 时进交互式终端;`ysql < 脚本.sql` 也从标准输入读.\n\n写是提交即落盘:没有事务时每条语句自己提交一次.整段装载请包在\nBEGIN; ... COMMIT; 里--否则每条写语句都要把整张表重写一遍.\n事务还开着就退出等于丢掉它(与 PostgreSQL 断开连接一致).\n\n退出码:0 正常;1 用法 / 认证 / 打开库失败,或 -f 的脚本里报过错.\n"
+cmd.cli.001: "ysql -- 带用户与库的命令行(ydbms 的服务模式)\n\n用法:\n  ysql [-U 用户] [-d 库] [-f 脚本] [--server-dist 目录]\n\n选项:\n  -U <用户>             以谁连(默认 $USER)\n  -d <库>               连哪个库(默认与 -U 同名)\n  -f <脚本>             跑完这个脚本就退出(默认进交互式终端);\n                        脚本模式下每条语句的状态行默认不打,\n                        要就打 \\set VERBOSE on\n  --server-dist <目录>   服务目录:users.json 与各个库放在这儿(默认 $HOME/.ydbms);\n                        相对路径按启动时的工作目录定死,\n                        之后的 \\cd 改不动它\n  -h, --help            这份帮助\n\n口令从 PGPASSWORD 环境变量来;没有它时,交互式提示输入,非交互直接报错.\nusers.json 不存在时(首次使用),这次 -U 会被建成管理员,默认库也一起建出来.\n没给 -d 时默认库不存在会自动建(owner 就是 -U);显式给 -d 时库必须已存在.\n没有 -f 时进交互式终端;`ysql < 脚本.sql` 也从标准输入读.\n\n写是提交即落盘:没有事务时每条语句自己提交一次.整段装载请包在\nBEGIN; ... COMMIT; 里--否则每条写语句都要把整张表重写一遍.\n事务还开着就退出等于丢掉它(与 PostgreSQL 断开连接一致).\n\n退出码:0 正常;1 用法 / 认证 / 打开库失败,或 -f 的脚本里报过错.\n"
 cmd.cli.002: "`%{arg0}` 后面要跟一个值\n\n%{arg1}"
 cmd.cli.003: "看不懂的参数 `%{arg0}`\n\n%{arg1}"
 cmd.cli.004: "错误:-U 的用户名不能为空"
@@ -48,7 +48,7 @@ cmd.engine.012: "错误:提交失败:%{arg0}\n"
 cmd.engine.013: "错误:提交失败:%{arg0}\n"
 cmd.engine.014: "(ON_ERROR_STOP:已停止后续语句)\n"
 cmd.engine.015: "错误:%{arg0}\n"
-cmd.engine.016: "耗时 %{arg0} ms\n"
+cmd.engine.016: "耗时: %{arg0} ms\n"
 cmd.engine.017: "成功 %{arg0} 条,失败 %{arg1} 条\n"
 cmd.engine.018: "(ON_ERROR_STOP:已停止后续语句)\n"
 cmd.engine.019: "错误:提交失败:%{arg0}\n"
@@ -70,8 +70,8 @@ cmd.engine.034: "错误:\\timing 只认 on / off(收到 `%{arg0}`)\n"
 cmd.engine.035: "计时:%{arg0}\n"
 cmd.engine.036: "开"
 cmd.engine.037: "关"
-cmd.engine.038: "错误:\\set 只认 ON_ERROR_STOP(收到 `%{arg0}`)\n"
-cmd.engine.039: "错误:\\set ON_ERROR_STOP 只认 on / off(收到 `%{arg0}`)\n"
+cmd.engine.038: "错误:\\set 只认 ON_ERROR_STOP / VERBOSE(收到 `%{arg0}`)\n"
+cmd.engine.039: "错误:\\set %{arg0} 只认 on / off(收到 `%{arg1}`)\n"
 cmd.engine.040: "开"
 cmd.engine.041: "关"
 cmd.engine.042: "错误:没有 $HOME,请给出目录\n"
@@ -160,6 +160,7 @@ cmd.repl.028: "  \\c [库名]          换一个库(旧库的写锁当场释放;
 cmd.repl.029: "  \\l                 列出服务目录里的库与 owner"
 cmd.repl.030: "  \\du                列出角色(属性,所属角色)"
 cmd.repl.031: "  %{arg0}/grants.json                 授权表(谁能连;谁能在哪张表上 SELECT / INSERT / UPDATE)"
+cmd.repl.032: "  \\set VERBOSE on|off   每条语句的状态行与汇总(交互式默认开,-f 脚本默认关)"
 
 # ---- src/db/index.rs ----
 db.index.001: "建索引时读不到第 %{arg0} 行第 %{arg1} 列"

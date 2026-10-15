@@ -151,7 +151,9 @@ fn metacommand_names_complete() {
 fn metacommand_arguments_complete() {
     let c = catalog();
     assert_eq!(inserts("\\set ON_", &c), vec!["ON_ERROR_STOP"]);
+    assert_eq!(inserts("\\set VER", &c), vec!["VERBOSE"]);
     assert!(inserts("\\set ON_ERROR_STOP ", &c).contains(&"on".to_string()));
+    assert!(inserts("\\set VERBOSE ", &c).contains(&"off".to_string()));
     assert!(inserts("\\timing ", &c).contains(&"off".to_string()));
     assert!(inserts("\\d ", &c).contains(&"t".to_string()));
     assert!(inserts("\\c ", &c).is_empty(), "手搓的目录里没有库名可补");

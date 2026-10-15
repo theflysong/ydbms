@@ -141,7 +141,8 @@ DDL/DML:CREATE TABLE 的 NOT NULL / DEFAULT / CHECK **真强制**(CHECK 见 ir/c
 - 查询层那一整张清单:`IN` 列表,`BETWEEN`,`LIKE`/`ILIKE`,`~*`,`DISTINCT`,派生表,
   `COUNT(*) FILTER`,`::numeric`,`EXTRACT(YEAR FROM ...)`/`CURRENT_DATE`,`UPPER`/`LEFT`/`CONCAT_WS`,
   以及子查询(标量 / `IN` / `EXISTS` / 相关 / `UNION` / `ANY`/`ALL`);
-- 元命令 `\i`,`\o <文件>`,`\echo`,`\dt`,`\timing`,`\set ON_ERROR_STOP`;
+- 元命令 `\i`,`\o <文件>`,`\echo`,`\dt`,`\timing`,`\set ON_ERROR_STOP`,`\set VERBOSE`
+  (后两个是会话开关:`VERBOSE` 管状态行与汇总,交互式默认开,`-f` 脚本默认关);
 - **装载可行**:1 万条单行 INSERT 用 0.43 秒 → 7.6 万条约 **3.3 秒**.
 
 ## 1.7 [?]`tests.yql` 要不要支持

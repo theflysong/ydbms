@@ -185,8 +185,9 @@ fn a_wrong_password_exits_non_zero() {
 fn a_database_and_its_rows_survive_across_processes() {
     let dir = TempDir::new("cross-process");
 
-    // 1) bootstrap + 建库(连的是默认库 `bob`)
-    let create = dir.script("create.sql", "CREATE DATABASE filmdb;\n");
+    // 1) bootstrap + 建库(连的是默认库 `bob`).
+    // 脚本模式默认安静,这里想看状态行,所以第一句把 VERBOSE 打开(顺带覆盖大写取值).
+    let create = dir.script("create.sql", "\\set VERBOSE ON\nCREATE DATABASE filmdb;\n");
     let out = run(&dir, &["-U", "bob", "-f", create.to_str().unwrap()], Some(PASSWORD));
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
@@ -199,7 +200,8 @@ fn a_database_and_its_rows_survive_across_processes() {
     // 2) 另一个进程:连 filmdb 装数据
     let load = dir.script(
         "load.sql",
-        "CREATE TABLE movies (movie_id INT, title VARCHAR(20));\n\
+        "\\set VERBOSE ON\n\
+         CREATE TABLE movies (movie_id INT, title VARCHAR(20));\n\
          INSERT INTO movies VALUES (1, 'Alien'), (2, 'Aliens');\n",
     );
     let out = run(
@@ -240,7 +242,8 @@ fn a_database_level_search_path_survives_into_another_process() {
 
     let setup = dir.script(
         "setup.sql",
-        "CREATE SCHEMA study;\n\
+        "\\set VERBOSE ON\n\
+         CREATE SCHEMA study;\n\
          CREATE TABLE study.movies (movie_id INT, title VARCHAR(20));\n\
          INSERT INTO study.movies VALUES (1, 'Alien');\n\
          ALTER DATABASE bob SET search_path TO study;\n",
@@ -253,7 +256,10 @@ fn a_database_level_search_path_survives_into_another_process() {
     let query = dir.script("query.sql", "SELECT movie_id FROM movies;\n");
     let out = run(&dir, &["-U", "bob", "-d", "bob", "-f", query.to_str().unwrap()], Some(PASSWORD));
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
-    assert!(stdout(&out).contains("1 | Alien") || stdout(&out).contains(" 1"), "{}", stdout(&out));
+    // 脚本模式安静,所以这里只有结果表:表头是 `movie_id`(说明非限定名解析到了
+    // `study.movies`),数据是那一行
+    let text = stdout(&out);
+    assert!(text.contains("movie_id") && text.contains('1'), "{text}");
 
     // 落盘的是 `catalog.json` 里的 `settings`
     let json: serde_json::Value = serde_json::from_str(
@@ -334,7 +340,7 @@ fn script_mode_and_backslash_i_produce_the_same_result() {
 
     let query = dir.script("q.sql", "SELECT 1 AS one;\n");
 
-    // `-f` 一路
+    // `-f` 一路(脚本模式:**默认安静**,所以这里只有结果表)
     let by_flag = run(
         &dir,
         &["-U", "bob", "-d", "bob", "-f", query.to_str().unwrap()],
@@ -343,8 +349,10 @@ fn script_mode_and_backslash_i_produce_the_same_result() {
     assert!(by_flag.status.success(), "{}", stderr(&by_flag));
     let by_flag_text = stdout(&by_flag);
     assert!(by_flag_text.contains("one\n---\n1\n"), "{by_flag_text}");
+    assert!(!by_flag_text.contains("成功"), "脚本模式默认不打状态行:{by_flag_text}");
 
-    // 交互终端(这里没有 tty,走的是 `ysql < 脚本` 那一路)里 `\i` 同一份脚本
+    // 交互终端(这里没有 tty,走的是 `ysql < 脚本` 那一路)里 `\i` 同一份脚本.
+    // 两边**不再是逐字一致**:`-f` 默认安静,`\i` 默认不安静,所以是包含关系.
     let by_include = run_with_stdin(
         &dir,
         &["-U", "bob", "-d", "bob"],
@@ -353,11 +361,56 @@ fn script_mode_and_backslash_i_produce_the_same_result() {
     );
     assert!(by_include.status.success(), "{}", stderr(&by_include));
     let by_include_text = stdout(&by_include);
+    assert!(by_include_text.contains("成功 1 条"), "{by_include_text}");
 
     assert!(
         by_include_text.contains(&by_flag_text),
         "`\\i` 的输出应当把 `-f` 的整段包在里面:\n--- -f ---\n{by_flag_text}\n--- \\i ---\n{by_include_text}"
     );
+}
+
+/// 脚本模式(`-f`)默认**安静**:状态行与汇总都不打,只有结果表;脚本里
+/// `\set VERBOSE ON` 能把它打开.
+#[test]
+fn script_mode_is_quiet_until_verbose_is_turned_on() {
+    let dir = TempDir::new("script-verbose");
+    bootstrap(&dir);
+
+    let quiet = dir.script(
+        "quiet.sql",
+        "CREATE TABLE t (x INT);\nINSERT INTO t VALUES (1);\nSELECT x FROM t;\n",
+    );
+    let out = run(
+        &dir,
+        &["-U", "bob", "-d", "bob", "-f", quiet.to_str().unwrap()],
+        Some(PASSWORD),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let text = stdout(&out);
+    assert!(text.contains("x\n-\n1\n"), "结果表照旧:{text}");
+    for needle in ["建表成功", "插入 1 行", "成功 1 条", "读入"] {
+        assert!(!text.contains(needle), "脚本模式默认不该有 `{needle}`:{text}");
+    }
+
+    let loud = dir.script(
+        "loud.sql",
+        "\\set VERBOSE ON\nCREATE TABLE u (x INT);\nINSERT INTO u VALUES (2);\n",
+    );
+    let out = run(
+        &dir,
+        &["-U", "bob", "-d", "bob", "-f", loud.to_str().unwrap()],
+        Some(PASSWORD),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let text = stdout(&out);
+    assert!(text.contains("建表成功:u"), "{text}");
+    assert!(text.contains("插入 1 行到 u"), "{text}");
+    assert!(text.contains("成功 2 条,失败 0 条"), "{text}");
+    // 打开的那一句自己也要报,而且**读入**是开关打开**之前**打的,所以仍然没有
+    assert!(text.contains("VERBOSE:开"), "{text}");
+    assert!(!text.contains("读入"), "读入发生在开关打开之前:{text}");
 }
 
 /// 跨进程的单写者锁:库被这个测试进程握着时,真 `ysql` 进程必须连不上.

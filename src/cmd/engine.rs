@@ -32,11 +32,21 @@
 //! 的 SQL 块跑掉再执行它;否则追加进 SQL 缓冲区.这样多行 SQL 与插在中间的元命令
 //! 都对,且顺序严格保持.
 //!
-//! # 两个开关
+//! # 三个开关
 //!
-//! `\timing` 与 `\set ON_ERROR_STOP on` 都是**会话状态**(不是某一段脚本的),所以
-//! `\i` 里设的会一直生效到会话结束.逐条执行靠 [`Script`]:引擎自己驱动循环,于是
-//! "每条语句计时"与"第一条错误就停"都是自然的.
+//! `\timing`,`\set ON_ERROR_STOP on` 与 `\set VERBOSE on` 都是**会话状态**(不是某一段
+//! 脚本的),所以 `\i` 里设的会一直生效到会话结束.逐条执行靠 [`Script`]:引擎自己驱动
+//! 循环,于是"每条语句计时"与"第一条错误就停"都是自然的.
+//!
+//! `VERBOSE` 管的是**引擎自己的聊天**:`\i` 的"读入 ...",每条语句的状态行
+//! (`[N] <SQL>  → ...`),每段 SQL 的汇总("成功 N 条,失败 M 条"),`\o` 的去向提示,
+//! 以及 `\set` 自己的回显.这些都是 **off 就不打**([`Session::info`]).**错误不归它管**
+//! --错误永远打出来,否则脚本会静悄悄地什么都没干(见 [`Session::error`]);查询结果表
+//! 与 `\timing` 的回显也不归它管(后者是用户点着名要的输出).
+//!
+//! 默认 **开**:交互式终端与内存会话都看得到状态行;只有 `ysql -f <脚本>` 走的是
+//! **脚本模式**,由 `cli` 在跑脚本之前关掉(psql 的 `-f` 也是安静的),
+//! 脚本里随时可以 `\set VERBOSE on` 打开.
 //!
 //! # 内存模式与服务模式
 //!
@@ -608,6 +618,10 @@ pub struct Session {
     timing: bool,
     /// `\set ON_ERROR_STOP on`:遇到第一条错误就停.
     on_error_stop: bool,
+    /// `\set VERBOSE on`:打每条语句的状态行与汇总(`\i` 的"读入 ..."也算).
+    ///
+    /// **错误不受它管**--见文件头的"三个开关".
+    verbose: bool,
     /// 上一次提交里 `ON_ERROR_STOP` 有没有让步(见 [`Session::stopped`]).
     stopped: bool,
     /// 这个会话报过多少次错.`ysql -f` 的退出码用它(见 [`Session::failed`]).
@@ -623,7 +637,8 @@ impl Default for Session {
 }
 
 impl Session {
-    /// 新建**内存**会话:两路输出都到标准输出,两个开关都关着,数据退出即丢.
+    /// 新建**内存**会话:两路输出都到标准输出,VERBOSE 开着,计时与 `ON_ERROR_STOP`
+    /// 关着,数据退出即丢.
     pub fn new() -> Self {
         Session {
             symbols: SymbolTable::new(),
@@ -634,6 +649,7 @@ impl Session {
             quit: false,
             timing: false,
             on_error_stop: false,
+            verbose: true,
             stopped: false,
             failed: 0,
             store: None,
@@ -875,6 +891,16 @@ impl Session {
         self.on_error_stop
     }
 
+    /// `\set VERBOSE on` 开着吗.
+    pub fn verbose(&self) -> bool {
+        self.verbose
+    }
+
+    /// 打开 / 关掉状态行与汇总.`ysql -f` 的**脚本模式**默认关(见 [`Session::info`]).
+    pub fn set_verbose(&mut self, on: bool) {
+        self.verbose = on;
+    }
+
     /// 上一次提交有没有因为 `ON_ERROR_STOP` 停下来.
     ///
     /// 交互终端用它做不了什么(那一段本来就已经停了),**脚本路径**要用它:
@@ -946,7 +972,7 @@ impl Session {
         }
         match std::fs::read_to_string(path) {
             Ok(sql) => {
-                self.msg(&format!("{}", tr!("cmd.engine.008", arg0 =  path.display(), arg1 =  sql.len())));
+                self.info(&format!("{}", tr!("cmd.engine.008", arg0 =  path.display(), arg1 =  sql.len())));
                 self.depth += 1;
                 let flow = self.run_with(&sql, false);
                 self.depth -= 1;
@@ -1106,6 +1132,17 @@ impl Session {
         self.messages.write(text);
     }
 
+    /// 一条**状态行**:`VERBOSE` 关着就什么也不打.
+    ///
+    /// 只有"引擎自己的聊天"走这里--`\i` 的读入提示,每条语句的状态行,每段 SQL 的
+    /// 汇总,`\o` 的去向,`\set` 的回显.错误一律走 [`Session::error`],查询结果表走
+    /// [`Session::query`]:那两样**不归 VERBOSE 管**.
+    fn info(&mut self, text: &str) {
+        if self.verbose {
+            self.messages.write(text);
+        }
+    }
+
     fn query(&mut self, text: &str) {
         self.query_out.write(text);
     }
@@ -1192,7 +1229,7 @@ impl Session {
                 self.failed += 1;
                 if self.on_error_stop {
                     // 停在 `index` 条上,前面 index 条(0 起)都成功了
-                    self.msg(&format!("{}", tr!("cmd.engine.017", arg0 =  index, arg1 =  failed)));
+                    self.info(&format!("{}", tr!("cmd.engine.017", arg0 =  index, arg1 =  failed)));
                     self.msg(&tr!("cmd.engine.018").into_owned());
                     return self.stop();
                 }
@@ -1207,19 +1244,23 @@ impl Session {
             }
         }
 
-        self.msg(&format!("{}", tr!("cmd.engine.020", arg0 = 
+        self.info(&format!("{}", tr!("cmd.engine.020", arg0 = 
             script.len() - failed, arg1 = 
             failed
         )));
         Flow::Continue
     }
 
+    /// 报一条语句的结果.
+    ///
+    /// 成功的那些都是**状态行**(`VERBOSE` 关着就不打,见 [`Session::info`]);
+    /// `Err` 那一支是错误,走 [`Session::msg`]--**永远打**.
     fn report(&mut self, result: &StmtResult) {
         let head = format!("[{}] {}", result.index, result.text);
 
         match &result.outcome {
             Ok(Outcome::Rows(table)) => {
-                self.msg(&format!("{}", tr!("cmd.engine.021", arg0 =  head, arg1 =  table.nrows())));
+                self.info(&format!("{}", tr!("cmd.engine.021", arg0 =  head, arg1 =  table.nrows())));
                 // 只有结果表本身进 query_out
                 let rendered = render_table(table);
                 self.query(&rendered);
@@ -1236,9 +1277,9 @@ impl Session {
                     n => format!("{}", tr!("cmd.engine.022", arg0 =  n)),
                 };
                 if unenforced.is_empty() {
-                    self.msg(&format!("{}", tr!("cmd.engine.023", arg0 =  head, arg1 =  name, arg2 =  enforced)));
+                    self.info(&format!("{}", tr!("cmd.engine.023", arg0 =  head, arg1 =  name, arg2 =  enforced)));
                 } else {
-                    self.msg(&format!("{}", tr!("cmd.engine.024", arg0 = 
+                    self.info(&format!("{}", tr!("cmd.engine.024", arg0 = 
                         head, arg1 = 
                         name, arg2 = 
                         enforced, arg3 = 
@@ -1247,18 +1288,18 @@ impl Session {
                 }
             }
             Ok(Outcome::Inserted { table, rows }) => {
-                self.msg(&format!("{}", tr!("cmd.engine.025", arg0 =  head, arg1 =  rows, arg2 =  table)));
+                self.info(&format!("{}", tr!("cmd.engine.025", arg0 =  head, arg1 =  rows, arg2 =  table)));
             }
             Ok(Outcome::Updated { table, rows }) => {
-                self.msg(&format!("{}", tr!("cmd.engine.026", arg0 =  head, arg1 =  rows, arg2 =  table)));
+                self.info(&format!("{}", tr!("cmd.engine.026", arg0 =  head, arg1 =  rows, arg2 =  table)));
             }
             Ok(Outcome::NoOp { message }) => {
-                self.msg(&format!("{}  → {}\n", head, message));
+                self.info(&format!("{}  → {}\n", head, message));
             }
             Ok(Outcome::Transaction { message, .. }) => {
                 // 真做了就是 `BEGIN` / `COMMIT` / `ROLLBACK` 一行状态;做不到时
                 // `message` 本身就是那句警告(照 PostgreSQL 的口径,不是错误)
-                self.msg(&format!("{}  → {}\n", head, message));
+                self.info(&format!("{}  → {}\n", head, message));
             }
             Err(e) => self.msg(&format!("{}", tr!("cmd.engine.027", arg0 =  head, arg1 =  e))),
         }
@@ -1279,7 +1320,8 @@ impl Session {
             ))),
 
             MetaCmd::Echo(text) => {
-                self.msg(&format!("{}\n", text));
+                // 引号归这里去,不归 `metacmd`:那一层只拆词,不解释参数(见它的文件头)
+                self.msg(&format!("{}\n", unquote_echo(&text)));
                 Flow::Continue
             }
 
@@ -1313,13 +1355,13 @@ impl Session {
                     SinkHome::Buffer => Sink::buffer(),
                 };
                 let described = self.query_out.describe();
-                self.msg(&format!("{}", tr!("cmd.engine.031", arg0 =  described)));
+                self.info(&format!("{}", tr!("cmd.engine.031", arg0 =  described)));
                 Flow::Continue
             }
             MetaCmd::Output(Some(path)) => match Sink::open(&path) {
                 Ok(sink) => {
                     self.query_out = sink;
-                    self.msg(&format!("{}", tr!("cmd.engine.032", arg0 =  path.display())));
+                    self.info(&format!("{}", tr!("cmd.engine.032", arg0 =  path.display())));
                     Flow::Continue
                 }
                 // 打不开就**保持原来的去向**--不能把输出弄丢
@@ -1363,19 +1405,27 @@ impl Session {
         Flow::Continue
     }
 
-    /// `\set <变量> [值]`.本版只认 `ON_ERROR_STOP`.
+    /// `\set <变量> [值]`.本版认 `ON_ERROR_STOP` 与 `VERBOSE`.
+    ///
+    /// 变量名**不分大小写**;不带值就是打开.取值认不出来就报错--见 [`parse_bool`].
     fn set_variable(&mut self, name: &str, value: Option<&str>) -> Flow {
-        if !name.eq_ignore_ascii_case("ON_ERROR_STOP") {
+        // 先把"认不认识这个变量"问清:两条错误(不认识的变量 / 不认识的取值)说法不同
+        let on_error_stop = if name.eq_ignore_ascii_case("ON_ERROR_STOP") {
+            true
+        } else if name.eq_ignore_ascii_case("VERBOSE") {
+            false
+        } else {
             return self.error(&format!("{}", tr!("cmd.engine.038", arg0 = 
                 name
             )));
-        }
+        };
 
         let on = match value {
             Some(text) => match parse_bool(text) {
                 Some(on) => on,
                 None => {
                     return self.error(&format!("{}", tr!("cmd.engine.039", arg0 = 
+                        name, arg1 = 
                         text
                     )))
                 }
@@ -1384,11 +1434,22 @@ impl Session {
             None => true,
         };
 
-        self.on_error_stop = on;
-        self.msg(&format!(
-            "ON_ERROR_STOP:{}\n",
-            if on { tr!("cmd.engine.040").into_owned() } else { tr!("cmd.engine.041").into_owned() }
-        ));
+        // 开关的回显也算**状态行**,走 `info`(`\timing` 那条不一样:它永远是用户
+        // 点着名要的).于是 `\set VERBOSE on` 会报一声,而 `\set VERBOSE off` 是
+        // 静悄悄的--它自己已经把状态行关掉了.
+        let label = if on_error_stop {
+            self.on_error_stop = on;
+            "ON_ERROR_STOP"
+        } else {
+            self.verbose = on;
+            "VERBOSE"
+        };
+        let word = if on {
+            tr!("cmd.engine.040").into_owned()
+        } else {
+            tr!("cmd.engine.041").into_owned()
+        };
+        self.info(&format!("{}:{}\n", label, word));
         Flow::Continue
     }
 
@@ -1572,6 +1633,23 @@ fn parse_bool(text: &str) -> Option<bool> {
         "off" | "0" | "false" => Some(false),
         _ => None,
     }
+}
+
+/// `\echo` 的参数:整行被**一对单引号**包住时把它们去掉,`''` 折成 `'`.
+///
+/// 这是照 psql 的行为来的:脚本里的 `\echo 'Test 1: Baseline tests'` 在 psql 下打出来
+/// 是**不带引号**的 `Test 1: Baseline tests`(`ydbms-test/` 那套输出就靠这个对齐).
+///
+/// 已知偏差:psql 是**逐个参数**去引号的(`\echo a 'b c'` → `a b c`),这里只认"整行被
+/// 一对单引号包住"这一种写法;双引号也不去.要真按 psql 那样切词,得先在
+/// [`crate::cmd::metacmd`] 里做出"参数表",那是另一件事.
+fn unquote_echo(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(inner) = trimmed.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')) else {
+        return text.to_string();
+    };
+    // `''` 是转义出来的一个单引号;长度小于 2 时(就是 `''`)折完是空串,正是那个意思
+    inner.replace("''", "'")
 }
 
 /// 把输入切成 SQL 块与元命令,保持原顺序.

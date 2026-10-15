@@ -57,6 +57,26 @@ fn echo_writes_the_text_verbatim() {
 }
 
 #[test]
+fn echo_drops_a_wrapping_pair_of_single_quotes() {
+    // psql 的口径:`\echo 'Test 1: ...'` 打出来不带引号(`ydbms-test/` 那套输出靠它对齐)
+    let mut s = buffered();
+    s.run_interactive("\\echo 'Test 1: Baseline tests'");
+    assert_eq!(s.messages(), "Test 1: Baseline tests\n");
+
+    // 一对引号里再写 `''` 就是一个单引号
+    s.run_interactive("\\echo 'it''s fine'");
+    assert!(s.messages().ends_with("it's fine\n"), "{}", s.messages());
+
+    // 空的那一对折成空行
+    s.run_interactive("\\echo ''");
+    assert!(s.messages().ends_with("it's fine\n\n"), "{}", s.messages());
+
+    // **没被一对引号整个包住**就原样:psql 的逐参数去引号本版不做
+    s.run_interactive("\\echo a 'b c'");
+    assert!(s.messages().ends_with("a 'b c'\n"), "{}", s.messages());
+}
+
+#[test]
 fn pwd_reports_the_working_directory() {
     let mut s = buffered();
     s.run_interactive("\\pwd");
@@ -451,7 +471,7 @@ fn timing_reports_every_statement() {
     s.run_interactive("CREATE TABLE m (a INT);\nINSERT INTO m VALUES (1);");
 
     let out = s.messages();
-    assert_eq!(out.matches("耗时").count(), 2, "两条语句两条计时:{out}");
+    assert_eq!(out.matches("耗时: ").count(), 2, "两条语句两条计时:{out}");
     assert!(out.contains("成功 2 条,失败 0 条"), "{out}");
 }
 
@@ -489,6 +509,90 @@ fn timing_rejects_a_value_it_does_not_understand() {
     s.run_interactive("\\timing yes");
     assert!(s.messages().contains("只认 on / off"), "{}", s.messages());
     assert!(!s.timing(), "认不出来的取值不该把它悄悄打开");
+}
+
+// ------------------------------------------- \set VERBOSE
+
+#[test]
+fn verbose_is_on_by_default_and_off_silences_the_status_lines() {
+    let mut s = buffered();
+    assert!(s.verbose(), "内存会话默认看得见状态行");
+
+    s.run_interactive("\\set VERBOSE off");
+    assert!(!s.verbose());
+    assert_eq!(s.messages(), "", "关掉时连它自己的回显也不打");
+
+    s.run_interactive("CREATE TABLE m (a INT);\nINSERT INTO m VALUES (1);\nSELECT a FROM m;");
+
+    let out = s.messages();
+    assert_eq!(out, "", "关掉之后不该再有状态行与汇总:{out}");
+    // 结果表照旧走另一路
+    assert!(s.query_output().contains('1'), "{}", s.query_output());
+
+    // 变量名与取值都不分大小写;打开这一句要报一声(那时它已经开着)
+    s.run_interactive("\\set verbose ON");
+    assert!(s.verbose());
+    assert!(s.messages().contains("VERBOSE:开"), "{}", s.messages());
+    s.run_interactive("INSERT INTO m VALUES (2);");
+    assert!(
+        s.messages().contains("成功 1 条,失败 0 条"),
+        "{}",
+        s.messages()
+    );
+}
+
+#[test]
+fn verbose_off_does_not_silence_errors() {
+    let mut s = buffered();
+    s.run_interactive("\\set VERBOSE off");
+    s.run_interactive("SELECT * FROM nope;");
+
+    let out = s.messages();
+    assert!(out.contains("unknown symbol"), "错误永远要打:{out}");
+    assert_eq!(s.failed(), 1);
+    assert!(!out.contains("成功"), "状态行与汇总还是不打:{out}");
+}
+
+#[test]
+fn the_read_notice_and_the_redirect_notice_follow_verbose() {
+    let dir = TempDir::new("verbose-include");
+    let script = dir.path().join("s.sql");
+    std::fs::write(&script, "SELECT 1 AS n;\n").unwrap();
+    let redirected = dir.path().join("n.txt");
+    let include = format!("\\i {}", script.display());
+
+    // 开着:读入与去向都报
+    let mut s = buffered();
+    s.run_interactive(&include);
+    assert!(s.messages().contains("读入"), "{}", s.messages());
+
+    // 关掉:两条提示都不报,但结果表照样进 `\o` 的文件
+    let mut s = buffered();
+    s.run_interactive("\\set VERBOSE off");
+    s.run_interactive(&include);
+    let out = s.messages();
+    assert!(!out.contains("读入"), "读入提示归 VERBOSE:{out}");
+    assert!(!out.contains("成功"), "{out}");
+
+    s.run_interactive(&format!("\\o {}", redirected.display()));
+    assert!(!s.messages().contains("查询输出"), "{}", s.messages());
+    s.run_interactive("SELECT 2 AS two;");
+    let written = std::fs::read_to_string(&redirected).unwrap();
+    assert!(written.contains('2'), "去向提示静了,结果还得写下去:{written}");
+}
+
+#[test]
+fn set_verbose_rejects_a_value_it_does_not_understand() {
+    let mut s = buffered();
+    s.run_interactive("\\set VERBOSE yes");
+    assert!(s.messages().contains("只认 on / off"), "{}", s.messages());
+    assert!(s.verbose(), "认不出来的取值不该把开关拨到另一边");
+
+    // 先关掉,再不给值:不给值就是打开(与 ON_ERROR_STOP 一致)
+    s.run_interactive("\\set VERBOSE off");
+    assert!(!s.verbose());
+    s.run_interactive("\\set VERBOSE");
+    assert!(s.verbose());
 }
 
 // ------------------------------------------- \set ON_ERROR_STOP
