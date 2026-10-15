@@ -365,6 +365,90 @@ fn i_recursion_is_capped_instead_of_looping_forever() {
     assert!(s.messages().contains("嵌套超过"), "{}", s.messages());
 }
 
+// ------------------------------------------------------------------ \ir
+
+/// `a/A.sql` 里 `\ir ../b/B.sql`;`B.sql` 自己再 `\ir C.sql` -- 这个 `C` 必须落在
+/// **b/** 里(基准是"当前脚本"的目录,不是最外层那个,也不是 cwd).
+#[test]
+fn ir_resolves_relative_to_the_current_script() {
+    let dir = TempDir::new("ir");
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("b")).unwrap();
+    std::fs::write(dir.path().join("a/A.sql"), "\\echo A开始\n\\ir ../b/B.sql\n").unwrap();
+    std::fs::write(dir.path().join("b/B.sql"), "\\echo B开始\n\\ir C.sql\n").unwrap();
+    std::fs::write(dir.path().join("b/C.sql"), "\\echo C来自b目录\n").unwrap();
+    // 诱饵:按外层脚本(a/)或者 cwd 解析都能找到它,按 B 所在的 b/ 就找不到
+    std::fs::write(dir.path().join("a/C.sql"), "\\echo C来自a目录\n").unwrap();
+
+    let mut s = buffered();
+    s.run_file(&dir.path().join("a/A.sql"));
+
+    let out = s.messages();
+    assert!(out.contains("A开始"), "{out}");
+    assert!(out.contains("B开始"), "{out}");
+    assert!(out.contains("C来自b目录"), "嵌套的 `\\ir` 要跟着当前脚本走:{out}");
+    assert!(!out.contains("C来自a目录"), "{out}");
+}
+
+/// `\i` 读进来的文件**也是**"当前脚本"(psql 的口径,实测过).
+#[test]
+fn i_inside_a_script_also_moves_the_current_script_directory() {
+    let dir = TempDir::new("ir-i");
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("b")).unwrap();
+
+    // 外层 A 在 a/,它用**绝对路径**引 b/AA.sql;AA 里的 `\ir D.sql` 要落在 b/
+    let aa = dir.path().join("b/AA.sql");
+    std::fs::write(dir.path().join("a/A.sql"), format!("\\i {}\n", aa.display())).unwrap();
+    std::fs::write(&aa, "\\echo AA开始\n\\ir D.sql\n").unwrap();
+    std::fs::write(dir.path().join("b/D.sql"), "\\echo D在b目录\n").unwrap();
+    std::fs::write(dir.path().join("a/D.sql"), "\\echo D在a目录\n").unwrap();
+
+    let mut s = buffered();
+    s.run_file(&dir.path().join("a/A.sql"));
+
+    let out = s.messages();
+    assert!(out.contains("AA开始"), "{out}");
+    assert!(out.contains("D在b目录"), "`\\i` 读进来的文件也换基准:{out}");
+    assert!(!out.contains("D在a目录"), "{out}");
+}
+
+/// 不在任何脚本里(交互式)时,`\ir` 与 `\i` 一样按进程的工作目录解析.
+#[test]
+fn ir_falls_back_to_the_working_directory_without_a_script() {
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let before = std::env::current_dir().unwrap();
+    let dir = TempDir::new("ir-cwd");
+    std::fs::write(dir.path().join("rel.sql"), "\\echo 相对cwd读到了\n").unwrap();
+
+    let mut s = buffered();
+    s.run_interactive(&format!("\\cd {}", dir.path().display()));
+    s.run_interactive("\\ir rel.sql");
+
+    assert!(s.messages().contains("相对cwd读到了"), "{}", s.messages());
+    std::env::set_current_dir(before).unwrap();
+}
+
+#[test]
+fn ir_without_a_path_prints_usage() {
+    let mut s = buffered();
+    s.run_interactive("\\ir");
+    assert!(s.messages().contains("用法"), "{}", s.messages());
+}
+
+#[test]
+fn ir_recursion_is_capped_instead_of_looping_forever() {
+    let dir = TempDir::new("ir-rec");
+    let looper = dir.path().join("loop.sql");
+    // 自己包含自己(`\ir loop.sql` 的基准就是它自己所在的目录)
+    std::fs::write(&looper, "\\ir loop.sql\n").unwrap();
+
+    let mut s = buffered();
+    s.run_file(&looper);
+
+    assert!(s.messages().contains("嵌套超过"), "{}", s.messages());
+}
+
 // ------------------------------------------------------------------ \!
 
 #[test]

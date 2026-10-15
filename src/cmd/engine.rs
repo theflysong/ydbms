@@ -32,6 +32,13 @@
 //! 的 SQL 块跑掉再执行它;否则追加进 SQL 缓冲区.这样多行 SQL 与插在中间的元命令
 //! 都对,且顺序严格保持.
 //!
+//! # `\i` 与 `\ir`:两条 include,只差相对的基准
+//!
+//! 两者是同一条路([`Session::include_file`]):`\i` 的相对路径按**进程的工作目录**
+//! 解析,`\ir` 的按**当前脚本所在目录**解析(psql 的口径).`-f`,`\i`,`\ir` 读进来的
+//! 文件都会成为"当前脚本",嵌套一层层跟着走;不在任何脚本里时(交互式终端直接敲)
+//! `\ir` 退化成 `\i`.递归深度有上限(见 [`MAX_INCLUDE_DEPTH`]).
+//!
 //! # 三个开关
 //!
 //! `\timing`,`\set ON_ERROR_STOP on` 与 `\set VERBOSE on` 都是**会话状态**(不是某一段
@@ -613,6 +620,12 @@ pub struct Session {
     /// 查询输出最初是哪种去向(`\o` 无参回到它).
     home: SinkHome,
     depth: usize,
+    /// **当前脚本**(最近一次经 `-f` / `\i` / `\ir` 读进来的那个文件)所在目录.
+    ///
+    /// `\ir` 的相对路径按它解析;不在任何脚本里时是 `None`(那时与 `\i` 一样按
+    /// 进程的工作目录解析).由 [`Session::include_file`] 在递归前后换进换出,
+    /// 所以它天然就是一层"脚本栈".存的是**绝对**路径,`\cd` 改不动它.
+    script_dir: Option<PathBuf>,
     quit: bool,
     /// `\timing on`:每条语句后打印耗时.
     timing: bool,
@@ -646,6 +659,7 @@ impl Session {
             messages: Sink::stdout(),
             home: SinkHome::Stdout,
             depth: 0,
+            script_dir: None,
             quit: false,
             timing: false,
             on_error_stop: false,
@@ -964,6 +978,14 @@ impl Session {
 
     /// [`run_file`](Session::run_file) 的实现:返回 [`Flow`],好让"出错就停"**穿过递归**
     /// 传出去(`\i` 里再 `\i`,最里面出错要能把外面也停下).
+    ///
+    /// # 当前脚本目录(`\ir` 的基准)
+    ///
+    /// 读进来的这个文件**成为当前脚本**:它的目录就是接下来 `\ir` 的基准;返回前换回
+    /// 上一层去.`\i` 也一样换--这是 psql 的口径,实测过:`\i ../a/AA.sql` 之后,
+    /// `AA.sql` 里的 `\ir D.sql` 落在 `a/` 上,而不是外层脚本的目录.
+    /// 换进换出都在这里,所以它就是一层栈;文件**读不到**时在动它之前就返回,
+    /// 不会把外层的基准弄脏.
     fn include_file(&mut self, path: &Path) -> Flow {
         if self.depth >= MAX_INCLUDE_DEPTH {
             return self.error(&format!("{}", tr!("cmd.engine.007", arg0 = 
@@ -973,12 +995,32 @@ impl Session {
         match std::fs::read_to_string(path) {
             Ok(sql) => {
                 self.info(&format!("{}", tr!("cmd.engine.008", arg0 =  path.display(), arg1 =  sql.len())));
+
+                let previous = self.script_dir.take();
+                self.script_dir = script_dir_of(path);
+
                 self.depth += 1;
                 let flow = self.run_with(&sql, false);
                 self.depth -= 1;
+
+                self.script_dir = previous;
                 flow
             }
             Err(e) => self.error(&format!("{}", tr!("cmd.engine.009", arg0 =  path.display(), arg1 =  e))),
+        }
+    }
+
+    /// `\ir` 的路径解析:绝对路径原样,否则拼在**当前脚本所在目录**上.
+    ///
+    /// `script_dir` 为 `None`(不在任何脚本里,例如交互式终端直接敲)时原样返回,
+    /// 于是与 `\i` 一样按进程的工作目录解析--psql 也是这个口径.
+    fn resolve_relative_script(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        match &self.script_dir {
+            Some(dir) => dir.join(path),
+            None => path.to_path_buf(),
         }
     }
 
@@ -1337,10 +1379,14 @@ impl Session {
 
             MetaCmd::Ls(target) => self.list_dir(target),
 
-            MetaCmd::Include(None) => {
+            MetaCmd::Include(None) | MetaCmd::IncludeRelative(None) => {
                 self.error(&tr!("cmd.engine.030").into_owned())
             }
             MetaCmd::Include(Some(path)) => self.include_file(&path),
+            MetaCmd::IncludeRelative(Some(path)) => {
+                let resolved = self.resolve_relative_script(&path);
+                self.include_file(&resolved)
+            }
 
             MetaCmd::Shell(command) => self.shell(command, allow_shell),
 
@@ -1627,6 +1673,16 @@ fn load_tables(symbols: &mut SymbolTable, db: &Database) -> Result<BTreeSet<Stri
 ///
 /// 认不出来就得报错,**不能默认成 off**--把 `\set ON_ERROR_STOP ture` 悄悄当成关着,
 /// 比报错危险得多.
+/// 一个脚本文件的所在目录--`\ir` 的基准.
+///
+/// 取 `canonicalize` 之后的**父目录**.绝对化是有意的:基准一旦定下,之后无论怎么
+/// `\cd` 都不会把它带跑偏.文件读得到才会走到这里,所以 canonicalize 基本不会失败;
+/// 万一失败就退回 `None`(与"不在脚本里"同一条路,按 cwd 解析),不报错.
+fn script_dir_of(path: &Path) -> Option<PathBuf> {
+    let absolute = std::fs::canonicalize(path).ok()?;
+    absolute.parent().map(Path::to_path_buf)
+}
+
 fn parse_bool(text: &str) -> Option<bool> {
     match text.trim().to_ascii_lowercase().as_str() {
         "on" | "1" | "true" => Some(true),

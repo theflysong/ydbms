@@ -188,7 +188,7 @@ fn metacommand(head: &str, cursor: usize, catalog: &Catalog) -> Option<Suggestio
     let word = &head[start..];
 
     let items = match name {
-        "\\i" | "\\o" | "\\ls" | "\\cd" => paths(word),
+        "\\i" | "\\ir" | "\\o" | "\\ls" | "\\cd" => paths(word),
         "\\d" => matched(&catalog.tables, word, str::to_string),
         "\\c" | "\\connect" => matched(&catalog.databases, word, str::to_string),
         "\\timing" => matched(SWITCHES, word, str::to_string),

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 /// Tab 补全与"未知元命令"的提示共用这一份,**不许两处各写一遍**--加一条命令
 /// 忘了补另一处,用户就会看到自相矛盾的提示.
 pub const NAMES: &[&str] = &[
-    "\\q", "\\quit", "\\!", "\\i", "\\pwd", "\\ls", "\\cd", "\\echo", "\\dt", "\\d", "\\o",
+    "\\q", "\\quit", "\\!", "\\i", "\\ir", "\\pwd", "\\ls", "\\cd", "\\echo", "\\dt", "\\d", "\\o",
     "\\timing", "\\set", "\\l", "\\du", "\\c", "\\connect",
 ];
 
@@ -25,8 +25,13 @@ pub enum MetaCmd {
     Quit,
     /// `\! <命令>` -- 执行 shell 命令.**脚本里会被拒绝**.
     Shell(String),
-    /// `\i <路径>` -- 读脚本.
+    /// `\i <路径>` -- 读脚本,相对路径按**进程的工作目录**解析.
     Include(Option<PathBuf>),
+    /// `\ir <路径>` -- 同 `\i`,但相对路径按**当前脚本所在目录**解析(psql 的口径).
+    ///
+    /// "当前脚本"就是最近一次经 `-f` / `\i` / `\ir` 读进来的那个文件;不在任何
+    /// 脚本里时(交互式)退化成 [`Include`](MetaCmd::Include).
+    IncludeRelative(Option<PathBuf>),
     /// `\pwd` -- 当前目录.
     Pwd,
     /// `\ls [目录]` -- 列目录.
@@ -88,6 +93,7 @@ pub fn parse(line: &str) -> Option<MetaCmd> {
         "q" | "quit" => MetaCmd::Quit,
         "!" => MetaCmd::Shell(rest.to_string()),
         "i" => MetaCmd::Include(path()),
+        "ir" => MetaCmd::IncludeRelative(path()),
         "pwd" => MetaCmd::Pwd,
         "ls" => MetaCmd::Ls(path()),
         "cd" => MetaCmd::Cd(path()),
