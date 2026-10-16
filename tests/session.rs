@@ -144,6 +144,67 @@ fn unknown_metacommand_lists_the_known_ones() {
     let out = s.messages();
     assert!(out.contains("未知元命令"), "{out}");
     assert!(out.contains("\\i"), "{out}");
+    assert!(out.contains("\\copy"), "补全与提示共用一份命令表:{out}");
+}
+
+// ------------------------------------------------------------------ \copy
+
+/// `\copy` 就是 `COPY`:同一句话,同一个结果,同一个命令标签(psql 的 `COPY N`).
+#[test]
+fn copy_metacommand_runs_the_same_statement() {
+    let dir = TempDir::new("copy");
+    let data = dir.path().join("data.tsv");
+    std::fs::write(&data, "1\tone\n2\ttwo\n").expect("写数据文件");
+
+    let mut s = buffered();
+    s.run_script("CREATE TABLE t (a INT, b TEXT);");
+    s.run_script(&format!("\\copy t FROM '{}'", data.display()));
+
+    assert_eq!(s.failed(), 0, "{}", s.messages());
+    // 状态行(VERBOSE 开着)与 psql 的协议行都在
+    assert!(s.messages().contains("→ 载入 2 行到 t"), "{}", s.messages());
+    assert!(s.messages().contains("COPY 2\n"), "{}", s.messages());
+
+    s.run_script("SELECT a, b FROM t ORDER BY a;");
+    let out = s.query_output();
+    assert!(out.contains("one") && out.contains("two"), "{out}");
+}
+
+/// 没给参数就报用法,别去猜一个文件名.
+#[test]
+fn copy_metacommand_without_arguments_reports_usage() {
+    let mut s = buffered();
+    s.run_interactive("\\copy");
+    let out = s.messages();
+    assert!(out.contains("用法"), "{out}");
+    assert_eq!(s.failed(), 1);
+
+    // 参数给得不成样子:SQL 那层的解析错误照实报出来,而不是当成空命令
+    let mut s = buffered();
+    s.run_interactive("\\copy nope");
+    assert_eq!(s.failed(), 1);
+    assert!(s.messages().contains("错误"), "{}", s.messages());
+}
+
+/// 路径按**进程的当前目录**解析(psql 的 `\copy` 口径),与 `\ir` 那套"相对当前
+/// 脚本"**不同**--`script/init.sql` 的文件头专门写了"必须在 script/ 下执行".
+#[test]
+fn copy_resolves_its_path_against_the_process_cwd() {
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let before = std::env::current_dir().unwrap();
+    let dir = TempDir::new("copy-cwd");
+
+    std::fs::write(dir.path().join("data.tsv"), "7\tseven\n").expect("写数据文件");
+    std::env::set_current_dir(dir.path()).unwrap();
+
+    let mut s = buffered();
+    s.run_script("CREATE TABLE t (a INT, b TEXT);");
+    // **相对**路径:按 cwd 就该找得到
+    s.run_script("\\copy t FROM 'data.tsv'");
+    assert_eq!(s.failed(), 0, "{}", s.messages());
+    assert!(s.messages().contains("COPY 1\n"), "{}", s.messages());
+
+    std::env::set_current_dir(before).unwrap();
 }
 
 // ------------------------------------------------------------ \d 与 \dt

@@ -127,6 +127,8 @@ cmd.engine.096: "不可登录"
 cmd.engine.097: "可建库"
 cmd.engine.098: "可建角色"
 cmd.engine.099: "NOINHERIT"
+cmd.engine.100: "用法:\\copy <表> FROM '<数据文件>',例如 \\copy imdb.title_basics FROM 'data/title.basics.tsv'\n本版它就是 SQL 的 COPY:路径按**进程的当前目录**解析(与 \\ir 不同),只认不带 WITH 选项的 text 格式\n"
+cmd.engine.101: "%{arg0}  → 载入 %{arg1} 行到 %{arg2}\n"
 
 # ---- src/cmd/repl.rs ----
 cmd.repl.001: "再见."
@@ -212,6 +214,7 @@ db.table.036: "列声明了 NOT NULL,不接受 NULL"
 db.table.037: "不符合 %{arg0} 的长度/精度限制"
 db.table.038: "行下标由 nrows() 给出"
 db.table.039: "搬自己的一份:行本来就通过过校验"
+db.table.040: "转义出来的字节拼不成合法的 UTF-8 文本"
 
 # ---- src/ir/checks.rs ----
 ir.checks.001: "CHECK 的结果必须是真值,实际是 %{arg0}"
@@ -573,6 +576,8 @@ ir.stmt.016: "空的语句"
 ir.stmt.017: "%{arg0}(这个会话没有服务目录:请用 ysql --server-dist <目录>)"
 ir.stmt.018: "当前角色:%{arg0}"
 ir.stmt.019: "%{arg0} 是空转:本版没有统计信息,也没有要回收的空间(点名了 %{arg1} 张表)"
+ir.stmt.020: "字段数对不上:这一行有 %{arg0} 个,期望 %{arg1} 个"
+ir.stmt.021: "列 `%{arg0}` 读不出来:%{arg1}"
 
 # ---- src/ir/symbol.rs ----
 ir.symbol.001: "事务快照丢了表 `%{arg0}`(有删除路径漏了快照)"

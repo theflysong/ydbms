@@ -734,3 +734,73 @@ fn old_schema_files_with_plain_int_still_load() {
     assert_eq!(loaded.nrows(), 2);
     assert_eq!(loaded.columns()[0].ty, DataType::Int);
 }
+
+// ------------------------------------------------------------ COPY text 字段
+
+/// COPY text 的反转义:控制字符,八/十六进制字节,以及"认不出来的转义就是它自己".
+#[test]
+fn copy_fields_unescape_the_way_postgresql_does() {
+    let text = DataType::Text;
+    let field = |s: &str| text.from_copy_field(s).expect("应当读得出来");
+    let value = |s: &str| field(s);
+
+    assert_eq!(value("plain"), Value::Text("plain".to_string()));
+    // 五个有专用写法的控制字符
+    assert_eq!(value(r"\t"), Value::Text("\t".to_string()));
+    assert_eq!(value(r"\n"), Value::Text("\n".to_string()));
+    assert_eq!(value(r"\r"), Value::Text("\r".to_string()));
+    assert_eq!(value(r"\b"), Value::Text("\u{8}".to_string()));
+    assert_eq!(value(r"\f"), Value::Text("\u{c}".to_string()));
+    assert_eq!(value(r"\v"), Value::Text("\u{b}".to_string()));
+    // `\\` 落在"认不出来的转义"那一支,正好就是反斜杠自己
+    assert_eq!(value(r"\\"), Value::Text("\\".to_string()));
+    assert_eq!(value(r"a\\b"), Value::Text("a\\b".to_string()));
+    assert_eq!(value(r"a\tb"), Value::Text("a\tb".to_string()));
+    // 八进制 / 十六进制给的是**字节**
+    assert_eq!(value(r"\101"), Value::Text("A".to_string()));
+    assert_eq!(value(r"\x41"), Value::Text("A".to_string()));
+    assert_eq!(value(r"\x4"), Value::Text("\u{4}".to_string()));
+    // 分开写的两个字节要能拼回一个字符(`é` 的 UTF-8 是 C3 A9)
+    assert_eq!(value(r"\xC3\xA9"), Value::Text("é".to_string()));
+    // `\x` 后面没有十六进制数字时,`x` 就是它自己
+    assert_eq!(value(r"\x"), Value::Text("x".to_string()));
+    assert_eq!(value(r"\xg"), Value::Text("xg".to_string()));
+    // 认不出来的转义 = 丢掉反斜杠(`\q` 就是 `q`,PostgreSQL 的文档口径)
+    assert_eq!(value(r"\q"), Value::Text("q".to_string()));
+    // 引号与逗号在 COPY text 里**没有**特殊含义(那是 CSV 的事),原样留着
+    assert_eq!(
+        value(r#"He said "hi", twice"#),
+        Value::Text(r#"He said "hi", twice"#.to_string())
+    );
+}
+
+/// NULL / 空字符串 / 字面文本 `\N` 三者必须始终可区分.
+#[test]
+fn copy_fields_keep_null_empty_and_a_literal_backslash_n_apart() {
+    let text = DataType::Text;
+
+    assert_eq!(text.from_copy_field(r"\N").unwrap(), Value::Null);
+    assert_eq!(text.from_copy_field("").unwrap(), Value::Text(String::new()));
+    assert_eq!(
+        text.from_copy_field(r"\\N").unwrap(),
+        Value::Text(r"\N".to_string())
+    );
+
+    // 非文本族:`\N` 也是 NULL,别的照旧按类型解析
+    assert_eq!(DataType::Int.from_copy_field(r"\N").unwrap(), Value::Null);
+    assert_eq!(DataType::Int.from_copy_field("42").unwrap(), Value::Int(42));
+    assert!(matches!(
+        DataType::Int.from_copy_field("abc"),
+        Err(DbError::BadValue { .. })
+    ));
+    // 长度限制与 CSV 那条路共用 `DataType::parse`,不另写一套
+    assert!(matches!(
+        DataType::VarChar(2).from_copy_field("abc"),
+        Err(DbError::BadValue { .. })
+    ));
+    // 转义拼不成合法 UTF-8:照实报错,不是安静地塞进去
+    assert!(matches!(
+        DataType::Text.from_copy_field(r"\xC3"),
+        Err(DbError::BadValue { .. })
+    ));
+}

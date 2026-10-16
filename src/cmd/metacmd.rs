@@ -14,8 +14,8 @@ use std::path::PathBuf;
 /// Tab 补全与"未知元命令"的提示共用这一份,**不许两处各写一遍**--加一条命令
 /// 忘了补另一处,用户就会看到自相矛盾的提示.
 pub const NAMES: &[&str] = &[
-    "\\q", "\\quit", "\\!", "\\i", "\\ir", "\\pwd", "\\ls", "\\cd", "\\echo", "\\dt", "\\d", "\\o",
-    "\\timing", "\\set", "\\l", "\\du", "\\c", "\\connect",
+    "\\q", "\\quit", "\\!", "\\i", "\\ir", "\\copy", "\\pwd", "\\ls", "\\cd", "\\echo", "\\dt",
+    "\\d", "\\o", "\\timing", "\\set", "\\l", "\\du", "\\c", "\\connect",
 ];
 
 /// 一条元命令.
@@ -32,6 +32,12 @@ pub enum MetaCmd {
     /// "当前脚本"就是最近一次经 `-f` / `\i` / `\ir` 读进来的那个文件;不在任何
     /// 脚本里时(交互式)退化成 [`Include`](MetaCmd::Include).
     IncludeRelative(Option<PathBuf>),
+    /// `\copy <表> FROM '<数据文件>'` -- 把文件装进表,参数取到行尾.
+    ///
+    /// **本版里它就是 SQL 的 `COPY`**:引擎与数据文件在同一个进程里,没有客户端 /
+    /// 服务端的分别(psql 的 `\copy` 只是"客户端自己读文件"的 `COPY`).所以执行层
+    /// 把它重写成一条 `COPY` 语句交给 `ir`--这一层只拆词,不解释它.
+    Copy(String),
     /// `\pwd` -- 当前目录.
     Pwd,
     /// `\ls [目录]` -- 列目录.
@@ -94,6 +100,7 @@ pub fn parse(line: &str) -> Option<MetaCmd> {
         "!" => MetaCmd::Shell(rest.to_string()),
         "i" => MetaCmd::Include(path()),
         "ir" => MetaCmd::IncludeRelative(path()),
+        "copy" => MetaCmd::Copy(rest.to_string()),
         "pwd" => MetaCmd::Pwd,
         "ls" => MetaCmd::Ls(path()),
         "cd" => MetaCmd::Cd(path()),

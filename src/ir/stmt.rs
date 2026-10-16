@@ -11,6 +11,10 @@
 //! 与 `Prog::eval`.`CHECK` 也是--它挂在一层 [`CheckedTable`] 装饰器上,
 //! 于是写路径不必各自记得校验.
 //!
+//! `COPY <表> FROM '<文件>'` 也住在这层([`Stmt::Copy`]):它**逐行读文件,逐行
+//! `insert`**,写路径与 `INSERT` 一字不差(索引键的追加也在内),于是约束,索引,
+//! 语句级原子性全都免费拿到.
+//!
 //! # 为什么必须逐条"降级 → 执行"
 //!
 //! 后面的语句依赖前面建出来的表:`INSERT INTO prime` 的降级需要 `prime` 已经
@@ -29,6 +33,9 @@
 //! 于是多行 SQL 能攒到分号才提交,而字符串/注释里的分号不会被误切.
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 use pg_query::protobuf::RawStmt;
 
@@ -86,6 +93,24 @@ pub enum Stmt {
         /// 降级时已经按语句里的列名表重排过了,所以这里的位置是确定的;值表达式
         /// 没有输入行,作用域为空,出现列引用会被 `Prog::verify` 挡下.
         rows: Vec<Vec<Prog>>,
+    },
+
+    /// `COPY <表> FROM '<文件>'`:把 COPY text 格式的数据文件装进表.
+    ///
+    /// psql 的 `\copy` 与它**是同一件事**:本版引擎与数据文件在同一个进程里,没有
+    /// 客户端 / 服务端之分,所以引擎把 `\copy X` 原样重写成 `COPY X` 再走到这里
+    /// (见 `src/cmd/AGENTS.md`).
+    ///
+    /// 只认降级层放行的那一个形式(裸 `FROM '<文件>'`,不带列清单与选项).文件
+    /// **逐行读,逐行插**,不先攒成一堆行.
+    Copy {
+        /// 表名(降级时的原文;执行时按 `search_path` 定生效名,与 `INSERT` 一致).
+        table: String,
+        /// 数据文件路径,**按进程的工作目录**解析.
+        ///
+        /// 这是 psql 的 `\copy` 口径(`script/init.sql` 的文件头专门写了"必须在
+        /// `script/` 下执行"),与 `\ir` 那套"相对当前脚本"的解析**不同**.
+        path: PathBuf,
     },
 
     /// `CREATE INDEX [IF NOT EXISTS] name ON table (column)`.
@@ -573,6 +598,45 @@ fn coerce_to_column(value: Value, ty: &DataType) -> Value {
     }
 }
 
+/// 读数据文件失败(`COPY` 与将来的数据文件语句共用).
+fn io_error(path: &Path, e: std::io::Error) -> DbError {
+    DbError::Io {
+        path: path.display().to_string(),
+        kind: e.kind(),
+        message: e.to_string(),
+    }
+}
+
+/// `COPY` 的一行 → 一行值.
+///
+/// 制表符分列,字段与表的列**一一对应**(列清单在降级层已经拒绝),`\N` 与反转义
+/// 都交给 `DataType::from_copy_field`.出错一律包成 [`DbError::Format`](DbError::Format)
+/// 并带上**行号**--与 `pers::csv` 读数据文件时的包装同一套写法,文件内容的问题
+/// 就该报成"文件内容的问题".
+fn copy_row(line: &str, columns: &[Column], path: &Path, line_no: usize) -> Result<Row> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() != columns.len() {
+        return Err(DbError::Format {
+            path: path.display().to_string(),
+            line: Some(line_no),
+            message: tr!("ir.stmt.020", arg0 =  fields.len(), arg1 =  columns.len()).into_owned(),
+        });
+    }
+
+    let mut row = Row::with_capacity(columns.len());
+    for (column, field) in columns.iter().zip(fields.iter()) {
+        let value = column.ty.from_copy_field(field).map_err(|e| {
+            DbError::Format {
+                path: path.display().to_string(),
+                line: Some(line_no),
+                message: tr!("ir.stmt.021", arg0 =  column.name, arg1 =  e).into_owned(),
+            }
+        })?;
+        row.push(value);
+    }
+    Ok(row)
+}
+
 /// 一条语句执行完的结果.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -592,6 +656,17 @@ pub enum Outcome {
         /// 表名.
         table: String,
         /// 实际插入的行数.
+        rows: usize,
+    },
+    /// `COPY ... FROM` 装载完成.
+    ///
+    /// 单独一个变体而不是复用 [`Inserted`](Outcome::Inserted),理由只有一条:
+    /// 引擎的命令标签是 psql 的**协议行**,而 `COPY` 的标签是 `COPY <行数>`
+    /// (不是 `INSERT 0 <行数>`).别的信息两边一模一样.
+    Copied {
+        /// 表名(生效名).
+        table: String,
+        /// 实际装载的行数.
         rows: usize,
     },
     /// 更新完成.
@@ -661,7 +736,7 @@ pub fn execute_stmt(stmt: &Stmt, symbols: &mut SymbolTable) -> Result<Outcome> {
 /// 那个隐式事务提交掉.
 ///
 /// 会改东西的是:[`Stmt::CreateTable`] (往符号表里加表),[`Stmt::Insert`] /
-/// [`Stmt::Update`] (改表内容),几条 schema / `SET` 语句(改的是**名字空间**,
+/// [`Stmt::Copy`] / [`Stmt::Update`] (改表内容),几条 schema / `SET` 语句(改的是**名字空间**,
 /// 不是数据),以及数据库那三条(改的是**服务目录**,本函数不碰,整件事在 `dbs`
 /// 那边).前两类都由符号表的撤销记录兜住.
 pub fn execute_stmt_with(
@@ -804,6 +879,49 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             }
 
             Ok(Outcome::Inserted {
+                table: effective,
+                rows: inserted,
+            })
+        }
+
+        Stmt::Copy { table, path } => {
+            // 同 `INSERT`:生效名与权限先定下来,再动数据.文件里的字段与**表的列**
+            // 一一对应(降级层已经拒绝了列清单),所以写的是全部列.
+            let target = symbols
+                .relation(table)
+                .ok_or_else(|| DbError::UnknownSymbol {
+                    name: table.clone(),
+                })?;
+            let effective = target.name().to_string();
+            let columns: Vec<Column> = target.columns().to_vec();
+            let written: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            dbs.check_table(symbols.role(), &effective, Privilege::Insert, &written)?;
+
+            // 文件按**进程的工作目录**解析(psql 的 `\copy` 口径,与 `\ir` 不同)
+            let file = File::open(path).map_err(|e| io_error(path, e))?;
+
+            // 边读边插:177 万行的装载不许先攒成一堆行.
+            // 中途失败不用在这里收拾--`execute_stmt_with` 那条隐式事务会整句回滚
+            // (显式事务里则与别的语句同一条口径:不整句回滚,要撤销就 `ROLLBACK`).
+            let mut inserted = 0usize;
+            for (index, line) in BufReader::new(file).lines().enumerate() {
+                let line = line.map_err(|e| io_error(path, e))?;
+                let row = copy_row(&line, &columns, path, index + 1)?;
+
+                // 与 `INSERT` 一字不差:索引要的键先取出来,行搬进表里,再追加键.
+                // 漏掉 `maintain_indexes` 就是"索引少了一批键"的安静错答案.
+                let keys = symbols.index_keys_of(table, &row);
+                let rid = symbols
+                    .relation_mut(table)
+                    .ok_or_else(|| DbError::UnknownSymbol {
+                        name: table.clone(),
+                    })?
+                    .insert(row)?;
+                symbols.maintain_indexes(keys, rid);
+                inserted += 1;
+            }
+
+            Ok(Outcome::Copied {
                 table: effective,
                 rows: inserted,
             })

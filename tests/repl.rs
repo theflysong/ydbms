@@ -142,7 +142,9 @@ fn metacommand_names_complete() {
     assert_eq!(inserts("\\ti", &c), vec!["\\timing"]);
 
     let all = inserts("\\", &c);
-    for want in ["\\i", "\\ir", "\\set", "\\dt", "\\timing", "\\l", "\\du", "\\c", "\\connect"] {
+    for want in [
+        "\\i", "\\ir", "\\copy", "\\set", "\\dt", "\\timing", "\\l", "\\du", "\\c", "\\connect",
+    ] {
         assert!(all.contains(&want.to_string()), "{want} 不在 {all:?}");
     }
 }

@@ -6,7 +6,7 @@
 
 - `table.rs` -- [`DataType`](table.rs) / [`Value`](table.rs) / [`Column`](table.rs) /
   [`Table`](table.rs) / [`TabShape`](table.rs) / [`DbError`](table.rs),
-  以及十进制算术与 CSV 字段读写.
+  以及十进制算术与字段读写(CSV 一种,COPY text 一种,见"磁盘契约").
 - `phys.rs` -- 物化表 [`PhysTab`](phys.rs).
 - `source.rs` -- 拉取式的中间结果 [`RowSource`](source.rs) / 基表游标
   [`TableCursor`](source.rs) / 物化 [`materialize`](source.rs) 与抽干 [`drain`](source.rs).
@@ -92,4 +92,10 @@
   **属于磁盘契约**,改名就是改文件格式.
 - CSV 里 `NULL` 写成 `\N`,以 `\` 开头的文本多写一个 `\` 转义.**这三者
   (NULL / 空字符串 / 字面文本 `\N`)必须始终可区分.**
+- **CSV 字段与 COPY text 字段是两套口径,别互相借**:`DataType::from_csv_field` 是
+  数据文件那一套(反转义只做"文本族掉一层前导 `\`"),`DataType::from_copy_field` 是
+  PostgreSQL `COPY ... (FORMAT text)` 那一套(整字段 `\N` 是 NULL,`\t` `\n` `\\`
+  `\b` `\f` `\r` `\v` `\ooo` `\xHH` 才是转义,认不出来的 `\X` 就是 `X`).两者都
+  **先认 NULL 记法,再反转义,最后才 `DataType::parse`**--typmod 与 `NOT NULL` 的
+  强制点仍然只有 `parse` 与 `Table::validate` 两处.
 - 新增字段一律 `#[serde(default)]`,保证老文件还能读.

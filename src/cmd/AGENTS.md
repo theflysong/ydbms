@@ -42,7 +42,7 @@
   `Database::commit`(影子分页 + `commit.json`,**一次提交是原子的**).**两张都空就
   一个字节的 IO 都不做**--少了这一句,一次纯 `SELECT` 也会去写 `commit.json`,
   库目录只读时会变成"查询成功却报提交失败".
-- 脏标记只认 `Outcome::Created / Inserted / Updated` 三种(唯一的写路径),
+- 脏标记只认 `Outcome::Created / Inserted / Copied / Updated` 四种(唯一的写路径),
   加新的写语句时**必须同时**把这个 `match` 补上,否则那条路悄悄不落盘.
 - 提交失败**保留 `dirty`**(下次再试)并走 `Session::error`;磁盘上不会留下"改了一半"的
   库--失败点要么在暂存阶段,要么在推广阶段(`commit.json` 还在,下次打开时补完).
@@ -131,8 +131,8 @@
 `\set VERBOSE on|off` 只管**引擎自己的聊天**,一律走 `Session::info`(off 就不打):
 
 - `\i` 的"读入 ...(N 字节)";
-- 每条语句的状态行(`report` 的六个成功分支:`Rows` / `Created` / `Inserted` /
-  `Updated` / `NoOp` / `Transaction`);
+- 每条语句的状态行(`report` 的七个成功分支:`Rows` / `Created` / `Inserted` /
+  `Copied` / `Updated` / `NoOp` / `Transaction`);
 - 每段 SQL 的汇总("成功 N 条,失败 M 条",含 `ON_ERROR_STOP` 打断时那一条);
 - `\o` 的去向提示;
 - `\set` 自己的回显(`ON_ERROR_STOP:开` / `VERBOSE:开`).所以 `\set VERBOSE on` 会报
@@ -154,6 +154,7 @@
 | `Outcome` | 标签 |
 |---|---|
 | `Inserted { rows, .. }` | `INSERT 0 <rows>` |
+| `Copied { rows, .. }` | `COPY <rows>` |
 | `Updated { rows, .. }` | `UPDATE <rows>` |
 | `Transaction { op, applied: true, .. }` | `BEGIN` / `COMMIT` / `ROLLBACK` |
 
@@ -205,6 +206,27 @@
   (`Session::script_dir` 在 `include_file` 的递归前后换进换出,于是它天然是一层栈;
   存的是**绝对**路径,`\cd` 改不动它);不在任何脚本里时 `\ir` 退化成 `\i`.
   这两句都是 psql 的实测口径,别"顺手"改成只认最外层脚本.
+
+### `\copy`:本版里它就是 `COPY`
+
+`\copy <表> FROM '<数据文件>'` 的**全部语义**就是"把前缀换成 `COPY`",然后交给
+[`Session::run_sql`](engine.rs)--解析,降级,降级层的显式拒绝,权限,事务全在 `ir`
+(`Stmt::Copy`),引擎里**不许**再多懂一点 SQL.这么定是因为 psql 的 `\copy` 只是
+"客户端自己读文件"的 `COPY`,而本版的引擎与数据文件在同一个进程里,没有这个分工.
+
+- **路径按进程的工作目录解析**(psql 的 `\copy` 口径),**不套** `\ir` 那套"相对当前
+  脚本"的解析.所以 `script/init.sql` 的文件头写着"必须在 `script/` 下执行",而
+  `ydbms-test/ydbms.sh` 每次调用前都要 `cd` 进 `SQL 目录`.
+- 参数为空时报用法(`cmd.engine.100`);别的东西(没写 `FROM`,表名拼错)由 SQL 那层
+  照实报,这一层不猜.
+- **回显文本是 `COPY ...` 而不是 `\copy ...`**(重写之后的原文).这是有意接受的代价:
+  换来的是"引擎里一行 SQL 解析都没有".
+- **Tab 补全故意不做它的参数**:`\i` / `\o` / `\ls` / `\cd` 那族补的是**路径**,而
+  `\copy` 的第一个参数是**表名**,第二个才是路径--补错比不补更糟(见
+  `complete.rs` 的 `metacmd` 那一支).
+- 事务口径跟着 `ir` 走:没有显式事务时整句失败即回滚(不留下半张表);`init.sql`
+  把四条 `\copy` 包在 `BEGIN; ... COMMIT;` 里,于是中途出错时 `ON_ERROR_STOP`
+  停下,事务丢弃,磁盘上什么都不会变.
 
 ### 错误与 `ON_ERROR_STOP`
 

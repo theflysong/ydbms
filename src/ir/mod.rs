@@ -64,6 +64,8 @@
 //! `::numeric` 与 `CAST`(**两个方向**:数值 / 日期 / 时间戳 ↔ `TEXT`),
 //! `CREATE TABLE`(`NOT NULL` / `DEFAULT` / `CHECK` 真强制;`PRIMARY KEY` / `UNIQUE` /
 //! `FOREIGN KEY` 接受并**如实记录为未强制**),`INSERT`,`UPDATE`,
+//! `COPY <表> FROM '<文件>'`(COPY text 格式:制表符分列,`\N` 是 NULL,反斜杠按
+//! PostgreSQL 的转义表;**边读边插**;见 [`Stmt::Copy`](stmt::Stmt::Copy)),
 //! `CREATE INDEX` / `DROP INDEX`,`UNION [ALL]`,
 //! **子查询**(标量 / `IN` / `EXISTS` / 相关引用 / 派生表 / `ANY`/`ALL`),
 //! NULL 与三值逻辑,`INT`/`TEXT`/`CHAR`/`VARCHAR`/`TIMESTAMP`/`DATE`/`NUMERIC`,
@@ -98,14 +100,16 @@
 //! [`Stmt::Vacuum`](stmt::Stmt::Vacuum) 与 `irgen` 的 `lower_vacuum`.
 //!
 //! 权限检查也在语句层这一处([`Stmt`] 的每个分支动数据之前):`SELECT` 按
-//! [`Plan::used_columns`](plan.rs) 给出的**列**要 `SELECT`,`INSERT` / `UPDATE` 按
-//! 写到与读到的列要 `INSERT` / `UPDATE` / `SELECT`,动结构要 `check_ddl`.
+//! [`Plan::used_columns`](plan.rs) 给出的**列**要 `SELECT`,`INSERT` / `UPDATE` /
+//! `COPY` 按写到与读到的列要 `INSERT` / `UPDATE` / `SELECT`,动结构要 `check_ddl`.
 //!
 //! 未实现:**代价估算与连接重排**(策略是定规则挑的);CTE;`INTERSECT`/`EXCEPT`;
 //! `DISTINCT ON`;窗口函数;`RIGHT`/`FULL` JOIN;`LATERAL`;`DELETE`/`DROP TABLE`/
-//! `ALTER TABLE`;`SAVEPOINT` 与嵌套事务(`BEGIN` 套 `BEGIN` 只给警告);唯一索引与
-//! 部分索引;`GRANT` 的 `ADMIN OPTION` / `TO PUBLIC`,`CREATE ROLE` 的 `VALID UNTIL`
-//! 那一档选项;`REASSIGN OWNED BY`.(`CHECK` 与索引**不落盘**--它们不是列定义;`DEFAULT` 是列定义的一部分,
+//! `ALTER TABLE`;`COPY` 的其余形式(`TO`,`STDIN`,`PROGRAM`,`(查询)`,列清单,
+//! `WITH (...)` 的任何选项,`WHERE`);`SAVEPOINT` 与嵌套事务(`BEGIN` 套 `BEGIN`
+//! 只给警告);唯一索引与部分索引;`GRANT` 的 `ADMIN OPTION` / `TO PUBLIC`,
+//! `CREATE ROLE` 的 `VALID UNTIL` 那一档选项;`REASSIGN OWNED BY`.(`CHECK` 与索引
+//! **不落盘**--它们不是列定义;`DEFAULT` 是列定义的一部分,
 //! 跟着模式文件走.)
 
 pub mod checks;

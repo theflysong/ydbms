@@ -127,6 +127,8 @@ cmd.engine.096: "cannot log in"
 cmd.engine.097: "createdb"
 cmd.engine.098: "createrole"
 cmd.engine.099: "NOINHERIT"
+cmd.engine.100: "Usage: \\copy <table> FROM '<data file>', for example \\copy imdb.title_basics FROM 'data/title.basics.tsv'\nIn this version it is the SQL COPY: the path is resolved against the **process working directory** (unlike \\ir), and only the text format without WITH options is accepted\n"
+cmd.engine.101: "%{arg0} -> Loaded %{arg1} row(s) into %{arg2}\n"
 
 # ---- src/cmd/repl.rs ----
 cmd.repl.001: "Bye."
@@ -212,6 +214,7 @@ db.table.036: "the column is declared NOT NULL and does not accept NULL"
 db.table.037: "does not satisfy the length/precision limit of %{arg0}"
 db.table.038: "the row index is given by nrows()"
 db.table.039: "copying its own copy: the row has already passed validation"
+db.table.040: "the escaped bytes do not form valid UTF-8 text"
 
 # ---- src/ir/checks.rs ----
 ir.checks.001: "the result of CHECK must be a truth value, but it is %{arg0}"
@@ -573,6 +576,8 @@ ir.stmt.016: "empty statement"
 ir.stmt.017: "%{arg0}(this session has no service directory: use ysql --server-dist <dir>)"
 ir.stmt.018: "current role: %{arg0}"
 ir.stmt.019: "%{arg0} is a no-op: this version keeps no statistics and has no space to reclaim (%{arg1} table(s) named)"
+ir.stmt.020: "field count mismatch: this line has %{arg0}, expected %{arg1}"
+ir.stmt.021: "cannot read column `%{arg0}`: %{arg1}"
 
 # ---- src/ir/symbol.rs ----
 ir.symbol.001: "the transaction snapshot lost table `%{arg0}` (a drop path missed the snapshot)"

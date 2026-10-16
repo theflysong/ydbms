@@ -22,10 +22,13 @@
 //!
 //! 仍未实现的(都在本文件里显式拒绝):CTE;`INTERSECT`/`EXCEPT`;`DISTINCT ON`;
 //! 窗口函数;`GROUPING SETS`/`ROLLUP`/`CUBE`;`RIGHT`/`FULL`/`SEMI`/`ANTI` JOIN,
-//! `JOIN ... USING` 与 `NATURAL JOIN`;`LATERAL`;`UPDATE`/`DELETE`/`DROP TABLE`/
+//! `JOIN ... USING` 与 `NATURAL JOIN`;`LATERAL`;`DELETE`/`DROP TABLE`/
 //! `ALTER TABLE`;DDL 的各种变体(`CREATE VIEW`/`AS SELECT`,`ALTER DATABASE` 的
 //! `RENAME`/`OWNER`...);`SAVEPOINT` 与嵌套事务(`BEGIN`/`COMMIT`/`ROLLBACK` 与
 //! `ALTER DATABASE ... SET search_path` 是支持的);参数占位符;数组与位串类型.
+//!
+//! `COPY` 只认**裸 `FROM '<文件>'`** 那一个形式(`lower_copy`);`TO` / `STDIN` /
+//! `PROGRAM` / `(查询)` / 列清单 / `WITH (...)` 的任何选项 / `WHERE` 都显式拒绝.
 //!
 //! 角色那几条**是支持的**(`CREATE/ALTER/DROP USER`·`ROLE`·`GROUP`,
 //! `GRANT/REVOKE <角色>`,`SET ROLE`/`RESET ROLE`);其中**显式拒绝**的是:
@@ -53,11 +56,12 @@
 //! `IrInvalid` 报出来,而不会静默读错列.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use pg_query::protobuf::{
     a_const::Val, node, AConst, AExpr, AExprKind, AlterDatabaseSetStmt, AlterRoleStmt, BoolExpr,
-    BoolExprType, CaseExpr, CoalesceExpr, ConstrType, CreateRoleStmt, CreateSchemaStmt, CreateStmt,
-    CreatedbStmt,
+    BoolExprType, CaseExpr, CoalesceExpr, ConstrType, CopyStmt, CreateRoleStmt, CreateSchemaStmt,
+    CreateStmt, CreatedbStmt,
     DefElem, DropBehavior, DropOwnedStmt, DropRoleStmt, DropStmt,
     DropdbStmt, FuncCall, GrantRoleStmt, InsertStmt,
     JoinExpr, JoinType, LimitOption, Node, NullTestType, ObjectType, OnCommitAction, RangeVar,
@@ -136,6 +140,7 @@ pub fn lower_statement(stmt: &Node, symbols: &SymbolTable) -> Result<Stmt> {
         }
         Some(node::Node::CreateStmt(create)) => lower_create_table(create, symbols),
         Some(node::Node::InsertStmt(insert)) => lower_insert(insert, symbols),
+        Some(node::Node::CopyStmt(copy)) => lower_copy(copy, symbols),
         Some(node::Node::UpdateStmt(update)) => lower_update(update, symbols),
         Some(node::Node::DeleteStmt(_)) => Err(unsupported("DELETE")),
         Some(node::Node::DropStmt(drop)) => lower_drop(drop),
@@ -1568,6 +1573,71 @@ fn type_mods(type_name: &TypeName) -> Result<Vec<u32>> {
         }
     }
     Ok(out)
+}
+
+// --------------------------------------------------------------------- COPY
+
+/// `COPY <表> FROM '<文件>'`:把 COPY text 格式的数据文件装进表.
+///
+/// psql 的 `\copy` 走的也是这里--引擎把 `\copy X` 原样重写成 `COPY X`
+/// (见 `src/cmd`),因为本版引擎与数据文件在同一个进程里,没有客户端 / 服务端之分.
+///
+/// **只认这一个形式**,别的变体一律显式拒绝(理由见 `ir/AGENTS.md` 的那一节):
+/// `TO`(导出),`(查询)`,`PROGRAM`,`STDIN`,列清单,`WITH (...)` 的任何选项,
+/// `WHERE`.列清单与选项都**不是看不懂**,是有意不做--数据文件与表列已经一一对应,
+/// 而"未列出的列补 DEFAULT"和"CSV / BINARY 格式"都会把这一项从"半天"撑成"另一件事".
+fn lower_copy(copy: &CopyStmt, symbols: &SymbolTable) -> Result<Stmt> {
+    if !copy.is_from {
+        return Err(unsupported("COPY ... TO"));
+    }
+    if copy.query.is_some() {
+        return Err(unsupported("COPY (query) ..."));
+    }
+    if copy.is_program {
+        return Err(unsupported("COPY ... PROGRAM"));
+    }
+    if copy.filename.is_empty() {
+        // `STDIN`:本版的会话没有"另一端"可以喂数据
+        return Err(unsupported("COPY ... FROM STDIN"));
+    }
+    if !copy.attlist.is_empty() {
+        return Err(unsupported("COPY ... (column list)"));
+    }
+    if !copy.options.is_empty() {
+        // 选项名照实报出来,用户才知道该删掉哪一个
+        let names: Vec<&str> = copy
+            .options
+            .iter()
+            .map(|option| match &option.node {
+                Some(node::Node::DefElem(def)) => def.defname.as_str(),
+                _ => "?",
+            })
+            .collect();
+        return Err(unsupported(format!(
+            "COPY ... WITH ({})",
+            names.join(", ")
+        )));
+    }
+    if copy.where_clause.is_some() {
+        return Err(unsupported("COPY ... WHERE"));
+    }
+
+    let relation = copy
+        .relation
+        .as_ref()
+        .ok_or_else(|| unsupported(tr!("ir.irgen.078").into_owned()))?;
+    let table = qualified_name(relation)?;
+
+    // 表必须**当场就有**:名字解不出来就不必去碰文件(与 `INSERT` 同一个判据).
+    // 执行时还会按 `search_path` 再定一次生效名,那一步在语句层.
+    symbols
+        .columns(&table)
+        .ok_or_else(|| DbError::UnknownSymbol { name: table.clone() })?;
+
+    Ok(Stmt::Copy {
+        table,
+        path: PathBuf::from(copy.filename.clone()),
+    })
 }
 
 // ------------------------------------------------------------------- INSERT

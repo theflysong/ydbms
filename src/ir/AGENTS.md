@@ -182,6 +182,38 @@ PhysTab                          ← db::source::materialize
 - **不查权限**,也**不在事务里拒绝**:它是空转,没有要保护的东西--后一条与
   PostgreSQL 有意不同(`VACUUM` 在 PostgreSQL 里不能在事务块里跑).
 
+### `COPY <表> FROM '<文件>'`:把数据文件装进表
+
+psql 的 `\copy` 与它是**同一件事**(引擎与数据文件在同一个进程里,没有客户端 /
+服务端之分),所以引擎把 `\copy X` 原样重写成 `COPY X` 交给这一层
+(见 `src/cmd/AGENTS.md`).口径:
+
+- **只认裸 `FROM '<文件>'`**:`TO`(导出),`STDIN`,`PROGRAM`,`(查询)`,列清单,
+  `WITH (...)` 的任何选项,`WHERE` 一律 `Unsupported`.列清单与选项**不是看不懂**,
+ 是有意不做--数据文件与表列已经一一对应,而"未列出的列补 DEFAULT"与"CSV / BINARY
+  格式"会把这一项从半天撑成另一件事.拒绝时**把选项名报出来**,用户才知道删哪一个.
+- **格式是 COPY 的 text 默认口径**:制表符分列(字段与表的列一一对应),整个字段等于
+  `\N` 就是 NULL,反斜杠按 PostgreSQL 的转义表(`\t \n \\ \b \f \r \v \ooo \xHH`,
+  其余 `\X` 就是 `X`).逐格落到 `Column.ty` 上(走 `DataType::from_copy_field`),
+  于是 typmod 与 `NOT NULL` 的强制点仍然只有 `DataType::parse` 与 `Table::validate`
+  两处.**COPY 的字段口径与数据文件(CSV)的字段口径不是一套**,别互相借
+  (见 `src/db/AGENTS.md`).
+- **边读边插**:`BufReader::lines()` 一行一行来,不先攒成 `Vec<Row>`--`init.sql` 那
+  四张表共 177 万行.
+- **写路径与 `INSERT` 一字不差**:`relation_mut(...).insert(row)` 加
+  `index_keys_of` + `maintain_indexes`.漏了索引那一步就是"索引少一批键"的安静错答案.
+- **失败靠隐式事务整句回滚**(`execute_stmt_with`):文件不存在报 `Io`,字段数不符与
+  读不出来的字段报带**行号**的 `Format`.显式事务里则与别的语句同一条口径(不整句
+  回滚,要撤销就 `ROLLBACK`).
+- **路径按进程的工作目录解析**:psql 的 `\copy` 口径,与 `\ir` 那套"相对当前脚本"
+  **不同**(`script/init.sql` 的文件头专门写了"必须在 `script/` 下执行").
+
+两条**已知偏差**(都写进了 `lower_copy` 与 `Stmt::Copy` 的文档注释):
+
+- 列清单与任何 `WITH` 选项都不支持(PostgreSQL 支持);
+- 按行读文件,所以"字段里夹一个**裸换行**"(`\` 加一个真换行)这种 COPY 写法不支持
+  --值里的换行请写 `\n`;`\.`(end-of-data)也不认,那是 `COPY FROM STDIN` 的约定.
+
 ### 库与角色(`CREATE/DROP/ALTER DATABASE`,`CREATE/ALTER/DROP ROLE`,`GRANT`):一个口子,不是文件系统
 
 语句层**不认识文件系统**:`Stmt::CreateDatabase` / `DropDatabase` /
@@ -224,6 +256,7 @@ PhysTab                          ← db::source::materialize
 |---|---|
 | `SELECT` | 计划里扫到的每张表,按 [`Plan::used_columns`](plan.rs) 给出的**列**要 `SELECT` |
 | `INSERT` | `Stmt::Insert::columns`(写了哪几列)要 `INSERT` |
+| `COPY ... FROM` | 表的所有列要 `INSERT`(数据文件与表列一一对应,没有列清单可省) |
 | `UPDATE` | `SET` 写到的列要 `UPDATE`;`SET` 与 `WHERE` **读到**的列要 `SELECT` |
 | `CREATE TABLE` / `CREATE INDEX` / `DROP INDEX` / `CREATE SCHEMA` / `DROP SCHEMA` | `check_ddl`(owner 含继承,或超级用户) |
 | `CREATE DATABASE` | `check_create_database`(`CREATEDB` 或超级用户) |

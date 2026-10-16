@@ -1163,3 +1163,188 @@ fn vacuum_on_an_unknown_table_is_reported() {
         "got {err:?}"
     );
 }
+
+// ------------------------------------------------------------------- COPY
+
+/// 自清理的临时目录(COPY 从真实文件里读,别读仓库外的东西).
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ydbms-copy-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("建临时目录");
+        TempDir { path }
+    }
+
+    /// 在里面写一个数据文件,返回它的**绝对路径**(COPY 的路径按进程的 cwd 解析,
+    /// 用绝对路径就不必改 cwd).
+    fn file(&self, name: &str, text: &str) -> String {
+        let path = self.path.join(name);
+        std::fs::write(&path, text).expect("写数据文件");
+        path.display().to_string()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// 整张表的每一行(逐值核对用).
+fn rows_vec(table: &dyn Table) -> Vec<Vec<Value>> {
+    (0..table.nrows())
+        .map(|r| table.row(r).expect("行在界内"))
+        .collect()
+}
+
+/// `\N` 进表是 NULL;引号 / 逗号 / 制表符的文本原样保留.
+#[test]
+fn copy_loads_a_tsv_with_nulls_quotes_commas_and_tabs() {
+    let dir = TempDir::new("tsv");
+    // 第 2 行整字段 `\N` 是 NULL;
+    // 第 3 行的 `a\tb\\N` 里 `\t` 落成真制表符,`\\` 落成一个反斜杠(不是 NULL 记法)
+    let file = dir.file(
+        "data.tsv",
+        "tt1\tMovie One\t7.5\n\\N\tHe said \"hi\", twice\t\\N\ntt3\ta\\tb\\\\N\t1.5\n",
+    );
+
+    let mut db = SymbolTable::new();
+    run_ok(
+        &mut db,
+        "CREATE TABLE t (k CHAR(9), name TEXT, score NUMERIC(3,1));",
+    );
+
+    let outcome = one(&mut db, &format!("COPY t FROM '{file}'")).expect("装载应当成功");
+    match outcome {
+        Outcome::Copied { table, rows } => {
+            assert_eq!(table, "t");
+            assert_eq!(rows, 3);
+        }
+        other => panic!("期望 Copied,得到 {other:?}"),
+    }
+
+    let table = db.relation("t").expect("表在");
+    let rows = rows_vec(table);
+    assert_eq!(
+        rows[0],
+        vec![
+            Value::Text("tt1".to_string()),
+            Value::Text("Movie One".to_string()),
+            Value::Numeric("7.5".to_string()),
+        ]
+    );
+    assert_eq!(
+        rows[1],
+        vec![
+            Value::Null,
+            Value::Text("He said \"hi\", twice".to_string()),
+            Value::Null,
+        ]
+    );
+    assert_eq!(
+        rows[2],
+        vec![
+            Value::Text("tt3".to_string()),
+            // 真制表符 + 两个字面字符 `\N`(不是 NULL)
+            Value::Text("a\tb\\N".to_string()),
+            Value::Numeric("1.5".to_string()),
+        ]
+    );
+
+    // 再装一次:行数翻倍(本版不做唯一性检查)--口径与 `INSERT` 一致
+    run_ok(&mut db, &format!("COPY t FROM '{file}'"));
+    assert_eq!(db.relation("t").expect("表在").nrows(), 6);
+}
+
+/// 只认裸 `FROM '<文件>'`:别的形式一律显式拒绝,不猜.
+#[test]
+fn copy_rejects_the_forms_it_does_not_do() {
+    let dir = TempDir::new("reject");
+    let file = dir.file("d.tsv", "1\n");
+
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE t (a INT, b TEXT);");
+
+    fn refused(db: &mut SymbolTable, sql: &str) {
+        let err = one(db, sql).expect_err(&format!("`{sql}` 本应被拒绝"));
+        assert!(
+            matches!(err, DbError::Unsupported { .. }),
+            "`{sql}` 期望 Unsupported,得到 {err:?}"
+        );
+    }
+
+    refused(&mut db, &format!("COPY t TO '{file}'"));
+    refused(&mut db, "COPY t FROM STDIN");
+    refused(&mut db, &format!("COPY t (a) FROM '{file}'"));
+    refused(&mut db, &format!("COPY t FROM '{file}' WITH (FORMAT csv)"));
+    refused(&mut db, "COPY t FROM PROGRAM 'cat /dev/null'");
+    refused(&mut db, &format!("COPY (SELECT 1) TO '{file}'"));
+    refused(&mut db, &format!("COPY t FROM '{file}' WHERE a > 1"));
+
+    // 表不存在是"找不到",不是"不支持"
+    let err = one(&mut db, &format!("COPY nope FROM '{file}'")).expect_err("本应报错");
+    assert!(
+        matches!(err, DbError::UnknownSymbol { ref name } if name == "nope"),
+        "got {err:?}"
+    );
+}
+
+/// 文件不存在 / 中途出错时,这一句**整体不生效**(与其他语句同一条隐式事务口径).
+#[test]
+fn copy_is_atomic_like_any_other_statement() {
+    let dir = TempDir::new("atomic");
+    let bad = dir.file("bad.tsv", "1\tone\nboom\ttwo\n3\tthree\n");
+    let missing = dir.path.join("nowhere.tsv").display().to_string();
+
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE t (a INT, b TEXT);");
+
+    // 第 2 行的第一列要 INT,却是 `boom`:整句失败,前一行也不许留下
+    let err = one(&mut db, &format!("COPY t FROM '{bad}'")).expect_err("本应报错");
+    assert!(
+        matches!(err, DbError::Format { line: Some(2), .. }),
+        "期望带行号的 Format,得到 {err:?}"
+    );
+    assert_eq!(db.relation("t").expect("表在").nrows(), 0, "半张表不许留下");
+
+    // 文件不存在:同样是整句不生效
+    let err = one(&mut db, &format!("COPY t FROM '{missing}'")).expect_err("本应报错");
+    assert!(matches!(err, DbError::Io { .. }), "got {err:?}");
+    assert_eq!(db.relation("t").expect("表在").nrows(), 0);
+
+    // 字段数与列数对不上:也报带行号的 Format
+    let ragged = dir.file("ragged.tsv", "1\tone\n2\n");
+    let err = one(&mut db, &format!("COPY t FROM '{ragged}'")).expect_err("本应报错");
+    assert!(
+        matches!(err, DbError::Format { line: Some(2), .. }),
+        "got {err:?}"
+    );
+    assert_eq!(db.relation("t").expect("表在").nrows(), 0);
+}
+
+/// `COPY` 也要把索引键追加进去--漏了 `maintain_indexes` 就是"索引少一批键"的
+/// 安静错答案,所以先让索引**建起来**,再往表里装.
+#[test]
+fn copy_appends_index_entries() {
+    let dir = TempDir::new("index");
+    let file = dir.file("d.tsv", "2\ttwo\n3\tthree\n");
+
+    let mut db = SymbolTable::new();
+    run_ok(&mut db, "CREATE TABLE k (a INT, b TEXT);");
+    run_ok(&mut db, "CREATE INDEX ki ON k (a);");
+    run_ok(&mut db, "INSERT INTO k VALUES (1, 'one');");
+    // 走到索引上,索引从此是"已经建好的那一份"
+    run_ok(&mut db, "SELECT b FROM k WHERE a = 1;");
+
+    run_ok(&mut db, &format!("COPY k FROM '{file}'"));
+
+    let found = one(&mut db, "SELECT b FROM k WHERE a = 3").expect("查询应当成功");
+    let table = rows_of(&found);
+    assert_eq!(table.nrows(), 1, "COPY 进来的行也得走索引找得到");
+    assert_eq!(table.value(0, 0), Some(Value::Text("three".to_string())));
+}

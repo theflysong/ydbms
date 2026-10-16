@@ -324,6 +324,22 @@ impl DataType {
         self.parse(&text)
     }
 
+    /// 从 `COPY ... (FORMAT text)` 的一个字段读回一个值.
+    ///
+    /// 与 [`from_csv_field`](DataType::from_csv_field) 的**顺序一样**(先认 NULL 记法,
+    /// 再反转义,最后按类型解析),差别只在**反转义的口径**:那一边是数据文件(CSV)
+    /// 的字段写法(以 `\` 开头的文本掉一层),这一边是 PostgreSQL COPY text 的转义表
+    /// (见 [`unescape_copy_field`]).两者**不是一套**,别互相借.
+    pub fn from_copy_field(&self, field: &str) -> Result<Value> {
+        // `\N` 是 COPY text 的默认空值串,**在做任何反转义之前**整字段比对
+        // (PostgreSQL 的口径:空值串与 `\.` 先认,再谈转义)
+        if field == "\\N" {
+            return Ok(Value::Null);
+        }
+
+        self.parse(&unescape_copy_field(field).map_err(|reason| self.bad_value(field, reason))?)
+    }
+
     fn bad_value(&self, text: &str, reason: String) -> DbError {
         DbError::BadValue {
             column: None,
@@ -332,6 +348,91 @@ impl DataType {
             reason,
         }
     }
+}
+
+/// COPY text 格式的反转义(PostgreSQL `CopyReadAttributesText` 那张表).
+///
+/// 认这几种:`\b` `\f` `\n` `\r` `\t` `\v`,一到三位**八进制** `\ooo`,`x` 加一到
+/// 两位**十六进制** `\xHH`;别的 `\X` 一律当成 `X`(反斜杠丢掉)--与 PostgreSQL
+/// 一致(`\q` 就是 `q`).
+///
+/// 八进制 / 十六进制给的是**字节**,所以结果先攒成 `Vec<u8>`,最后整体校验 UTF-8:
+/// 分开写的 `\xC3\xA9` 因此还能拼回一个 `é`,而落单的续字节会照实报错(错误原因
+/// 交给调用方去套成 [`BadValue`](DbError::BadValue),那里才有列的类型).
+///
+/// 已知不处理:转义出来的**裸换行**(`\` 加一个真换行)本是 COPY 表示"值里有换行"
+/// 的另一种写法;本版按行读文件,值里的换行请写 `\n`.
+fn unescape_copy_field(field: &str) -> std::result::Result<String, String> {
+    // 快路径:没有反斜杠就一个字节都不用搬(数据文件里绝大多数字段走这条)
+    if !field.contains('\\') {
+        return Ok(field.to_string());
+    }
+
+    let bytes = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        i += 1;
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+
+        // 行尾孤零零一个 `\`:留着它,别把后面当转义(行已经到头了)
+        let Some(&escape) = bytes.get(i) else {
+            out.push(b'\\');
+            break;
+        };
+        i += 1;
+
+        match escape {
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'0'..=b'7' => {
+                // 八进制:最多再吃两位
+                let mut value = u32::from(escape - b'0');
+                for _ in 0..2 {
+                    match bytes.get(i) {
+                        Some(&digit @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(digit - b'0');
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(value as u8);
+            }
+            b'x' => {
+                // 十六进制:最多再吃两位;一位都没有时 `x` 就是它自己
+                let mut value = 0u32;
+                let mut digits = 0;
+                for _ in 0..2 {
+                    match bytes.get(i).and_then(|b| (*b as char).to_digit(16)) {
+                        Some(digit) => {
+                            value = value * 16 + digit;
+                            i += 1;
+                            digits += 1;
+                        }
+                        None => break,
+                    }
+                }
+                match digits {
+                    0 => out.push(b'x'),
+                    _ => out.push(value as u8),
+                }
+            }
+            // 认不出来的转义就是它自己(`\\` 也落在这里,正好是 `\`)
+            other => out.push(other),
+        }
+    }
+
+    String::from_utf8(out).map_err(|_| tr!("db.table.040").into_owned())
 }
 
 fn timestamp_precision_of(ty: &DataType) -> u32 {

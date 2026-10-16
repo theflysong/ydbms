@@ -39,6 +39,18 @@
 //! 文件都会成为"当前脚本",嵌套一层层跟着走;不在任何脚本里时(交互式终端直接敲)
 //! `\ir` 退化成 `\i`.递归深度有上限(见 [`MAX_INCLUDE_DEPTH`]).
 //!
+//! # `\copy`:本版里它就是 `COPY`
+//!
+//! `\copy <表> FROM '<数据文件>'` 的**全部语义**就是"把前缀换成 `COPY`"再交给 SQL
+//! 那条唯一的路([`Session::run_sql`])--psql 的 `\copy` 只是"客户端自己读文件"的
+//! `COPY`,而本版的引擎与数据文件在同一个进程里,没有这个分工.于是解析,降级,
+//! 降级层的显式拒绝,权限与事务全在 `ir` 的 `Stmt::Copy` 上,引擎里一行 SQL
+//! 解析都不多.
+//!
+//! **路径按进程的工作目录解析**(psql 的 `\copy` 口径),**不套** `\ir` 那套"相对
+//! 当前脚本"的解析--所以 `script/init.sql` 的文件头写着"必须在 `script/` 下执行".
+//! 代价只有一处:语句原文的回显是 `COPY ...`,不是用户敲进来的 `\copy ...`.
+//!
 //! # 三个开关
 //!
 //! `\timing`,`\set ON_ERROR_STOP on` 与 `\set VERBOSE on` 都是**会话状态**(不是某一段
@@ -1171,6 +1183,7 @@ impl Session {
         let name = match &result.outcome {
             Ok(Outcome::Created { name, .. }) => name,
             Ok(Outcome::Inserted { table, .. }) => table,
+            Ok(Outcome::Copied { table, .. }) => table,
             Ok(Outcome::Updated { table, .. }) => table,
             _ => return,
         };
@@ -1358,6 +1371,12 @@ impl Session {
                 self.info(&format!("{}", tr!("cmd.engine.025", arg0 =  head, arg1 =  rows, arg2 =  table)));
                 self.tag(&format!("INSERT 0 {}\n", rows));
             }
+            Ok(Outcome::Copied { table, rows }) => {
+                self.info(&format!("{}", tr!("cmd.engine.101", arg0 =  head, arg1 =  rows, arg2 =  table)));
+                // `COPY` 的标签是 psql 协议里的 `COPY <行数>`(不是 `INSERT 0`):
+                // 与 `INSERT` 分开的正是这个字,别顺手统一掉
+                self.tag(&format!("COPY {}\n", rows));
+            }
             Ok(Outcome::Updated { table, rows }) => {
                 self.info(&format!("{}", tr!("cmd.engine.026", arg0 =  head, arg1 =  rows, arg2 =  table)));
                 self.tag(&format!("UPDATE {}\n", rows));
@@ -1422,6 +1441,18 @@ impl Session {
             MetaCmd::IncludeRelative(Some(path)) => {
                 let resolved = self.resolve_relative_script(&path);
                 self.include_file(&resolved)
+            }
+
+            // `\copy` 的全部语义就是"把前缀换成 `COPY`":本版引擎与数据文件在同一个
+            // 进程里,psql 的"客户端自己读文件"在这里没有对应的分工,所以两者是同一
+            // 句话.重写之后交给 SQL 那条唯一的路,解析 / 降级 / 权限 / 事务全在 `ir`
+            // --这里**不新增任何 SQL 知识**.
+            MetaCmd::Copy(rest) => {
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    return self.error(&tr!("cmd.engine.100").into_owned());
+                }
+                self.run_sql(&format!("COPY {}", rest))
             }
 
             MetaCmd::Shell(command) => self.shell(command, allow_shell),
