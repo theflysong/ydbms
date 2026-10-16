@@ -17,6 +17,9 @@
 `VACUUM (ANALYZE)` / `||` / `COALESCE` / `LOWER` / `CAST(INT AS TEXT)`),
 二是**访问路径**--`PRIMARY KEY` 不建索引,于是全量 `tests.sql` 停在第 52 条(8.7).
 它**不是**阶段 7 的前置:全量装载实测只占 593 MB,内存不是这个库的瓶颈.
+**语法与元命令那一类已经补齐**(除 `\copy`),写基准的脚本(`insert_*` / `update_*`)
+与小样本上的 `tests.sql` 都能跑到底;剩下的两条是 `\copy`(8.1)与访问路径(8.7),
+再往后是全量跑批(8.8).
 
 难度标记:**[易]** 半天内,改动集中;**[中]** 一到两天,要动一两层;**[难]** 需要新机制或重写.
 
@@ -34,15 +37,15 @@
 | **5** | 服务目录,数据库与"写完就落盘"(`--server-dist` / `-d`) | 0 | 5.1 库目录 / `catalog.json` / `CREATE`·`DROP DATABASE`,5.2 打开即载入 + 只写脏表的提交点,5.3 服务目录与单写者锁(随阶段 6 一起做),5.4 库级会话默认值(`ALTER DATABASE ... SET search_path`) |
 | **6** | 用户系统(`src/usr/`)与 `ysql` 命令行 | 0 | 6.1 用户表与认证,6.2 `ysql` 命令行,6.3 端到端验收与文档,6.4 角色 / 授权 / `\c`·`\l`·`\du` |
 | **7** | 超大型数据库:数据不再要求全在内存 | 9 | (未开始) |
-| **8** | 跑通 `script/` 下的基准脚本(init / insert / update / tests) | 9 | (未开始;失败点与全量现状已逐条实测,见该节开头的表) |
+| **8** | 跑通 `script/` 下的基准脚本(init / insert / update / tests) | 3 | 8.2 `\ir`,8.3 `VACUUM` / `ANALYZE` 空转,8.4 `\|\|`,8.5 `COALESCE`,8.6 `LOWER` 与两个方向的 `CAST`,8.9 写基准的命令标签(`insert_*` / `update_*` 已能跑到底,`tests.sql` 小样本 72 条零失败) |
 
 **当前基线**(改动前先确认还成立):
 
 ```text
 db.sql 52/0 · query1 4/0 · query2 5/0 · query3 8/0 · query4 6/0 · query5 9/0
 (格式:成功 / 失败)
-cargo test --offline → 654 通过(2 个 #[ignore]:两个基准),0 warning;约 13 秒
-(其中 tests/ydbms_suite.rs 的端到端装载 + 25 条查询约 9 秒)
+cargo test --offline → 689 通过(2 个 #[ignore]:两个基准),0 warning;约 5 秒
+(端到端那套是 crate 内自带的 tests/script/filmdb/,11 张表 68 行,不再读仓库外的资源)
 执行模型:拉取式 -- ir::exec 的每个节点产出一个 RowSource,
           只有需要随机访问 / 重扫 / 哈希 build / 最终结果才物化(见 ir/exec.rs)
 访问路径:WHERE 的合取项下推到单表 Scan(LEFT JOIN 的可空侧只放行 null-rejecting 的
@@ -117,15 +120,14 @@ DDL/DML:CREATE TABLE 的 NOT NULL / DEFAULT / CHECK **真强制**(CHECK 见 ir/c
       拼成一个字符串;没有内存预算,没有溢出目录,也没有"边拉边渲染"的口子
       --所以**超过可用内存的库今天跑不起来**(分析与待办见"阶段 7")
 script/:另一套基准(IMDb 四张表),**与 `ydbms-test/` 无关**.`schema.sql` 能跑;
-      `init.sql` 卡在 `\ir` -> 四句 `\copy`(全部装载都靠它)-> `VACUUM (ANALYZE)`;
-      `insert_1k/5k/10k/50k.sql` 只差 `\ir` 与末尾那条多表 `ANALYZE`
-      (多行 `INSERT ... VALUES (...),(...)` 本身能跑);
-      `update_1k/5k/10k/50k.sql` 只差 `title_crew` 那一句的 `COALESCE` 与 `||`;
-      `tests.sql` 72 条里 68 条通过--失败的是 Test 11.1 / 11.3(`||`,
-      `CAST(INT AS TEXT)`),11.4(`LOWER`),14.3(`COALESCE`,而且是 `GROUP BY` 里的那种);
-      带 `ON_ERROR_STOP on` 时它会停在 11.1(其余 3 条是关掉它一次收全才看到的)
+      `insert_1k/5k/10k/50k.sql` 与 `update_1k/5k/10k/50k.sql` 现在都**能跑到底**;
+      `tests.sql` 在小样本(3512 行,`insert_1k.sql` 装出来的那个库)上
+      **72 条零失败**;`init.sql` 只剩 `\copy`(8.1)一道坎--它已经过了
+      `\ir schema.sql`(建表与 `search_path` 都做完),四条 `\copy` 一句都不认,
+      带 `ON_ERROR_STOP on` 时直接停在第一句
 script/ 的全量实测(**内存不是瓶颈**,release 档,库目录即 `pers` 的 CSV 格式,
-      四个 TSV 共 1770672 行 / 约 100 MB):
+      四个 TSV 共 1770672 行 / 约 100 MB;这一组是**手工装载**测出来的,
+      `init.sql` 跑通(8.1)之后要按 8.8 的口径重测):
       * 装载:四张表全部载入常驻 **593 MB**,1.71 秒(在 `ulimit -v 4G` 下毫无压力);
       * `tests.sql`:前 **51 条零失败**,第 52 条(Test 10.3 的相关 `EXISTS`)3 分钟
         无进展--**卡在时间上,不是内存上**(见 8.7);
@@ -142,15 +144,18 @@ script/ 的全量实测(**内存不是瓶颈**,release 档,库目录即 `pers` �
 > `order_by_an_output_column_number_sorts_by_that_column` 连顺序与 `EXPLAIN`
 > 一起核).
 
-> **`ydbms-test/` 现在真的跑起来了**:`tests/ydbms_suite.rs` 走
-> `init.sql → filmdb.sql → correctness/queries.sql`,断言零失败,11 张表的行数
-> (`movies` 9204,`credits` 46850,`people` 16489...),并且把 25 条查询的结果与
-> 仓库自带的**参照结果** `correctness/expect/query*.txt`(PostgreSQL 18.6 的 psql
-> 输出)逐条比对--只归一化对齐,`NULL` 的呈现与行序(那些查询本来就没有
-> `ORDER BY`),值必须一致.
-> 只有 `tests.sql` 没进默认测试:它的 Test 1.2 是 `movies × countries`(约 170 万
-> 行),而引擎会把整个结果表物化再渲染成一个字符串--那要几百 MB 内存,
-> 属于手动验收.
+> **阶段 1 那套端到端现在**住在 crate 里**:`tests/filmdb_suite.rs` 读
+> `tests/script/filmdb/`(自造的小样本:11 张表 68 行),走 `init.sql -> filmdb.sql ->
+> queries.sql`,断言零失败,逐张核对行数,并把 6 条查询的结果与本文件里**手算**的
+> 期望值逐字比对(表头,数据行,连行序一起核).期望值逐条对照过 PostgreSQL 18.6.
+> 它**不读仓库外的任何东西**--这一点有测试证明:把 `tests/` 那棵源码树单独复制出去
+> (没有 `../ydbms-test` 与 `../script`)跑 `cargo test` 仍然全绿.
+>
+> 原来那一套(课程给的 `ydbms-test/`:3.8 MB `filmdb.sql`,7.6 万条 INSERT,25 条
+> 查询的 PostgreSQL 参照输出)**留在 crate 之外**,现在住在 `script/old/`,由
+> `ydbms-test/` 那边的脚本手工跑;`script/old/tests.sql` 的 Test 1.2 是
+> `movies × countries`(约 170 万行),引擎会把整个结果表物化再渲染成一个字符串
+> --那要几百 MB 内存,属于手动验收.
 
 ---
 
@@ -650,25 +655,25 @@ id = 5` 今天**永远全表扫**--哪怕 `id` 上有索引.
 它与 `ydbms-test/`(阶段 1)是两套数据,两套口径:那边断言**结果对不对**,
 这边只量**快不快**--所以"跑通"的口径就是"每条语句都不报错,并打出耗时".
 
-**失败点是逐条探测出来的**(拿现成的 `ysql` 跑真脚本,`\set ON_ERROR_STOP off` 之后一次收全):
+**失败点是逐条探测出来的**(拿现成的 `ysql` 跑真脚本,`\set ON_ERROR_STOP off` 之后一次收全;
+下面这一列是**补齐 8.2~8.6 与 8.9 之后**重新实测的结果):
 
 | 脚本 | 现状 |
 |---|---|
 | `schema.sql` | 能跑. |
-| `init.sql` | 卡在 `\ir`(第 25 行),然后是四句 `\copy`(全部装载都靠它),最后 `VACUUM (ANALYZE)`. |
-| `insert_1k/5k/10k/50k.sql` | 只差 `\ir` 与末尾那条 `ANALYZE`(多表列表).多行 `INSERT ... VALUES (...),(...)` 本身已经能跑. |
-| `update_1k/5k/10k/50k.sql` | 只差 `title_crew` 那一句里的 `COALESCE` 与 `||`;其余三张表的 `UPDATE ... WHERE 主键 IN (...)` 能跑. |
-| `tests.sql` | 小样本上 72 条里 68 条能跑.失败的是 Test 11.1 / 11.3(`||` 与 `CAST(INT AS TEXT)`),11.4(`LOWER`),14.3(`COALESCE`,而且是 `GROUP BY` 里的那种). |
-| **全量** `tests.sql` | **停在第 52 条**:前 51 条零失败,零内存告急,卡在 Test 10.3 的相关 `EXISTS`--3 分钟无进展.根因**不是内存**(装载只占 593 MB,见基线),而是**没有索引**(见 8.7). |
+| `init.sql` | 只剩 `\copy` 一道坎:它已经过了 `\ir schema.sql`(建表,`search_path`,全部 DDL 都做完),四条 `\copy` 一句都不认,`ON_ERROR_STOP on` 之下停在第一句. |
+| `insert_1k/5k/10k/50k.sql` | **能跑到底**(`\ir` 与末尾的多表 `ANALYZE` 都补齐了).实测:`insert_1k.sql` 装进 1000/1000/1000/512 行,`insert_5k.sql` 装进 5000/5000/5000/2670 行,退出码 0. |
+| `update_1k/5k/10k/50k.sql` | **能跑到底**,`title_crew` 那一句的 `COALESCE` 与 `||` 补齐了(实测 `update_1k.sql` 四条 UPDATE 各 1000/1000/1000/512 行). |
+| `tests.sql` | 小样本(3512 行)上 **72 条零失败**(11.1 / 11.3 / 11.4 / 14.3 都过了),退出码 0. |
+| **全量** `tests.sql` | **仍停在第 52 条**:前 51 条零失败,零内存告急,卡在 Test 10.3 的相关 `EXISTS`--3 分钟无进展.根因**不是内存**(装载只占 593 MB,见基线),而是**没有索引**(见 8.7). |
 | `gen_sample.py` | 与引擎无关(纯 Python 生成 SQL),不用动. |
 
 **跑法已经有了**:`ydbms-test/ydbms.sh`--与 `postgresql/postgresql.sh` 同构,
 四个阶段(init -> tests × 10 -> update × 5 -> insert × 5)与 SQL 文件都不改写,
-默认导出 `YDBMS_LANG=en`(见 8.9).本阶段要做的就是让它能跑到底.
+默认导出 `YDBMS_LANG=en`.本阶段要做的就是让它能跑到底.
 
-**下面按"先能跑,再能救访问路径,最后才是下游"排**:8.1~8.6 是小的补齐
-(元命令 / 语法 / 函数各一两处),8.7 是全量跑不完的那个真原因,8.8 是全量验收,
-8.9 是下游(不做也能"跑通").
+**剩下三条**:8.1 是 `init.sql` 唯一的坎(也是全量跑批的前置),8.7 是全量 `tests.sql`
+跑不完的那个真原因,8.8 是全量验收与基线数字.
 `script/old/` 里那几份(`filmdb.sql` / `tests.sql` / `tests.yql`)是另一条线,
 归阶段 1 与 1.7,不在这里重复.
 
@@ -687,7 +692,7 @@ id = 5` 今天**永远全表扫**--哪怕 `id` 上有索引.
   177 万行要**边读边 `insert`**,不许先攒成 `Vec<Row>`;`\copy` 落在显式事务里时,
   "提交点只写脏表"这条(5.2)已经能省掉绝大部分重写.
 - **坑**(三个):一是路径按**进程的 cwd** 解析(`init.sql` 的文件头专门写了"必须在
-  `script/` 下执行";8.2 那套"相对脚本"的解析**不**适用于 `\copy`);二是文件不存在或
+  `script/` 下执行";`\ir` 那套"相对脚本"的解析**不**适用于 `\copy`);二是文件不存在或
   中途出错时,这一句要整体不生效(与其他语句同一条隐式事务口径),不能留下半张表;
   三是 `\copy` 进事务会触发 `snapshot_before_write` 的**整表克隆**(`ir/symbol.rs`)--
   全量装载时每张表在内存里变两份,这正是 3.17(追加式写的撤销记录只记"截断到 N 行")
@@ -696,81 +701,6 @@ id = 5` 今天**永远全表扫**--哪怕 `id` 上有索引.
 - **验收**:`cd script && ysql ... -f init.sql` 把四张表装满,末尾自检数出
   499999 / 499999 / 499999 / 270675;再跑一次结果一致;`tests/ir_script.rs` 加一条
   "TSV 里的 `\N` 进表是 NULL,带引号 / 逗号 / 制表符的文本原样保留".
-
-## 8.2 [易] `\ir`:相对**脚本自己**的 include
-
-**缺在哪**:元命令表里只有 `\i`(相对 cwd).而 `init.sql` 与四个 `insert_*.sql`
-都用 `\ir schema.sql`.
-
-- **要点**:与 `\i` 同一条路,只把相对路径按"**当前正在执行的脚本所在目录**"解析;
-  `-f` 的顶层脚本是起点,嵌套 include 一层层跟着走(psql 的口径).
-- **量级**:半天.
-- **验收**:从任意 cwd 执行 `ysql -f <绝对路径>/script/insert_1k.sql` 都能找到 `schema.sql`;
-  `\i` 的行为不变(仍相对 cwd).
-
-## 8.3 [易] `VACUUM (ANALYZE)` 与 `ANALYZE`:接受并说明是空转
-
-**缺在哪**:两条都落到 `unsupported: 这种语句`(实测 `VACUUM t` / `VACUUM ANALYZE t` /
-`VACUUM (ANALYZE) t1, t2, ...` 一样).`init.sql` 第 39 行是四表列表的 `VACUUM (ANALYZE)`,
-四个 `insert_*.sql` 末尾是四表列表的 `ANALYZE`,而它们都在 `\set ON_ERROR_STOP on` 之下--
-不认就是脚本直接失败.
-
-- **要点**:本版**没有统计信息**(基数估算与代价模型还是 3.4 的待办),所以这一版只能
-  "接受,什么也不做";但要**明确写清是空转**,别让"`ANALYZE` 跑过了"被读成"有统计信息了".
-  将来 3.4 落地时,同一个入口用来收真实统计.变体要一起收:`VACUUM` / `VACUUM ANALYZE` /
-  `VACUUM (ANALYZE)`(以及 `(VERBOSE)` 之类的选项列表),`ANALYZE [VERBOSE]`,多表列表.
-- **量级**:半天.
-- **验收**:两条语句在脚本里不报错,且"加它 / 不加它"的查询结果逐行相同;
-  `src/ir/AGENTS.md` 或 `src/cmd/AGENTS.md` 里写着它是空转.
-
-## 8.4 [易] `||` 字符串连接
-
-**缺在哪**:`binop_of`(`src/ir/irgen.rs` 的运算符表,`+ - * / = <> < <= > >=` 与
-`LIKE` 族都在)里没有 `||`,实测 `unsupported: 运算符 '||'`.用到它的有两处:
-`update_*.sql` 的 `title_crew` 那一句 `writers = COALESCE(writers, '') || ','`
-(每批一条 UPDATE,四个规模都跑),以及 `tests.sql` 的 Test 11.1 / 11.3(`'(' || ... || ')'`).
-
-- **要点**:加一个 `BinOp::Concat`,结果类型 TEXT.非文本的一侧**不隐式转文本**
-  (PostgreSQL 里 `1 || 'a'` 同样要显式 cast,口径一致);任一侧是 NULL,结果就是 NULL.
-- **量级**:半天.
-- **验收**:`'a' || 'b'` = `ab`,`NULL || 'a'` = NULL,`'a' || NULL` = NULL;
-  `update_1k.sql` 与 `tests.sql` 的 11.1 / 11.3 通过.
-
-## 8.5 [中] `COALESCE(...)`
-
-**缺在哪**:标量函数分派(`src/ir/irgen.rs` 的 `round` / `upper` / `length` / `left` /
-`concat_ws` / `extract` 那一串)里没有它,实测 `unsupported: 这种表达式`.
-有意思的是 `opt/mod.rs` 那份"非严格函数"名单里**已经写着** `coalesce`--优化器这一层
-知道它,只是降级这一层没实现.用到它的:`update_*.sql` 的 `COALESCE(writers, '')`,
-以及 `tests.sql` 的 Test 14.3(`SELECT COALESCE(genres, '(none)') ... GROUP BY COALESCE(genres, '(none)')`).
-
-- **要点**:变参,逐个求值,取第一个非 NULL;全 NULL 得 NULL.
-  求值必须**惰性**(后面的参数只在前面都是 NULL 时才求值),否则 `COALESCE(x, 1/0)`
-  会冒出不该有的错--这与已经落地的 `CASE` / `AND` / `OR` 惰性是同一条口径,
-  做法也照抄(自足子程序 + `Step`,见 `ir/expr.rs`).
-  另外 Test 14.3 要的是"**表达式当分组键**"(`GROUP BY COALESCE(...)`),与 9.5 的
-  `GROUP BY start_year / 10` 是同一条路,实现时要确认它真能落进分组键,而不只是投影.
-- **量级**:一天.
-- **验收**:`COALESCE(NULL, 'a')` = `a`,`COALESCE(NULL, NULL)` = NULL,
-  `COALESCE(1, 1/0)` 不报错;`tests.sql` 的 14.3 通过;`tests/ir_lazy.rs` 加一条惰性用例.
-
-## 8.6 [易] `LOWER()` 与"数值 → 文本"的 `CAST`
-
-**缺在哪**:两处独立的小缺,各一条实测:
-`LOWER` → `unsupported: 函数 'lower'`(而 `upper` / `length` / `left` 都已经有了,
-只差这一个);`CAST(start_year AS TEXT)` → `不能把 INT 转成 TEXT`
-(`ir/expr.rs` 的 `cast_type` / `cast_value` 的类型表里没有"数值 → 文本").
-用到它的:`tests.sql` Test 11.4(`LOWER`),Test 11.1 / 11.3(`'(' || CAST(b.start_year AS TEXT) || ')'`).
-
-- **要点**:`LOWER` 照 `upper` 抄一份(只动 `ScalarFunc`,一个分派分支与文案表).
-  `CAST` 这边是**类型系统**的事:给 `cast_type` / `cast_value` 加上
-  INT / NUMERIC / DATE → TEXT,呈现必须与渲染那一套**逐字相同**(别写出第二种数字格式:
-  Test 11.1 期望的是 `(1994)` 这种没有多余小数的样子).顺手核一遍反向(文本 → 数值)
-  是否已有,口径与 PostgreSQL 是否一致.
-- **量级**:半天到一天.
-- **验收**:`lower('AbC')` = `abc`;`CAST(1994 AS TEXT)` = `1994`;
-  `CAST(9.5 AS TEXT)` 与 `SELECT 9.5` 的呈现逐字相同;
-  `tests.sql` 的 11.1 / 11.3 / 11.4 通过.
 
 ## 8.7 [中] 主键 / UNIQUE 要自动建唯一索引(全量停在第 52 条的真原因)
 
@@ -817,41 +747,9 @@ id = 5` 今天**永远全表扫**--哪怕 `id` 上有索引.
   阶段 7 要解决的是"库比内存大",不是"这个库".
 - **量级**:一到两天的跑批与记录(不加功能).
 - **验收**:`init.sql` 末尾的四条自检行数是 499999 / 499999 / 499999 / 270675;
-  `tests.sql` 72 条零失败;三个 `*_timing.txt` 都能喂进 `summarize.py`(写基准那两份要先
-  过 8.9);本文档顶部的"当前基线"里多出这一组数字.
-
-## 8.9 [中] 写基准的耗时也要能被 `summarize.py` 认出来
-
-**先说结论:查询基准那边**已经**通了,不用改.**`summarize.py` 的两条关键正则都是 psql 口径
-(`^Time:\s*([\d.]+)\s*ms` 与 `Test \S+`,前者正是 `en.yml` 的 `cmd.engine.016` 写的
-`"Time: %{arg0} ms\n"`),而 `ydbms-test/ydbms.sh` 与 `ydbms-test/ysql_login.sh` 都默认
-`export YDBMS_LANG=en`--**改语言就够了**.实测:拿一个装好 3512 行样本的库跑
-`script/tests.sql`,输出直接喂 `summarize.py`,得到 56 条带正确测试名的条目
-(`Test 1.1: Dump the title_basics table (499999 rows, 72 MB)` ...),与 `test_summary.json`
-同构.所以这一项**不含**"改 `\timing` 的格式",那条路是多余的.
-
-**缺在哪(只剩写基准)**:`insert_*.sql` / `update_*.sql` 那边,`summarize.py` 认"写了多少行"
-靠一条**单独成行**的 `^(?:INSERT 0|UPDATE) (\d+)$`,认提交耗时靠一行裸的 `COMMIT`
-(`parse_writes` 与 `main` 的 `verb` 判定都依赖它们).而 `ysql` 这两样都不打:裸 `COMMIT`
-从来不回显,状态行只在 `\set VERBOSE on` 时才有,形状还是
-`[1] INSERT INTO ... -> Inserted 1 row(s) into imdb.title_ratings`.实测把
-`script/insert_1k.sql` 的输出喂进去,得到的是一句 `0 个条目`(`[]`).
-
-- **要点**:两条路选一条,别两边都改.
-  **(a)** 让 `ysql` 在写语句后打 psql 的两行 tag(`INSERT 0 1000` / `UPDATE 1000`)与裸
-  `COMMIT`.要顺带定一件事:现在 `VERBOSE` 管的是那套**人类可读**的状态行
-  (`Inserted 1 row(s) into ...`),而 psql 的 tag 是**机器可读的协议**--
-  是让它跟着 `VERBOSE` 一起出,还是另给一个只认 tag 的开关,得先定下来.
-  另外 psql 的 tag 是**协议不是文案**,不受"文案一律走 `tr!`"约束,
-  这一点要在 AGENTS.md 里写明,免得后来者"顺手"把它翻译了.
-  **(b)** 给 `summarize.py` 加一条 ydbms 口径的解析(它是个独立小工具,
-  改它一行都不动引擎,但改的是**三库共用**的汇总器,要在它的文件头写清两套口径).
-  从"不动用户可感知的输出"这个角度看,(b)更省事.
-- **量级**:半天.
-- **验收**:把 `script/insert_1k.sql` 与任一 `script/update_*.sql` 的输出喂给
-  `summarize.py`,得到 `INSERT 1k name_basics (...)`, `... ALL`, `... COMMIT` 这类条目
-  (注入的行数取语句真报的数);同时把"`tests.sql` 那条**现在就已经通**"也写成一条断言,
-  免得以后被当成还没做.
+  `tests.sql` 72 条零失败;三个 `*_timing.txt` 都能喂进 `summarize.py`(查询基准那份与
+  写基准那两份**都已经能喂**--写基准靠 8.9 补的命令标签);本文档顶部的"当前基线"
+  里多出这一组数字.
 
 # 附:外部依赖备忘
 
