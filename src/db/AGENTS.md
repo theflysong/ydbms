@@ -41,17 +41,22 @@
 - **`ir` 那一层**:`CHECK`(`ir/checks.rs` 的 `CheckedTable` 装饰器)与 `DEFAULT`
   (`ir/irgen.rs` 在 INSERT 缺列时补).它们要 `Prog`,而 `db` 不认识 IR.
 
-### 撤销记录:`Table::snapshot` 与 `Table::truncate_to`
+### 撤销记录:`Table::truncate_to` 与 `Table::update_row`
 
-事务回滚要一份"改之前的表",所以 trait 上有两条口子(TODO 3.17):
+事务回滚要能把表恢复到事务开始时的样子,所以 trait 上有两条口子(TODO 3.17 与 7.6):
 
-- `snapshot()` -- **整表克隆**,给"原地改写"的语句(`UPDATE`)与删表的路径用.
-  物理表与带 `CHECK` 的表都覆盖成 `clone`,其余实现走默认(按形状与逐行 `row`
-  物化).**默认实现会把装饰丢掉**:`CheckedTable` 若走默认,回滚之后那张表就不再
-  强制 `CHECK` 了--**新的装饰器实现必须覆盖 `snapshot`**;
 - `truncate_to(n)` -- **截断到前 n 行**,给"纯追加"的语句(`INSERT` / `COPY`)用:
   追加式写的撤销记录只需要"回到原来的行数",表里的值**一个都不用复制**.默认实现
-  是"从尾部逐行 `delete`",物理表与 `CheckedTable` 覆盖成一次做完.
+  是"从尾部逐行 `delete`",物理表与 `CheckedTable` 覆盖成一次做完;
+- `update_row(r, row)` -- 一整行替换第 `r` 行,`UPDATE` 的落库口.按行回滚时它被
+  **反向**用一次(把记下来的旧行写回第 `r` 行),所以**能 `update_row` 的表必须
+  收得下它自己原来的那一行**--收不下就是 `ir.symbol.005`(回滚时炸掉,而不是留一张
+  没回滚掉的表).
+
+> `Table::snapshot`(**整表克隆**)现在**不再被事务调用**了:改 1 行也复制整张表
+> 是 O(表) 的常数开销(实测 50 万行的表上 230 ms),7.6 之后按行记就够了.这个
+> 方法留在 trait 上给"要一份整表副本"的地方用(`CheckedTable` 仍然必须覆盖它:
+> 默认实现物化出来的是一张 `PhysTab`,会把 `CHECK` 这层装饰丢掉).
 
 默认实现存在的唯一理由是让只读的虚表(测试里的计数表之类)不用为它们做任何事;
 **能 `insert` 的表也该覆盖 `truncate_to`**,否则回滚追加时只能报错(`ir.symbol.004`).

@@ -148,7 +148,8 @@ impl Table for CheckedTable {
     }
 
     /// 快照必须把 `CHECK` 一起带走:默认实现物化成一张 `PhysTab`,
-    /// 那样回滚之后的表就不再强制约束了.
+    /// 那样拿到的副本就不再强制约束了(事务的撤销记录不再用整表快照,TODO 7.6;
+    /// 这条口径留给"真要一份副本"的地方).
     fn snapshot(&self) -> Box<dyn Table> {
         Box::new(self.clone())
     }

@@ -1627,8 +1627,8 @@ pub trait Table: TabShape {
     /// 把表**截断到前 `n` 行**;`n` 不小于现在的行数就什么都不做.
     ///
     /// 只有**追加式写的撤销记录**用它(TODO 3.17):`INSERT` / `COPY` 只往表尾追加,
-    /// 所以事务回滚只需要"把表截回原来的 N 行",一个值都不用复制.`UPDATE` 是原地
-    /// 改写,它那条撤销记录仍然是一份整表克隆([`Table::snapshot`]).
+    /// 所以事务回滚只需要"把表截回原来的 N 行",一个值都不用复制.`UPDATE` 那条按行
+    /// 记的撤销记录走 [`update_row`](Table::update_row)(把旧行写回去).
     ///
     /// 默认实现是"从尾部逐行 [`delete`](Table::delete)":对覆盖了 `delete` 的表都
     /// 成立,物理表(与装饰它的 `CheckedTable`)覆盖成一次做完.只读表在 `delete`
@@ -1641,13 +1641,16 @@ pub trait Table: TabShape {
         Ok(())
     }
 
-    /// 深拷贝一份完整的自己 -- 事务回滚用的**整表快照**(见
-    /// [`SymbolTable`](crate::ir::SymbolTable) 的撤销记录).
+    /// 深拷贝一份完整的自己 -- **整表快照**.
     ///
     /// 默认实现按形状与逐行 [`row`](Table::row) 物化成一张 [`PhysTab`],所以只读的
     /// 虚表不用为它做任何事.**带装饰的实现必须覆盖它**:物化会把装饰丢掉
-    /// (`ir/checks.rs` 的 `CheckedTable` 就覆盖成克隆自己,否则回滚之后的表
-    /// 就不再强制 `CHECK` 了).
+    /// (`ir/checks.rs` 的 `CheckedTable` 就覆盖成克隆自己,否则拿到的副本就不再
+    /// 强制 `CHECK` 了).
+    ///
+    /// > **事务不再用它**(TODO 7.6):`UPDATE` 的撤销记录按行记
+    /// > (`SymbolTable::update_row`),删表把整张表搬进撤销记录--两条路都不需要
+    /// > 整表克隆.这个方法留在 trait 上给"真要一份整表副本"的地方用.
     fn snapshot(&self) -> Box<dyn Table> {
         let shape = ColumnsShape::new(self.columns().to_vec());
         let mut copy = PhysTab::new(self.name(), &shape);

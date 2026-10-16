@@ -587,6 +587,7 @@ ir.symbol.001: "事务快照丢了表 `%{arg0}`(有删除路径漏了快照)"
 ir.symbol.002: "DROP SCHEMA %{arg0}(名下还有 %{arg1} 张表,%{arg2} 条索引,请写 CASCADE;本版不做依赖检查)"
 ir.symbol.003: "DROP INDEX %{arg0}(它是 PRIMARY KEY 那条约束的索引,本版没有 `ALTER TABLE ... DROP CONSTRAINT`,删不掉)"
 ir.symbol.004: "回滚时截断不了表 `%{arg0}`:追加式的撤销记录要用 `Table::truncate_to`,它报了 %{arg1}(能 `insert` 的表必须也覆盖 `truncate_to`)"
+ir.symbol.005: "回滚时写不回表 `%{arg0}` 的第 %{arg1} 行:按行的撤销记录要用 `Table::update_row`,它报了 %{arg2}(能 `update_row` 的表必须收得下它自己原来的那一行)"
 
 # ---- src/main.rs ----
 main.001: "错误:%{e}"

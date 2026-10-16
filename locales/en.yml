@@ -588,6 +588,7 @@ ir.symbol.001: "the transaction snapshot lost table `%{arg0}` (a drop path misse
 ir.symbol.002: "DROP SCHEMA %{arg0} (it still has %{arg1} table(s) and %{arg2} index(es), please write CASCADE; this version does no dependency checking)"
 ir.symbol.003: "DROP INDEX %{arg0} (it is the index of the PRIMARY KEY constraint, and this version has no `ALTER TABLE ... DROP CONSTRAINT` to drop it with)"
 ir.symbol.004: "cannot truncate table `%{arg0}` while rolling back: the append-only undo record needs `Table::truncate_to`, which reported %{arg1} (a table that can `insert` must override `truncate_to` too)"
+ir.symbol.005: "cannot restore row %{arg1} of table `%{arg0}` while rolling back: the row-level undo record needs `Table::update_row`, which reported %{arg2} (a table that can `update_row` must accept its own previous row)"
 
 # ---- src/main.rs ----
 main.001: "Error: %{e}"

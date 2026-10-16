@@ -1268,27 +1268,17 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
                 false => Vec::new(),
             };
 
-            // ---- 逐行改:一次拿到可变句柄,整段改完再还回去
-            //      (每一行都解一次名同样是白干,TODO 3.15)
+            // ---- 逐行改:`SymbolTable::update_row` 是唯一的落库口,它把这一行的
+            //      **旧值**记进事务的撤销记录(TODO 7.6)之后,再把由旧值算出来的
+            //      新行落库.改哪几行就留哪几行的旧值,不再克隆整张表.
             let mut updated = 0usize;
-            {
-                let relation = symbols.relation_mut(&effective).ok_or_else(|| {
-                    DbError::UnknownSymbol {
-                        name: table.clone(),
-                    }
-                })?;
-
-                for r in hits {
-                    // 读旧行:所有 `SET` 表达式都在它上面求值.只有命中的行才克隆.
-                    let row = relation.row(r).ok_or_else(|| DbError::IrRuntime {
-                        node: None,
-                        message: format!("{}", tr!("ir.stmt.006", arg0 = table, arg1 = r)),
-                    })?;
-
-                    let mut new_row = row.clone();
+            for r in hits {
+                symbols.update_row(&effective, r, |old| {
+                    // 所有 `SET` 表达式都在**旧行**上求值(与 PostgreSQL 一致)
+                    let mut new_row = old.clone();
                     for (index, prog) in sets {
                         let value = prog
-                            .eval(&row)
+                            .eval(old)
                             .map_err(|e| e.into_db_error(None))?
                             .to_value()
                             .ok_or_else(|| DbError::IrRuntime {
@@ -1297,12 +1287,11 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
                             })?;
                         new_row[*index] = coerce_to_column(value, &columns[*index].ty);
                     }
-
                     // 整行一次落库:`Table::update_row` 管 typmod / NOT NULL,
                     // `CheckedTable` 管 CHECK -- 约束看到的是**最终**那一行
-                    relation.update_row(r, new_row)?;
-                    updated += 1;
-                }
+                    Ok(new_row)
+                })?;
+                updated += 1;
             }
 
             // 唯一性**现在**查(主键,TODO 8.7):写到的那几列上的索引刚刚作废,而

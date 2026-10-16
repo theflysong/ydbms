@@ -23,14 +23,15 @@
 //! 持有 `Box<dyn Table>`),有哪些符号,索引,schema 名,`search_path`.四条口径:
 //!
 //! * **目录快照**在事务开始时取一份(只有名字,**不含数据**,所以是廉价的);
-//! * **表的撤销记录按需**,而且按**写的方式**分两种(TODO 3.17):
+//! * **表的撤销记录按需**,而且按**写的方式**分两种(TODO 3.17 与 7.6):
 //!   [`relation_append`](SymbolTable::relation_append)(`INSERT` / `COPY`)只记下
 //!   "第一次追加之前的行数"--撤销是截断,表里的值一个都不复制;
-//!   [`relation_mut`](SymbolTable::relation_mut)(`UPDATE`,以及删表的路径)记一份
-//!   整表克隆([`Table::snapshot`]).两种可以叠在同一张表上,撤销时"先恢复克隆,
-//!   再截断";
-//! * **任何会改数据或删符号的路径都必须先记一笔**(`relation_mut` /
-//!   `relation_append` / `drop_schema` 是仅有的三处),否则回滚会静默丢表;
+//!   [`update_row`](SymbolTable::update_row)(`UPDATE`)按**行**记:改哪一行就存哪
+//!   一行改之前的样子(整表克隆的年代改 1 行也要复制整张表,500k 行的表上是
+//!   230 ms);`drop_schema` 更省--它把整张表**搬**进撤销记录,一个值都不复制.
+//!   两种按行的记录可以叠在同一张表上,撤销时"先写回旧值,再截断追加";
+//! * **任何会改数据或删符号的路径都必须先记一笔**(`relation_append` /
+//!   `update_row` / `drop_schema` 是仅有的三处),否则回滚会静默丢表;
 //! * **回滚之后必须把所有索引槽作废**(行号可能变了,留着就是拿旧行号回答新键).
 
 use std::collections::BTreeMap;
@@ -38,7 +39,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::db::index::IndexSlot;
-use crate::db::table::{Column, DbError, Result, Row, Table, Value};
+use crate::db::phys::PhysTab;
+use crate::db::table::{Column, ColumnsShape, DbError, Result, Row, Table, Value};
 
 /// 目录里的一条索引:`CREATE INDEX name ON table (column)`.
 ///
@@ -243,31 +245,26 @@ struct Tx {
 
 /// 一张表的撤销记录.
 ///
-/// 两种形态,按**写的方式**分(见 [`Write`]),同一张表可能两种都有:
+/// 三种形态,同一张表可能**叠**着好几种:
 ///
 /// * **纯追加**(`INSERT` / `COPY`):只记下"事务里第一次追加之前的行数",
 ///   撤销 = 截断回去--表里的值一个都不用复制(TODO 3.17);
-/// * **原地改写**(`UPDATE`,以及 `DROP SCHEMA` 那种整张表要回来的):只能整表克隆
-///   一份(`UPDATE` 改的是已有行的内容,要盖回去就得有那份老数据).
+/// * **按行改写**(`UPDATE`,TODO 7.6):改哪一行就存哪一行**改之前**的样子,
+///   撤销 = 逐行写回.同一个行号只记第一次(要盖回去的是最早那份);
+/// * **整张表搬走**(`DROP SCHEMA ... CASCADE`):表是**移**进这里来的,不是克隆
+///   --回滚时移回去,一个值都不复制.
 ///
-/// 先追加后改写(`BEGIN; INSERT; UPDATE; ROLLBACK;`)时两种会**叠**在一起:
-/// 撤销的顺序是"先恢复整表克隆,再截断到追加前的行数"--克隆那一份是"改写之前"
-/// 的状态(里面已经含了先前追加的那些行),截断再把它们去掉,一步都不多余.
+/// 先追加后改写(`BEGIN; INSERT; UPDATE; ROLLBACK;`)时前两种会叠在一起:撤销的
+/// 顺序是"先写回旧值,再截断到追加前的行数"--被追加的那些行本来就在截断的范围里,
+/// 写回它们再截掉,一步都不多余.
 #[derive(Default)]
 struct UndoTable {
     /// 纯追加:事务里**第一次**追加之前的行数.
     appended: Option<usize>,
-    /// 有过原地改写时的整表克隆.
-    full: Option<Box<dyn Table>>,
-}
-
-/// 一次写入是**追加**还是**原地改写**:撤销记录的形态按它分(见 [`UndoTable`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Write {
-    /// 只往表尾加行(`INSERT` / `COPY`).
-    Append,
-    /// 改已有行的内容,或者整张表要能回来(`UPDATE` / `DROP SCHEMA ... CASCADE`).
-    InPlace,
+    /// 原地改写:行号 → 改之前的那一行.
+    rows: BTreeMap<usize, Row>,
+    /// 整张表(连带它的形状与装饰)从符号表里搬出来的那一份.
+    owned: Option<Box<dyn Table>>,
 }
 
 impl fmt::Debug for Tx {
@@ -278,10 +275,13 @@ impl fmt::Debug for Tx {
             .tables
             .iter()
             .map(|(name, undo)| {
-                // 名字是给读日志的人看的:用 `clone` / `truncate` 这两个标识符,
-                // 不要写文案(文案一律走 `tr!`,见 `src/i18n.rs`)
-                let shape = match &undo.full {
-                    Some(table) => format!("clone({})", table.nrows()),
+                // 名字是给读日志的人看的:用 `rows` / `truncate` / `owned` 这几个
+                // 标识符,不要写文案(文案一律走 `tr!`,见 `src/i18n.rs`)
+                let shape = match &undo.owned {
+                    Some(table) => format!("owned({})", table.nrows()),
+                    None if !undo.rows.is_empty() => {
+                        format!("rows({})", undo.rows.len())
+                    }
                     None => format!("truncate({})", undo.appended.unwrap_or(0)),
                 };
                 (name.as_str(), shape)
@@ -296,8 +296,8 @@ impl fmt::Debug for Tx {
 
 /// 事务开始时的目录:符号(只有名字),索引,schema 名,`search_path`,当前角色.
 ///
-/// **数据不在里面**--它按需记一笔(整表克隆,或者"截断回 N 行");见
-/// [`SymbolTable::snapshot_before_write`].
+/// **数据不在里面**--它按需记一笔(改过的那几行,或者"截断回 N 行");见
+/// [`SymbolTable::note_append`] 与 [`SymbolTable::update_row`].
 struct CatalogSnapshot {
     symbols: Vec<SnapEntry>,
     indexes: Vec<IndexSymbol>,
@@ -409,32 +409,82 @@ impl SymbolTable {
         })
     }
 
-    /// 名字 → **可变**的表句柄(穿透别名).
-    ///
-    /// `INSERT` 要改表内容,而 [`relation`](SymbolTable::relation) 是只读的.
-    /// 实现上分两步:先用只读借用解出下标,再按下标取 `&mut`--这也是为什么
-    /// 别名穿透要有一个返回下标的版本.
-    ///
-    /// **这是数据唯一的写入口**,所以事务的整表快照也挂在这里:事务里第一次要写
-    /// 这张表时先克隆一份(见私有的 `snapshot_before_write`).
-    pub fn relation_mut(&mut self, name: &str) -> Option<&mut Box<dyn Table>> {
-        let index = self.resolve_index(name)?;
-        self.snapshot_before_write(index, Write::InPlace);
-        self.write_handle(index)
-    }
-
     /// 名字 → **可变**的表句柄,并且按**纯追加**记撤销记录(`INSERT` / `COPY` 用).
     ///
-    /// 与 [`relation_mut`](SymbolTable::relation_mut) 只差撤销记录的形态:追加
-    /// 只往表尾加行,所以撤销只需要"把表截断回原来的 N 行"(TODO 3.17)--
+    /// 追加只往表尾加行,所以撤销只需要"把表截断回原来的 N 行"(TODO 3.17)--
     /// 一个值都不复制,大表也一样便宜.
+    ///
+    /// `UPDATE` **不走这里**:它改的是已有行的内容,那种撤销记录得**按行**记
+    /// ([`update_row`](SymbolTable::update_row),TODO 7.6).
     pub fn relation_append(&mut self, name: &str) -> Option<&mut Box<dyn Table>> {
         let index = self.resolve_index(name)?;
-        self.snapshot_before_write(index, Write::Append);
+        self.note_append(index);
         self.write_handle(index)
     }
 
-    /// 按符号下标取可变句柄(两个写入口共用).
+    /// 改第 `r` 行 -- `UPDATE` 的落库口,而且**顺带把这一行的旧值记进撤销记录**
+    /// (TODO 7.6).
+    ///
+    /// 老做法在第一次写某张表时克隆整张表(`Table::snapshot`):改 1 行也要复制
+    /// 全部数据,50 万行的表上是 230 ms,而且改的行越少越亏.现在按行记:改哪几行
+    /// 就留哪几行的旧值,`ROLLBACK` 逐行写回.
+    ///
+    /// **新行由 `f` 从旧行算出来**:新行要在**改之前**的那一行上求值(`SET a = a + 1`
+    /// 里的 `a` 是老值),而旧值正是这里要记下来的东西--所以让调用方拿着它算,
+    /// 一次读取就够(各读一遍就是两倍的整行克隆,而这一条是逐行跑的热路径).
+    /// 旧值**先记后写**:`f` 报错时这一行还没被动过,记录里多一份原样的值无害.
+    ///
+    /// **同一个行号只记第一次**:要盖回去的是这一行最早的样子的.
+    ///
+    /// 没在事务里(手写调用)就不记--那时也没有回滚这回事.
+    pub fn update_row<F>(&mut self, table: &str, r: usize, f: F) -> Result<()>
+    where
+        F: FnOnce(&Row) -> Result<Row>,
+    {
+        let index = self
+            .resolve_index(table)
+            .ok_or_else(|| DbError::UnknownSymbol {
+                name: table.to_string(),
+            })?;
+        let name = match self.symbols.get(index) {
+            Some(Symbol::Relation { name, .. }) => name.clone(),
+            // `resolve_index` 只给关系符号,这里到不了
+            _ => return Err(DbError::UnknownSymbol { name: table.to_string() }),
+        };
+
+        // 旧值(**改之前**的那一行):表上读一次,读不到就是行号越界
+        let old = match self.symbols.get(index) {
+            Some(Symbol::Relation { table, .. }) => table.row(r),
+            _ => None,
+        }
+        .ok_or(DbError::RowOutOfBounds {
+            index: r,
+            nrows: self.symbols.get(index).map_or(0, |symbol| match symbol {
+                Symbol::Relation { table, .. } => table.nrows(),
+                Symbol::Alias { .. } => 0,
+            }),
+        })?;
+
+        // 新行在旧行上求值(调用方拿的是借来的旧值,不必再克隆一遍)
+        let new_row = f(&old)?;
+
+        if let Some(tx) = self.tx.as_mut() {
+            tx.tables
+                .entry(name)
+                .or_default()
+                .rows
+                .entry(r)
+                .or_insert(old);
+        }
+
+        self.write_handle(index)
+            .ok_or_else(|| DbError::UnknownSymbol {
+                name: table.to_string(),
+            })?
+            .update_row(r, new_row)
+    }
+
+    /// 按符号下标取可变句柄(几个写入口共用).
     fn write_handle(&mut self, index: usize) -> Option<&mut Box<dyn Table>> {
         match self.symbols.get_mut(index)? {
             Symbol::Relation { table, .. } => Some(table),
@@ -575,55 +625,66 @@ impl SymbolTable {
         }
     }
 
-    /// 事务里**第一次**要改(或要删)第 `index` 个符号的表之前,记一条撤销记录.
+    /// 事务里**第一次**要往第 `index` 个符号的表尾追加之前,记一条撤销记录.
     ///
-    /// 任何"会改数据 / 会删符号"的路径都必须先调它:[`relation_mut`](SymbolTable::relation_mut)
-    /// (原地改写),`relation_append`(`INSERT` / `COPY`),以及
-    /// `drop_schema`(符号连同数据一起消失).键用**符号自己的名字**:回滚按目录
-    /// 快照重建,对的就是这个名字.
+    /// `relation_append`(`INSERT` / `COPY`)走它:记的只是"第一次追加之前的行数",
+    /// 撤销 = 截断回去(见 [`UndoTable::appended`]).第二次追加不必再记--那个行数
+    /// 还是同一个.键用**符号自己的名字**:回滚按目录快照重建,对的就是这个名字.
     ///
-    /// 记什么是 `write` 说了算(见 [`UndoTable`]):追加只记行数,原地改写整表克隆.
-    /// 两种可以叠在同一张表上,已经记过的部分不重记--**已经克隆过的那一份才是
-    /// 要盖回去的**,再克隆一次就把它覆盖成"改过一半"的那份了.
-    fn snapshot_before_write(&mut self, index: usize, write: Write) {
+    /// 别的写路径不从这里走:`UPDATE` 按行记
+    /// ([`update_row`](SymbolTable::update_row)),删表把整张表搬走
+    /// (`drop_schema`,见 [`SymbolTable::take_for_undo`]).
+    fn note_append(&mut self, index: usize) {
         let name = match self.symbols.get(index) {
             Some(Symbol::Relation { name, .. }) => name.clone(),
             // 别名:数据在它指向的关系符号上,那个符号自己会被钩子照到
             _ => return,
         };
-
-        // 不在事务里,或者该记的都记过了:都不用再动
-        match self.tx.as_ref().and_then(|tx| tx.tables.get(&name)) {
-            Some(undo) if undo.full.is_some() => return,
-            // `appended` 记的是**第一次**追加之前的行数,第二次追加不必再记
-            Some(undo) if undo.appended.is_some() && write == Write::Append => return,
-            _ => {}
-        }
-
-        let (full, appended) = match self.symbols.get(index) {
-            Some(Symbol::Relation { table, .. }) => match write {
-                Write::Append => (None, Some(table.nrows())),
-                Write::InPlace => (Some(table.snapshot()), None),
-            },
+        let appended = match self.symbols.get(index) {
+            Some(Symbol::Relation { table, .. }) => table.nrows(),
             _ => return,
         };
 
         if let Some(tx) = self.tx.as_mut() {
             let undo = tx.tables.entry(name).or_default();
             if undo.appended.is_none() {
-                undo.appended = appended;
-            }
-            if undo.full.is_none() {
-                undo.full = full;
+                undo.appended = Some(appended);
             }
         }
     }
 
+    /// `DROP SCHEMA ... CASCADE` 的撤销记录:把第 `index` 个符号的表**搬**进
+    /// 事务(不是克隆).
+    ///
+    /// 表马上要从符号表里 `retain` 掉了,那之后内存里就只剩这一份.老做法在这里
+    /// 克隆整张表(`Table::snapshot`),于是"删一个 schema"要先复制它下面所有的
+    /// 数据;搬走一个值都不复制,回滚时再搬回来.
+    fn take_for_undo(&mut self, index: usize) {
+        let Some(tx) = self.tx.as_mut() else {
+            return;
+        };
+        let Some(Symbol::Relation { name, table }) = self.symbols.get_mut(index) else {
+            return;
+        };
+
+        let undo = tx.tables.entry(name.clone()).or_default();
+        // 已经搬过就不再搬第二回(同一张表在一次事务里被删两次不可能,但这里要幂等)
+        if undo.owned.is_some() {
+            return;
+        }
+        // 形状照旧的那张空表顶上:符号马上要被 `retain` 掉,这个占位没人看得见.
+        // 形状要从被搬走的那张表上取,所以先借它的列定义.
+        let shape = ColumnsShape::new(table.columns().to_vec());
+        let name = table.name().to_string();
+        let placeholder = PhysTab::new(&name, &shape);
+        undo.owned = Some(std::mem::replace(table, Box::new(placeholder)));
+    }
+
     /// 把当前事务的改动全部撤销,并结束这个事务.
     ///
-    /// 做法是"按目录快照重建":符号表整个按事务开始时的样子拼回来--改过 / 删过的
-    /// 表用 undo 里的整表克隆,没动过的用现成的那一份;索引,schema 名,
-    /// `search_path` 直接盖回去.
+    /// 做法是"按目录快照重建":符号表整个按事务开始时的样子拼回来--改过的表按
+    /// 撤销记录逐行写回,被删掉的表**搬**回来,没动过的用现成的那一份;索引,
+    /// schema 名,`search_path` 直接盖回去.
     fn undo(&mut self) {
         let Some(tx) = self.tx.take() else {
             return;
@@ -639,48 +700,45 @@ impl SymbolTable {
 
         // 2) 按快照重建符号表.事务开始时存在的关系,要么没动过(还在 `live` 里),
         //    要么被钩子记过(在 `tx.tables` 里);两边都没有只可能是某条删除路径
-        //    漏了 `snapshot_before_write`--那会让这张表连同数据一起**静默消失**,
-        //    所以这里宁可炸掉.
+        //    漏了记一笔--那会让这张表连同数据一起**静默消失**,所以这里宁可炸掉.
         let mut symbols = Vec::with_capacity(tx.catalog.symbols.len());
         let mut restored = tx.tables;
         for entry in tx.catalog.symbols {
             match entry {
                 SnapEntry::Relation(name) => {
-                    let (mut table, appended) = match restored.remove(&name) {
-                        // 有整表克隆:用它(现成的那一份丢掉)
-                        Some(UndoTable {
-                            full: Some(table),
-                            appended,
-                        }) => {
-                            live.remove(&name);
-                            (table, appended)
-                        }
-                        // 只记过"纯追加":表还是现成那一份,截断就行
-                        Some(UndoTable {
-                            full: None,
-                            appended,
-                        }) => (
-                            live.remove(&name).unwrap_or_else(|| {
-                                panic!("{}", tr!("ir.symbol.001", arg0 = name))
-                            }),
-                            appended,
-                        ),
-                        None => (
-                            live.remove(&name).unwrap_or_else(|| {
-                                panic!("{}", tr!("ir.symbol.001", arg0 = name))
-                            }),
-                            None,
-                        ),
+                    let mut undo = restored.remove(&name);
+
+                    // 表的数据在哪儿:被 `DROP SCHEMA ... CASCADE` **搬**进撤销记录
+                    // 了(`owned`),还是仍在 `live` 里(搬走时留下的空壳不再有人要)
+                    let owned = undo.as_mut().and_then(|undo| undo.owned.take());
+                    let mut table = match owned {
+                        Some(table) => table,
+                        None => live.remove(&name).unwrap_or_else(|| {
+                            panic!("{}", tr!("ir.symbol.001", arg0 = name))
+                        }),
                     };
 
-                    // 追加式的撤销记录:截断回事务里第一次追加之前的行数
-                    // (表里的值一个都不用复制,TODO 3.17)
-                    if let Some(rows) = appended {
-                        if let Err(error) = table.truncate_to(rows) {
-                            // 截断不了就没有第二份数据可以拿出来盖:这是**实现坏了**
-                            // (能 `insert` 的表必须覆盖 `truncate_to`),宁可炸掉也
-                            // 不留给用户一张没回滚掉的表.
-                            panic!("{}", tr!("ir.symbol.004", arg0 = name, arg1 = error));
+                    // 先按行写回旧值,再截断掉追加的那些行--两种记录可以叠在同一张
+                    // 表上(`BEGIN; INSERT; UPDATE; ROLLBACK;`),而被追加的行本来
+                    // 就在截断的范围里.
+                    if let Some(undo) = undo {
+                        for (r, old) in undo.rows {
+                            // 写不回去就没有第二份数据可以拿出来盖:这是**实现坏了**
+                            // (能 `update_row` 的表必须收得下它自己原来的那一行),
+                            // 宁可炸掉也不留给用户一张没回滚掉的表.
+                            if let Err(error) = table.update_row(r, old) {
+                                panic!("{}", tr!("ir.symbol.005", arg0 = name, arg1 = r, arg2 = error));
+                            }
+                        }
+                        // 追加式的撤销记录:截断回事务里第一次追加之前的行数
+                        // (表里的值一个都不用复制,TODO 3.17)
+                        if let Some(rows) = undo.appended {
+                            if let Err(error) = table.truncate_to(rows) {
+                                // 截断不了就没有第二份数据可以拿出来盖:这是**实现坏了**
+                                // (能 `insert` 的表必须覆盖 `truncate_to`),宁可炸掉也
+                                // 不留给用户一张没回滚掉的表.
+                                panic!("{}", tr!("ir.symbol.004", arg0 = name, arg1 = error));
+                            }
                         }
                     }
 
@@ -1091,8 +1149,9 @@ impl SymbolTable {
             });
         }
 
-        // 要删掉的表先把**数据**克隆进 undo:`retain` 一走,这些表的内存里就再也
-        // 没有第二份了,只回滚目录(留下一个空壳名字)比不实现事务更糟.
+        // 要删掉的表**搬**进 undo:`retain` 一走,这些表的数据就只剩 undo 里那一份
+        // 了(不是克隆--删一个 schema 不该先把它的数据复制一遍).只回滚目录
+        // (留下一个空壳名字)比不实现事务更糟.
         let doomed_slots: Vec<usize> = self
             .symbols
             .iter()
@@ -1101,7 +1160,7 @@ impl SymbolTable {
             .map(|(index, _)| index)
             .collect();
         for index in doomed_slots {
-            self.snapshot_before_write(index, Write::InPlace);
+            self.take_for_undo(index);
         }
 
         self.symbols

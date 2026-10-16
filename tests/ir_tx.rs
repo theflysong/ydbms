@@ -1,10 +1,11 @@
-//! 事务的撤销记录(TODO 3.17):**追加式写**不必克隆整表.
+//! 事务的撤销记录(TODO 3.17 与 7.6):一笔都不必克隆整表.
 //!
 //! `INSERT` / `COPY` 只往表尾加行,所以撤销只需要"把表截断回事务开始时的行数";
-//! `UPDATE` 改的是已有行的内容,它那条撤销记录仍然是一份整表克隆.
+//! `UPDATE` 按**行**记(改哪一行存哪一行),`DROP SCHEMA` 把整张表**搬**进撤销
+//! 记录.三种都不复制整张表.
 //!
-//! 用一张**会数快照**的表看得见这件事:整表克隆走 `Table::snapshot`,追加式的
-//! 记录连一次都不该调它.
+//! 用一张**会数快照**的表看得见这件事:整表克隆走 `Table::snapshot`,这三条路
+//! 连一次都不该调它(改过的那几行是按行记的,也数不出来--那是"账"不是"表").
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -150,20 +151,36 @@ fn a_committed_insert_keeps_its_rows() {
 }
 
 #[test]
-fn an_update_still_clones_the_table_and_rolls_back() {
-    let (mut db, snapshots) = counting(5);
+fn an_update_rolls_back_by_the_row_it_touched() {
+    // TODO 7.6:改 1 行只留这 1 行的旧值--不再克隆整张表(1000 行的表上克隆一次
+    // 就是 1000 行的复制,改一行也要付)
+    let (mut db, snapshots) = counting(1000);
 
     ok(&mut db, "BEGIN; UPDATE t SET v = -1 WHERE k = 2; ROLLBACK;");
 
-    assert_eq!(nrows(&db), 5);
+    assert_eq!(nrows(&db), 1000);
     assert_eq!(cell(&db, 2, 1), 20, "改之前的值要回来");
-    assert!(snapshots.get() >= 1, "原地改写要一份整表克隆");
+    assert_eq!(cell(&db, 999, 1), 9990, "没改过的行原样");
+    assert_eq!(snapshots.get(), 0, "按行的撤销记录不该克隆整表");
+}
+
+#[test]
+fn an_update_of_several_rows_rolls_all_of_them_back() {
+    let (mut db, snapshots) = counting(5);
+
+    // 两行一起改:两行都要有旧值(同一个行号只记第一次)
+    ok(&mut db, "BEGIN; UPDATE t SET v = v + 1 WHERE k IN (1, 3); UPDATE t SET v = 0 WHERE k = 1; ROLLBACK;");
+
+    assert_eq!(cell(&db, 1, 1), 10, "先改后改,盖回去的是最早那份");
+    assert_eq!(cell(&db, 3, 1), 30);
+    assert_eq!(cell(&db, 2, 1), 20, "没点到的行不动");
+    assert_eq!(snapshots.get(), 0);
 }
 
 #[test]
 fn an_insert_then_an_update_both_roll_back() {
-    // 两种撤销记录叠在同一张表上:先追加(`appended`),再原地改写(`full`).
-    // 撤销的顺序是"先恢复整表克隆,再截断到追加之前的行数".
+    // 两种撤销记录叠在同一张表上:先追加(`appended`),再按行改(`rows`).
+    // 撤销的顺序是"先按行写回旧值,再截断到追加之前的行数".
     let (mut db, snapshots) = counting(5);
 
     ok(
@@ -176,13 +193,13 @@ fn an_insert_then_an_update_both_roll_back() {
 
     assert_eq!(nrows(&db), 5, "插进去的那一行不该留下");
     assert_eq!(cell(&db, 2, 1), 20, "改过的那一行要回来");
-    assert!(snapshots.get() >= 1, "改写那一步要克隆");
+    assert_eq!(snapshots.get(), 0, "两条路都不克隆整表");
 }
 
 #[test]
 fn an_insert_then_a_drop_schema_rolls_back_to_the_original_rows() {
-    // 反过来叠:`DROP SCHEMA ... CASCADE` 记一份整表克隆(里面已经有刚插的那一行),
-    // 撤销时截断再把它们去掉.
+    // 反过来叠:`DROP SCHEMA ... CASCADE` 把**整张表搬走**(连同刚插进去的那一行),
+    // 撤销时搬回来--一个值都不复制.
     let (mut db, _) = counting(3);
     ok(&mut db, "CREATE SCHEMA s; SET search_path TO s; CREATE TABLE u (k INT, v INT);");
     ok(&mut db, "INSERT INTO u VALUES (1, 10), (2, 20);");
