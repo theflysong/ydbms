@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ydbms::cmd::{Session, Sink};
 use ydbms::db::table::{Column, ColumnsShape, DataType, Table, Value};
 use ydbms::db::PhysTab;
-use ydbms::pers::{CsvPersister, Persister, TableDelta, TablePath};
+use ydbms::pers::heap::encode_row;
+
 use ydbms::usr::service::{Manifest, TableFootprint};
 use ydbms::usr::{ServiceDir, User};
 
@@ -213,7 +214,7 @@ fn tables_written_at_commit_are_loaded_by_the_next_session() {
     } // 会话一放手:单写者锁释放,数据已经在盘上
 
     let lib = dir.path().join("filmdb");
-    assert!(lib.join("movies.csv").is_file());
+    assert!(lib.join("movies.heap").is_file(), "页式堆文件该在(TODO 7.5)");
     assert!(lib.join("movies.schema.json").is_file());
 
     // 另一个会话(另一个进程也是同一条路)把它读回来
@@ -234,10 +235,10 @@ fn tables_written_at_commit_are_loaded_by_the_next_session() {
 }
 
 #[test]
-fn a_long_log_is_compacted_back_into_the_base_file() {
-    // 日志攒过阈值(1 MiB 与基表大小里大的那个)就在**同一次提交**里整理:基表
-    // 重写一遍,日志归零.不整理的话,载入那一步要重放越来越长的日志,而同一个
-    // 行号的旧版本会越攒越多(TODO 7.7).
+fn a_heap_with_too_many_dead_bytes_is_compacted() {
+    // 堆文件是**只追加**的:`UPDATE` 写一条新记录,旧的那条留在文件里变成"死字节"
+    // (TODO 7.5).死字节比活着的还多(而且文件本身够大)时,提交点顺手把整张表按
+    // 当前行目录**密集重写**一遍--不整理的话每一次读都要跨过那些旧版本.
     let dir = TempDir::new("compact");
     let service = dir.service();
     service.create_database("d", "bob").unwrap();
@@ -246,32 +247,36 @@ fn a_long_log_is_compacted_back_into_the_base_file() {
 
     {
         let mut session = open_session(&service, "d", &bob);
-        session.run_script("CREATE TABLE t (x INT, pad TEXT); INSERT INTO t VALUES (0, 'seed');");
-        assert_eq!(session.failed(), 0, "{}", session.messages());
-
-        // 一条事务里追加 600 行,每行 2 KB:日志一次就攒到 1 MiB 以上
+        session.run_script("CREATE TABLE t (x INT, pad TEXT);");
+        // 一次事务灌 2000 行 x 2 KB:堆文件约 4 MB
         let mut script = String::from("BEGIN;\n");
-        for i in 1..=600 {
+        for i in 0..2000 {
             script.push_str(&format!("INSERT INTO t VALUES ({}, '{}');\n", i, "p".repeat(2000)));
         }
         script.push_str("COMMIT;");
         session.run_script(&script);
         assert_eq!(session.failed(), 0, "{}", session.messages());
+
+        // 改两遍:每一遍都给 2000 行写上一条新记录(旧的那条变成死字节)
+        session.run_script("BEGIN; UPDATE t SET pad = pad || 'a'; UPDATE t SET pad = pad || 'b'; COMMIT;");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
     }
 
     let manifest = Manifest::load(&lib).unwrap().expect("提交记录在");
     let footprint = manifest.tables.get("t").copied().expect("t 的位置");
-    assert_eq!(footprint.base, 601, "整理之后的基表带着全部行");
-    assert_eq!(footprint.log, 0, "整理之后日志归零");
-    assert_eq!(
-        std::fs::metadata(lib.join("t.log")).map(|meta| meta.len()).unwrap_or(0),
-        0,
-        "日志要截掉"
+    assert_eq!(footprint.heap_rows, 2000, "行还在");
+    let size = std::fs::metadata(lib.join("t.heap")).unwrap().len();
+    assert!(
+        size < footprint.heap_bytes.max(4 * 1024 * 1024) + 8 * 1024 * 1024,
+        "整理之后文件该明显变小(现在 {size} 字节)"
     );
 
-    // 另一个会话把 601 行读回来(NUL 与转义那条契约照旧)
+    // 另一个会话把 2000 行读回来,每一行的 `pad` 都是最后一次改的样子
     let session = open_session(&service, "d", &bob);
-    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 601);
+    let table = session.symbols().relation("t").unwrap();
+    assert_eq!(table.nrows(), 2000);
+    let pad = table.row(7).unwrap()[1].clone();
+    assert_eq!(pad, Value::Text("p".repeat(2000) + "ab"), "{pad:?}");
 }
 
 #[test]
@@ -309,7 +314,7 @@ fn a_table_dropped_by_drop_schema_cascade_has_its_files_removed() {
             "CREATE SCHEMA study;\nSET search_path TO study;\n\
              CREATE TABLE movies (movie_id INT);\nINSERT INTO movies VALUES (1);",
         );
-        assert!(lib.join("study.movies.csv").is_file(), "建表就该落盘");
+        assert!(lib.join("study.movies.heap").is_file(), "建表就该落盘");
     }
 
     {
@@ -318,7 +323,7 @@ fn a_table_dropped_by_drop_schema_cascade_has_its_files_removed() {
         assert!(session.messages().contains("schema study 已删除"), "{}", session.messages());
     }
 
-    assert!(!lib.join("study.movies.csv").exists(), "表没了,文件也要没");
+    assert!(!lib.join("study.movies.heap").exists(), "表没了,文件也要没");
     assert!(!lib.join("study.movies.schema.json").exists());
 }
 
@@ -340,7 +345,7 @@ fn a_table_created_and_dropped_in_the_same_piece_is_not_an_error() {
     assert!(!session.messages().contains("提交失败"), "{}", session.messages());
 
     let lib = dir.path().join("d");
-    assert!(!lib.join("s.t.csv").exists(), "压根没落盘过");
+    assert!(!lib.join("s.t.heap").exists(), "压根没落盘过");
 
     drop(session); // 放开单写者锁,才轮得到另一个会话打开
     assert!(service.open("d", &bob).expect("再打开").load_tables().unwrap().is_empty());
@@ -360,15 +365,28 @@ fn a_write_is_on_disk_before_the_session_ends() {
     session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (9);");
     assert_eq!(session.failed(), 0, "{}", session.messages());
 
-    // 会话还开着(锁也还握着):直接读盘上的那一对文件
+    // 会话还开着(锁也还握着):盘上的堆文件**已经**长出来了
     //
-    // 注意行在**哪儿**:`CREATE TABLE` 那一次提交把空的基表写下去了,所以 `9` 是
-    // 后来追加进 `<表>.log` 的(TODO 7.7 之后提交不再重写基表).两份文件都要对得上,
-    // 才算"写完就落盘".
-    let csv = std::fs::read_to_string(dir.path().join("d/t.csv")).expect("t.csv 应当已经在盘上");
-    assert!(csv.lines().next().is_some(), "表头要在:{csv}");
-    let log = std::fs::read_to_string(dir.path().join("d/t.log")).expect("t.log 应当已经在盘上");
-    assert!(log.lines().any(|line| line == "A,0,9"), "{log}");
+    // 行不再是 CSV 里的一行,而是堆文件里的一条记录(只追加,TODO 7.5);`9` 落在
+    // `t.heap` 里,同时每个会话都能把它读回来.
+    let heap = std::fs::read(dir.path().join("d/t.heap")).expect("t.heap 应当已经在盘上");
+    assert!(!heap.is_empty(), "堆文件里该有那条记录");
+    let footprint = Manifest::load(&dir.path().join("d"))
+        .unwrap()
+        .unwrap()
+        .tables
+        .get("t")
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(footprint.heap_rows, 1, "提交记录里也要算上这一行");
+
+    drop(session);
+    let session2 = open_session(&service, "d", &bob);
+    assert_eq!(
+        session2.symbols().relation("t").unwrap().row(0).unwrap()[0],
+        Value::Int(9),
+        "另一个会话也要读得到"
+    );
 
     let schema = std::fs::read_to_string(dir.path().join("d/t.schema.json")).unwrap();
     assert!(schema.contains("\"name\": \"t\""), "{schema}");
@@ -399,8 +417,8 @@ fn a_late_search_path_change_does_not_make_commit_save_the_wrong_table() {
     }
 
     let lib = dir.path().join("d");
-    assert!(lib.join("s.t.csv").is_file(), "s.t 没落盘");
-    assert!(lib.join("t.csv").is_file(), "t 没落盘");
+    assert!(lib.join("s.t.heap").is_file(), "s.t 没落盘");
+    assert!(lib.join("t.heap").is_file(), "t 没落盘");
 
     let session = open_session(&service, "d", &bob);
     let s_t = session.symbols().relation("s.t").expect("s.t 回来了");
@@ -447,16 +465,16 @@ fn a_file_stem_that_does_not_match_the_schema_name_is_refused() {
         session.run_script("CREATE TABLE a (x INT); INSERT INTO a VALUES (1);");
     }
 
-    // 手工把 a 的两个文件复制成 b:b.csv 的模式里写的还是表名 a
+    // 手工把 a 的两个文件复制成 b:b 的模式文件里写的还是表名 a
     let lib = dir.path().join("d");
-    std::fs::copy(lib.join("a.csv"), lib.join("b.csv")).unwrap();
+    std::fs::copy(lib.join("a.heap"), lib.join("b.heap")).unwrap();
     std::fs::copy(lib.join("a.schema.json"), lib.join("b.schema.json")).unwrap();
 
-    let err = service
-        .open("d", &bob)
-        .expect("目录还在")
-        .load_tables()
-        .expect_err("主干名与表名对不上就该报错");
+    let db = service.open("d", &bob).expect("目录还在");
+    let err = match db.load_tables() {
+        Ok(tables) => panic!("主干名与表名对不上就该报错(读回来 {} 张表)", tables.len()),
+        Err(e) => e,
+    };
     assert!(err.to_string().contains("主干名"), "{err}");
 }
 
@@ -552,16 +570,6 @@ fn a_memory_session_refuses_database_statements() {
 
 // ------------------------------------------------------------ 事务的落盘点(4.1)
 
-/// 一张只有一列 `x INT` 的表(造"下一次的内容"给崩溃现场用).
-fn table_of(name: &str, rows: &[i32]) -> PhysTab {
-    let shape = ColumnsShape::new(vec![Column::new("x", DataType::Int)]);
-    let mut table = PhysTab::new(name, &shape);
-    for row in rows {
-        table.insert(vec![Value::Int(*row)]).unwrap();
-    }
-    table
-}
-
 #[test]
 fn a_transaction_writes_nothing_before_commit() {
     // 提交点是 `COMMIT`:`BEGIN; ...` 里的语句一句都不落盘
@@ -574,25 +582,29 @@ fn a_transaction_writes_nothing_before_commit() {
     {
         let mut session = open_session(&service, "d", &bob);
 
-        // 事务外:建表当场落盘("写完就落盘")
+        // 事务外:建表当场落盘(建表就是提交,堆文件与模式文件都写出来)
         session.run_script("CREATE TABLE t (x INT);");
         assert_eq!(session.failed(), 0, "{}", session.messages());
-        assert!(lib.join("t.csv").is_file());
+        assert!(lib.join("t.heap").is_file());
+        let empty = std::fs::metadata(lib.join("t.heap")).unwrap().len();
 
-        // 事务里:插行**不**落盘(基表一个字节都不动,日志也不该长大)
+        // 事务里:插行会写进堆文件(追加式写落笔就写),但**提交记录还没算它**--
+        // 所以崩在这一刻,重启之后那一行不算数(见 `pers::heap` 的文件头)
         session.run_script("BEGIN; INSERT INTO t VALUES (1);");
         assert_eq!(session.failed(), 0, "{}", session.messages());
-        let csv = std::fs::read_to_string(lib.join("t.csv")).unwrap();
-        assert!(!csv.lines().any(|line| line == "1"), "事务里不该落盘:{csv}");
-        assert!(!lib.join("t.log").exists(), "事务里日志也不该动");
+        let rows = |lib: &Path| {
+            Manifest::load(lib)
+                .unwrap()
+                .and_then(|manifest| manifest.tables.get("t").copied())
+                .map_or(0, |footprint| footprint.heap_rows)
+        };
+        assert_eq!(rows(&lib), 0, "事务里那几行还没提交");
 
-        // `COMMIT` 一次把改动追加进日志(TODO 7.7:基表不重写)
+        // `COMMIT` 一次把提交记录往前挪
         session.run_script("COMMIT;");
         assert_eq!(session.failed(), 0, "{}", session.messages());
-        let log = std::fs::read_to_string(lib.join("t.log")).unwrap();
-        assert!(log.lines().any(|line| line.starts_with("A,0,")), "{log}");
-        let csv = std::fs::read_to_string(lib.join("t.csv")).unwrap();
-        assert!(!csv.lines().any(|line| line == "1"), "基表没被重写:{csv}");
+        assert_eq!(rows(&lib), 1, "提交之后才算数");
+        assert!(std::fs::metadata(lib.join("t.heap")).unwrap().len() > empty);
     }
 
     // 另一个会话把它读回来
@@ -642,59 +654,72 @@ fn rollback_after_a_transaction_reports_the_table_before_the_transaction() {
 
 // ------------------------------------------------- 提交的原子性与崩溃恢复(4.2)
 
-/// 造一次"提交崩在提交点**之前**"的现场:`t` 的改动已经追加进日志,而提交记录
-/// (每张表写到了哪儿)还没写.
-fn crash_before_the_manifest(dir: &Path) {
-    let persister = CsvPersister::new();
-    let at = TablePath::new(dir, "t");
-
-    // 把第 0 行改成 2(与 `UPDATE t SET x = 2` 等价的那一条日志)
-    let pending = table_of("t", &[2]);
-    let delta = TableDelta {
-        appended_from: None,
-        updated: [0usize].into_iter().collect(),
-    };
-    let committed = Manifest::load_or_empty(dir)
-        .unwrap()
-        .tables
-        .get("t")
-        .map_or(0, |at| at.log);
-    persister.append_delta(&pending, &at, &delta, committed).unwrap();
-    // 提交记录**没写**:日志尾巴不算数
+/// 给 `<库>/<表>.heap` **追加**一条记录(手工造"崩在半路"的现场用).
+///
+/// 与 `HeapTab` 写下去的那一条一模一样:`[len u32][rid u32][行编码]`.
+fn append_heap_record(lib: &Path, table: &str, rid: u32, row: &[Value], columns: &[Column]) {
+    let payload = encode_row(&row.to_vec(), columns).expect("编码");
+    let path = lib.join(format!("{table}.heap"));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("打开堆文件");
+    use std::io::Write as _;
+    file.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+    file.write_all(&rid.to_le_bytes()).unwrap();
+    file.write_all(&payload).unwrap();
 }
 
-/// 造一次"提交崩在提交点**之后**"的现场:提交记录已经写了(所以这次提交必须做完),
-/// 但推广那一半只做了一张表.
-fn crash_after_the_manifest(dir: &Path, promote_t: bool) {
-    let persister = CsvPersister::new();
-    let pending_t = table_of("t", &[2]);
-    let pending_u = table_of("u", &[7]);
+/// 造一次"提交崩在提交点**之前**"的现场:`t` 的改动已经写进堆文件,而提交记录
+/// (每张表写到了哪儿)还没更新.
+fn crash_before_the_manifest(lib: &Path) {
+    let columns = vec![Column::new("x", DataType::Int)];
+    // 第 0 行改成 2:追加一条**同 rid** 的新记录(它落在已提交长度之外)
+    append_heap_record(lib, "t", 0, &[Value::Int(2)], &columns);
+}
 
-    persister
-        .stage(&pending_t, &TablePath::new(dir, "t"))
-        .expect("暂存 t");
-    persister
-        .stage(&pending_u, &TablePath::new(dir, "u"))
-        .expect("暂存 u");
+/// 造一次"提交崩在提交点**之后**"的现场:提交记录里的长度已经跟上了那一条新记录,
+/// 但"要推广的暂存文件"那一半还没做.
+fn crash_after_the_manifest(lib: &Path) {
+    let before = Manifest::load(lib).unwrap().expect("提交记录在");
+    let footprint = before.tables.get("t").copied().unwrap_or_default();
 
-    let mut manifest = Manifest::load_or_empty(dir).unwrap();
+    crash_before_the_manifest(lib);
+    let size = std::fs::metadata(lib.join("t.heap")).unwrap().len();
+
+    let mut manifest = before;
     manifest.tables.insert(
         "t".to_string(),
-        TableFootprint { base: 1, log: 0 },
+        TableFootprint {
+            heap: true,
+            heap_bytes: size,
+            heap_rows: footprint.heap_rows.max(1),
+            moved: footprint.moved,
+        },
     );
-    manifest.tables.insert(
-        "u".to_string(),
-        TableFootprint { base: 1, log: 0 },
-    );
-    manifest.promoted = vec!["t".to_string(), "u".to_string()];
-    manifest.save(dir).expect("写提交记录");
+    manifest.save(lib).expect("写提交记录");
+}
 
-    if promote_t {
-        // 只推广了 `t`(`save` = 暂存 + 推广,结果一样:`t` 的 `.new` 没了)
-        persister
-            .save(&pending_t, &TablePath::new(dir, "t"))
-            .expect("推广 t");
-    }
+/// 造一次"提交记录说该推广,而推广还没做"的现场:`<表>.heap.new` 里是一份**密集的**
+/// 新堆文件(第 0 行是 2),清单里记着要推广它.
+fn crash_with_a_staged_heap(lib: &Path) {
+    let shape = ColumnsShape::new(vec![Column::new("x", DataType::Int)]);
+    let mut pending = PhysTab::new("t", &shape);
+    Table::insert(&mut pending, vec![Value::Int(2)]).unwrap();
+    let bytes = ydbms::pers::heap::HeapTab::write_dense(&lib.join("t.heap"), &pending).unwrap();
+
+    let mut manifest = Manifest::load_or_empty(lib).unwrap();
+    manifest.tables.insert(
+        "t".to_string(),
+        TableFootprint {
+            heap: true,
+            heap_bytes: bytes,
+            heap_rows: 1,
+            moved: 0,
+        },
+    );
+    manifest.promoted = vec!["t".to_string()];
+    manifest.save(lib).expect("写提交记录");
 }
 
 /// 一个已经提交过的两行库:`t` 有 1,`u` 有 7.
@@ -715,14 +740,18 @@ fn crash_fixture(tag: &str) -> (TempDir, ServiceDir, User) {
 
 #[test]
 fn a_crash_before_the_manifest_is_all_before_the_commit() {
-    let (dir, service, bob) = crash_fixture("crash-log");
+    let (dir, service, bob) = crash_fixture("crash-heap");
     let lib = dir.path().join("d");
 
-    // 改动已经追加进日志,提交记录还没写:那份改动**不算数**
+    // 改动已经写进堆文件,提交记录还没更新:那份改动**不算数**
+    let committed = std::fs::metadata(lib.join("t.heap")).unwrap().len();
     crash_before_the_manifest(&lib);
-    assert!(lib.join("t.log").is_file(), "现场:日志在");
+    assert!(
+        std::fs::metadata(lib.join("t.heap")).unwrap().len() > committed,
+        "现场:堆文件长出来一截"
+    );
 
-    // 打开库:日志尾巴被截掉,`t` 还是提交前那一份
+    // 打开库:账本之外的那一截被截掉,`t` 还是提交前那一份
     let session = open_session(&service, "d", &bob);
     assert_eq!(session.symbols().relation("t").unwrap().nrows(), 1);
     assert_eq!(
@@ -730,9 +759,11 @@ fn a_crash_before_the_manifest_is_all_before_the_commit() {
         Value::Int(1),
         "崩在提交点之前 = 旧数据"
     );
-    let log = std::fs::read_to_string(lib.join("t.log")).unwrap();
-    assert!(log.contains("A,0,1"), "已提交的那条还在:{log}");
-    assert!(!log.contains("U,0,2"), "没越过提交点的那条要截掉:{log}");
+    assert_eq!(
+        std::fs::metadata(lib.join("t.heap")).unwrap().len(),
+        committed,
+        "没越过提交点的那条记录要截掉"
+    );
 }
 
 #[test]
@@ -740,15 +771,8 @@ fn a_crash_after_the_manifest_keeps_the_appended_rows() {
     let (dir, service, bob) = crash_fixture("crash-manifest");
     let lib = dir.path().join("d");
 
-    // 改动追加进日志 + 提交记录也写了:这份改动**已经提交**
-    crash_before_the_manifest(&lib);
-    let mut manifest = Manifest::load_or_empty(&lib).unwrap();
-    let entry = manifest.tables.entry("t".to_string()).or_insert(TableFootprint {
-        base: 0,
-        log: 0,
-    });
-    entry.log += 1;
-    manifest.save(&lib).unwrap();
+    // 改动写进堆文件 + 提交记录里的长度也跟上了:这份改动**已经提交**
+    crash_after_the_manifest(&lib);
 
     let session = open_session(&service, "d", &bob);
     let t = session.symbols().relation("t").unwrap();
@@ -759,6 +783,9 @@ fn a_crash_after_the_manifest_keeps_the_appended_rows() {
         Value::Int(7),
         "没被这次提交碰过的表照旧"
     );
+    // 现场本来就已经落定(这次提交没有要推广的东西)
+    let manifest = Manifest::load(&lib).unwrap().expect("提交记录在");
+    assert!(manifest.settled(), "记录里不该留着没做完的记号");
 }
 
 #[test]
@@ -766,26 +793,18 @@ fn a_crash_in_the_middle_of_promoting_still_ends_after_the_commit() {
     let (dir, service, bob) = crash_fixture("crash-promote");
     let lib = dir.path().join("d");
 
-    // 提交记录写了,推广只做了一半(`t` 搬了,`u` 还没)
-    crash_after_the_manifest(&lib, true);
-    assert!(!lib.join("t.csv.new").exists(), "t 已经搬过了");
-    assert!(lib.join("u.csv.new").is_file(), "u 还没搬");
+    // 提交记录写了(要推广 `t`),推广还没做
+    crash_with_a_staged_heap(&lib);
+    assert!(lib.join("t.heap.new").is_file(), "现场:暂存的堆文件在");
 
     let session = open_session(&service, "d", &bob);
-
     assert_eq!(
         session.symbols().relation("t").unwrap().row(0).unwrap()[0],
-        Value::Int(2)
+        Value::Int(2),
+        "补完推广之后读到的是暂存的那一份"
     );
-    assert_eq!(
-        session.symbols().relation("u").unwrap().row(0).unwrap()[0],
-        Value::Int(7),
-        "u 补成下一次的内容"
-    );
-    assert!(!lib.join("u.csv.new").exists(), "补完要把剩下的搬完");
-    // 现场落定之后清单里不再有"没做完"的记号
-    let manifest = Manifest::load(&lib).unwrap().expect("提交记录在");
-    assert!(manifest.settled(), "补完要把 promoted / removed 清掉");
+    assert!(!lib.join("t.heap.new").exists(), "补完要把剩下的搬完");
+    assert!(Manifest::load(&lib).unwrap().unwrap().settled(), "现场要落定");
 }
 
 #[test]

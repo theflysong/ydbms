@@ -1500,6 +1500,32 @@ pub fn is_file_stem_safe(name: &str) -> bool {
         || name.contains('\0'))
 }
 
+/// **自己落盘**的表要回答的那两句(TODO 7.5).
+///
+/// 页式基表是追加式写的:提交点(见 [`crate::usr::service`])只需要问它"写到多少字节,
+/// 有多少行",把这两个数记进提交记录,就算交出去了--不必把整张表读回内存重写.
+/// 提交成功之后调 [`Paged::mark_committed`],它就把"已提交到哪儿"往前挪一格.
+pub trait Paged {
+    /// 交出去的位置:`(文件字节数, 行数)`.
+    fn footprint(&self) -> (u64, usize);
+
+    /// **死字节**是不是攒得太多了(该按当前内容密集重写一遍).
+    ///
+    /// 判据属于存储层(见 [`crate::pers::heap`]):这里只把问题转给表自己,因为只有它
+    /// 知道"活着的字节"有多少.
+    fn needs_compaction(&self) -> bool;
+
+    /// 提交点:把**地址动过的行**写进 `log`(固定记录大小的那种),返回日志里现在有
+    /// 多少条.`committed` 是日志里已经算数的条数(先截到它,再追加).
+    fn write_move_log(&self, log: &std::path::Path, committed: usize) -> Result<usize>;
+
+    /// 提交成功之后认账:从这以后写的东西才算下一轮.
+    ///
+    /// 收 `&self`:提交点手里是 `&dyn Table`(符号表借出去的),而"已提交到哪儿"
+    /// 是表自己的小事--实现用 `Cell` / `RefCell` 记它(与索引槽位同一个口径).
+    fn mark_committed(&self);
+}
+
 /// 表的抽象行为.
 ///
 /// 所有针对表的操作都应该写在本 trait 之上.实现者至少要给出
@@ -1532,6 +1558,19 @@ pub trait Table: TabShape {
         let _ = r;
         None
     }
+
+    /// 这张表**自己落盘**吗;是就把"我写到哪儿了"问出来(TODO 7.5).
+    ///
+    /// 内存里的表(`PhysTab`)与虚表给 `None`,它们由 `pers` 整表写出去;页式基表
+    /// ([`HeapTab`](crate::pers::heap::HeapTab))是**追加式**写的,提交点只需要问它
+    /// 一句"写到多少字节,有多少行",再记进提交记录就完了.
+    ///
+    /// 不这么办的话,`usr` 那一层就得自己维护一张"名字 → 存储句柄"的表--而表本来
+    /// 就知道自己在哪儿,问它最省事.
+    fn paged(&self) -> Option<&dyn Paged> {
+        None
+    }
+
     /// 取出第 `r` 行第 `c` 列的值;越界返回 `None`.
     fn value(&self, r: usize, c: usize) -> Option<Value> {
         self.row(r)?.into_iter().nth(c)

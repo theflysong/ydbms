@@ -54,6 +54,7 @@ use std::path::PathBuf;
 
 use super::engine::Session;
 use super::repl;
+use crate::pers::heap::DEFAULT_POOL_BYTES;
 use crate::usr::service::ServiceDir;
 use crate::usr::{RoleAttrs, User, UserStore};
 
@@ -243,13 +244,28 @@ pub fn run() -> i32 {
     }
 }
 
+/// 缓冲池预算(字节):`YDBMS_BUFFER_POOL_MB` 说的那个,没写或不认识就是默认值.
+///
+/// 认不出来**不报错**:它只是个内存预算,而"没设"与"设错了"对用户来说都是"用默认的"
+/// (与 `--server-dist` 那种必须说清的东西不同).
+fn buffer_pool_bytes(getenv: &dyn Fn(&str) -> Option<String>) -> usize {
+    getenv("YDBMS_BUFFER_POOL_MB")
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(DEFAULT_POOL_BYTES)
+}
+
 /// 认证 → 决定连哪个库 → 打开它.`Err` 是给用户看的一段话.
 fn connect(
     args: &Args,
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> std::result::Result<Session, String> {
     let service = ServiceDir::resolve(Some(args.server_dist.clone()), getenv("HOME").map(PathBuf::from))
-        .map_err(|e| format!("{}", tr!("cmd.cli.011", e = e)))?;
+        .map_err(|e| format!("{}", tr!("cmd.cli.011", e = e)))?
+        // 缓冲池预算:页式基表(TODO 7.5)最多常驻多少页由它定,于是 `ysql` 的
+        // 常驻内存与库的大小无关.`YDBMS_BUFFER_POOL_MB` 覆盖默认值.
+        .with_pool_bytes(buffer_pool_bytes(getenv));
 
     let user = authenticate(&service, args, getenv)?;
 

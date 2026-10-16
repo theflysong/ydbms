@@ -137,16 +137,17 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::db::phys::PhysTab;
-use crate::db::table::{DbError, Result, TabShape, Table};
-use crate::pers::TableCommit;
+use crate::db::table::{Column, ColumnsShape, DbError, Result, TabShape, Table};
 use crate::ir::stmt::{
     AlterRoleRequest, CreateRoleRequest, GrantRequest, GrantRoleRequest, GrantTarget, Server,
 };
 use crate::usr::grants::Privilege;
 use crate::ir::{Outcome, Script, StmtResult, Symbol, SymbolTable, TxOp};
+use crate::pers::heap::{HeapFile, HeapTab};
 use crate::usr::service::{Database, ServiceDir};
 use crate::usr::{PasswordAction, User};
 
@@ -275,11 +276,6 @@ struct Store {
     user: User,
     /// 这次提交要写的表(生效名).
     dirty: BTreeSet<String>,
-    /// 这些表下一次提交**整表重写**,不要追加日志.
-    ///
-    /// 上一次提交失败时把脏表记进来:日志可能已经追加了一半(整行写完但清单没写成),
-    /// 再追加一遍就是重复记录.重写一遍最省心,而这条路上本来就是出错之后的补救.
-    force_full: BTreeSet<String>,
     /// 磁盘上**应该有**的表名:载入时那份,加上已经写成功的.
     known_on_disk: BTreeSet<String>,
 }
@@ -527,6 +523,21 @@ impl Server for Store {
         self.service.set_database_owner(name, owner)
     }
 
+    /// `CREATE TABLE` 造一张**页式堆表**(TODO 7.5):数据写在库目录的 `<表>.heap`
+    /// 里,内存里只留一份行目录与页缓存--表多大都不占内存.
+    fn new_table(&mut self, name: &str, columns: &[Column]) -> Result<Box<dyn Table>> {
+        let path = self.db.heap_path(name);
+        let footprint = self
+            .db
+            .manifest_tables()
+            .get(name)
+            .copied()
+            .unwrap_or_default();
+        let file = Rc::new(HeapFile::open(&path, footprint.heap_bytes, self.db.pool())?);
+        let shape = ColumnsShape::new(columns.to_vec());
+        Ok(Box::new(HeapTab::open(name, shape, file, footprint.heap_rows)?))
+    }
+
     fn forget_grants(&mut self, table: &str) -> Result<()> {
         let tables = vec![table.to_string()];
         self.db.retire_grants(&tables)
@@ -747,7 +758,6 @@ impl Session {
             db,
             user,
             dirty: BTreeSet::new(),
-            force_full: BTreeSet::new(),
             known_on_disk,
         });
         Ok(session)
@@ -1110,9 +1120,8 @@ impl Session {
     /// `manifest.json`(先写它,再做推广 / 删表).所以**一次提交是原子的**--
     /// 崩在中间只可能全在提交前或全在提交后(4.2).
     ///
-    /// 失败时 `dirty` **原样留着**(下次提交再试),而磁盘上什么都不会被动过.
-    /// 重试时这些表会**整表重写**(见 `store.force_full`):日志可能已经追加了一半,
-    /// 再追加一遍就会重复记录--重写一遍最省心,代价只在出错这一条路上.
+    /// 失败时 `dirty` **原样留着**(下次提交再试),而磁盘上什么都不会被动过:
+    /// 页式基表的写是追加式的,提交记录没写下去的话那些字节打开库时就被截掉了.
     pub fn commit(&mut self) -> Result<()> {
         let Some(store) = self.store.as_mut() else {
             return Ok(());
@@ -1142,24 +1151,12 @@ impl Session {
             return Ok(());
         }
 
-        // 这一次提交要写的行(上一次提交点之后改过的那些);先`拿走`,写成功了才
-        // 真的丢掉(见 [`SymbolTable::take_pending`])
-        let pending = self.symbols.take_pending();
-
-        let mut tables: Vec<TableCommit<'_>> = Vec::with_capacity(store.dirty.len());
+        let mut tables: Vec<&dyn Table> = Vec::with_capacity(store.dirty.len());
         for name in store.dirty.iter() {
             // **精确**取表:脏表记的是它自己的生效名,不能再按当时的 `search_path`
             // 解一次--`s.t` 与 `t` 都在,`search_path` 又指向 `s` 时,那会把表存错
             match self.symbols.relation_exact(name) {
-                Some(table) => {
-                    // 重试的表整表重写(见方法头那段);没有改动行的那种(新建的空表)
-                    // 同样整表重写
-                    let delta = match store.force_full.contains(name) {
-                        true => None,
-                        false => pending.get(name),
-                    };
-                    tables.push(TableCommit { table, delta });
-                }
+                Some(table) => tables.push(table),
                 // 这一段里刚建出来又被 `DROP SCHEMA ... CASCADE` 清掉的表:
                 // 没有东西要写,也不算错(它的文件压根没落过盘)
                 None => continue,
@@ -1173,29 +1170,15 @@ impl Session {
             store.db.retire_grants(&gone)?;
         }
 
-        let mut gone = gone;
-        let written: Vec<String> = tables
-            .iter()
-            .map(|commit| commit.table.name().to_string())
-            .collect();
-        if let Err(e) = store.db.commit(&tables, &gone) {
-            // 失败:改动行放回去,这些表下一轮**整表重写**(日志可能追加了一半,
-            // 再追加一遍就重复了)
-            drop(tables);
-            self.symbols.restore_pending(pending);
-            store.force_full.extend(store.dirty.iter().cloned());
-            return Err(e);
-        }
-        drop(tables);
+        store.db.commit(&tables, &gone)?;
 
         // 提交成功了才认账:清掉脏标记,更新"磁盘上应该有哪些"
         store.dirty.clear();
-        store.force_full.clear();
-        for name in gone.drain(..) {
+        for name in gone {
             store.known_on_disk.remove(&name);
         }
-        for name in written {
-            store.known_on_disk.insert(name);
+        for table in tables {
+            store.known_on_disk.insert(table.name().to_string());
         }
 
         Ok(())
@@ -1782,7 +1765,10 @@ fn load_tables(symbols: &mut SymbolTable, db: &Database) -> Result<BTreeSet<Stri
     let mut batch = Vec::with_capacity(tables.len());
     for table in tables {
         known_on_disk.insert(table.name().to_string());
-        batch.push(Symbol::relation(table.name().to_string(), table));
+        batch.push(Symbol::Relation {
+            name: table.name().to_string(),
+            table,
+        });
     }
     symbols.extend(batch)?;
     symbols.rebuild_indexes()?;

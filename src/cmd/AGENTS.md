@@ -34,19 +34,19 @@
   `BEGIN; ... COMMIT;` 里一次都不落盘.**别把提交点挪回"一次 `run_with`"**:那会让
   `BEGIN` 变成一个没有意义的记号.
 - **代价口径**:一条语句一个事务意味着没包事务的脚本里**每条写语句都提交一次**
-  (`pers` 那边一次提交是"追加改过的那几行",TODO 7.7 之前才是整表重写),几千条
-  INSERT 也看得出来.所以 `-f` / `\i` 的长装载仍然要**包在 `BEGIN; ... COMMIT;` 里**
-  (`filmdb.sql` 本来就是这样),这句话在 `ysql -h`,`engine.rs` 文件头与 `repl.rs`
-  的横幅里都要有.
+  (每次提交要写一遍提交记录,并把它记的那些字节"认下来"),几千条 INSERT 也看得出来.
+  所以 `-f` / `\i` 的长装载仍然要**包在 `BEGIN; ... COMMIT;` 里**(`filmdb.sql` 本来
+  就是这样),这句话在 `ysql -h`,`engine.rs` 文件头与 `repl.rs` 的横幅里都要有.
 - `Session::commit` 只写 `dirty` 里的表,并把"磁盘上有,符号表里已经没了"的表文件删掉
   (`DROP SCHEMA ... CASCADE` 靠这条落盘,**不需要语句报告删了谁**),最后交给
-  `Database::commit`(追加变更日志 + `manifest.json`,**一次提交是原子的**).
+  `Database::commit`(追加式堆文件 + `manifest.json`,**一次提交是原子的**).
   **两张都空就一个字节的 IO 都不做**--少了这一句,一次纯 `SELECT` 也会去写
   `manifest.json`,库目录只读时会变成"查询成功却报提交失败".
-- 每张表**改过哪几行**由符号表记着(`SymbolTable::pending`,由 `relation_append` /
-  `update_row` 两处钩子填),提交点 `take_pending` 拿走,写成功了才真的丢掉;失败要
-  `restore_pending` 放回去,并且把那几张表记进 `force_full`--下一轮**整表重写**,
-  因为日志可能已经追加了一半.
+- 写下去的那些字节**由表自己记着**(页式堆表 = 堆文件 + 行位置日志,见
+  [`pers::heap`](../pers/heap.rs)):提交点只问它"写到多少字节,有多少行"
+  ([`Paged`](../db/table.rs)),写进提交记录才算数.所以符号表**不必**再为落盘记账
+  (7.7 那套 `pending` / `force_full` 已经删掉)--失败时盘上多出来的字节打开库时被
+  截掉,重试就是再写一遍.
 - 脏标记只认 `Outcome::Created / Inserted / Copied / Updated` 四种(唯一的写路径),
   加新的写语句时**必须同时**把这个 `match` 补上,否则那条路悄悄不落盘.
 - 提交失败**保留 `dirty`**(下次再试)并走 `Session::error`;磁盘上不会留下"改了一半"的

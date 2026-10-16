@@ -41,7 +41,6 @@ use std::rc::Rc;
 use crate::db::index::IndexSlot;
 use crate::db::phys::PhysTab;
 use crate::db::table::{Column, ColumnsShape, DbError, Result, Row, Table, Value};
-use crate::pers::TableDelta;
 
 /// 目录里的一条索引:`CREATE INDEX name ON table (column)`.
 ///
@@ -214,14 +213,6 @@ pub struct SymbolTable {
     role: String,
     /// 进行中的事务(没有就是 `None`).撤销记录在这里,见文件头.
     tx: Option<Tx>,
-    /// 每张表**自上一次提交点以来**改了些什么(TODO 7.7).
-    ///
-    /// 与 [`Tx`] 是两件事:那个管**回滚**(改之前的旧值,ROLLBACK 时用完就扔),
-    /// 这个管**落盘**(改过哪几行,提交点把它追加到表的数据文件旁).所以它活得比
-    /// 事务长--提交点(`Session::commit`)拿走它,写成功了才算数.
-    ///
-    /// 键是表的**生效名**,与脏表标记同一套口径.
-    pending: BTreeMap<String, TableDelta>,
 }
 
 /// 事务的种类.
@@ -340,7 +331,6 @@ impl SymbolTable {
             search_path: Vec::new(),
             role: String::new(),
             tx: None,
-            pending: BTreeMap::new(),
         }
     }
 
@@ -355,6 +345,15 @@ impl SymbolTable {
     ) -> Result<()> {
         let name = self.effective_name(&name.into());
         self.extend([Symbol::relation(name, table)])
+    }
+
+    /// 注册一个**已经装箱**的关系(服务模式下 `CREATE TABLE` 造出来的页式堆表).
+    ///
+    /// 与 [`define`](SymbolTable::define) 同一件事,只是表已经是 `Box<dyn Table>`:
+    /// 造表的那个口子([`crate::ir::stmt::Server::new_table`])返回的就是它.
+    pub fn define_boxed(&mut self, name: impl Into<String>, table: Box<dyn Table>) -> Result<()> {
+        let name = self.effective_name(&name.into());
+        self.extend([Symbol::Relation { name, table }])
     }
 
     /// 批量导入.
@@ -487,43 +486,11 @@ impl SymbolTable {
                 .or_insert(old);
         }
 
-        // 落盘那一半(TODO 7.7):这几行**改过**,提交点要把它追加到日志里
-        self.pending.entry(name).or_default().updated.insert(r);
-
         self.write_handle(index)
             .ok_or_else(|| DbError::UnknownSymbol {
                 name: table.to_string(),
             })?
             .update_row(r, new_row)
-    }
-
-    /// 每张表**自上一次提交点以来**改了些什么(TODO 7.7).
-    ///
-    /// 提交点读它([`SymbolTable::take_pending`] 之后拿到的就是这一份)--
-    /// 与"哪些表脏了"那张单子(`cmd::Store::dirty`)是两件事:那个说"要写这张表",
-    /// 这个说"表里哪几行".脏表里没有 pending 的那种(新建的空表)整表重写.
-    pub fn pending(&self) -> &BTreeMap<String, TableDelta> {
-        &self.pending
-    }
-
-    /// 把 pending **拿走**:提交点用它,而且写成功了才真的丢掉(见
-    /// [`SymbolTable::restore_pending`]).
-    pub fn take_pending(&mut self) -> BTreeMap<String, TableDelta> {
-        std::mem::take(&mut self.pending)
-    }
-
-    /// 提交失败时把 pending 放回来:下一轮提交还得带上这些改动.
-    pub fn restore_pending(&mut self, pending: BTreeMap<String, TableDelta>) {
-        for (table, delta) in pending {
-            let entry = self.pending.entry(table).or_default();
-            match (entry.appended_from, delta.appended_from) {
-                // 两轮都追加过:起点取**早**的那个(更早的那些行也得写出去)
-                (Some(old), Some(new)) => entry.appended_from = Some(old.min(new)),
-                (None, Some(new)) => entry.appended_from = Some(new),
-                _ => {}
-            }
-            entry.updated.extend(delta.updated);
-        }
     }
 
     /// 按符号下标取可变句柄(几个写入口共用).
@@ -667,14 +634,10 @@ impl SymbolTable {
         }
     }
 
-    /// 事务里**第一次**要往第 `index` 个符号的表尾追加之前,记两笔账.
+    /// 事务里**第一次**要往第 `index` 个符号的表尾追加之前,记一条撤销记录.
     ///
-    /// `relation_append`(`INSERT` / `COPY`)走它:
-    ///
-    /// * **撤销记录**(TODO 3.17):"第一次追加之前的行数",回滚 = 截断回去
-    ///   (见 [`UndoTable::appended`]).第二次追加不必再记--那个行数还是同一个;
-    /// * **落盘账**(TODO 7.7):同一个行数也是"这一次提交要从这里开始追加"的起点
-    ///   (见 [`crate::pers::TableDelta::appended_from`]).
+    /// `relation_append`(`INSERT` / `COPY`)走它:"第一次追加之前的行数",回滚 =
+    /// 截断回去(见 [`UndoTable::appended`]).第二次追加不必再记--那个行数还是同一个.
     ///
     /// 别的写路径不从这里走:`UPDATE` 按行记
     /// ([`update_row`](SymbolTable::update_row)),删表把整张表搬走
@@ -695,10 +658,6 @@ impl SymbolTable {
             if undo.appended.is_none() {
                 undo.appended = Some(appended);
             }
-        }
-        let pending = self.pending.entry(name).or_default();
-        if pending.appended_from.is_none() {
-            pending.appended_from = Some(appended);
         }
     }
 
@@ -877,6 +836,25 @@ impl SymbolTable {
         if_not_exists: bool,
         implicit: bool,
     ) -> Result<(String, bool)> {
+        self.ensure_index_with(name, table, column, unique, if_not_exists, implicit, true)
+    }
+
+    /// 与 [`ensure_index`](SymbolTable::ensure_index) 同一件事,多一个"现在就建吗".
+    ///
+    /// `build = false` 只**登记**槽位,第一次用到时再建(见
+    /// [`IndexSlot`](crate::db::index::IndexSlot) 的惰性).打开库时走这一条:基表是
+    /// 磁盘上的页式堆表(TODO 7.5),"打开就建索引"等于把整列读一遍--那就把
+    /// "打开库只读元数据"这件事又丢掉了.
+    fn ensure_index_with(
+        &mut self,
+        name: &str,
+        table: &str,
+        column: usize,
+        unique: bool,
+        if_not_exists: bool,
+        implicit: bool,
+        build: bool,
+    ) -> Result<(String, bool)> {
         let table = self.effective_name(table);
         // **裸名**在这里展开成生效名(与表名同一套规则).显式 (`CREATE INDEX`) 走
         // 那条路时 `create_index` 已经展开过一次,这里再展开是**幂等**的;隐含的
@@ -920,10 +898,18 @@ impl SymbolTable {
             name: table.clone(),
         })?;
 
-        // 建一份索引:错的列号在这里就会被 `Index::build` 报出来;`unique` 的还会
-        // 顺带查重(表里已经有重复行就建不出来).
+        // 错的列号在这里就会被 `Index::build` 报出来(建的时候才报);`unique` 的
+        // 还会顺带查重(表里已经有重复行就建不出来).
         let slot = IndexSlot::new(column, unique, name.clone());
-        slot.build(relation)?;
+        if build {
+            slot.build(relation)?;
+        } else {
+            // 只登记:列号越界要现在就说,不能等到第一次查询
+            let arity = relation.arity();
+            if column >= arity {
+                return Err(DbError::ColumnOutOfBounds { index: column, arity });
+            }
+        }
 
         self.indexes.push(IndexSymbol {
             name: name.clone(),
@@ -1018,7 +1004,20 @@ impl SymbolTable {
     pub fn rebuild_indexes(&mut self) -> Result<Vec<(String, usize)>> {
         let mut built = Vec::new();
         for (table, column, enforced) in self.unique_columns() {
-            let (name, created) = self.ensure_implicit_index(&table, column, enforced)?;
+            let (desired, _) = {
+                let columns = self.columns(&table).unwrap_or(&[]);
+                implicit_index(&table, columns, column, enforced)
+            };
+            let (name, created) = self.ensure_index_with(
+                &desired,
+                &table,
+                column,
+                enforced,
+                true,
+                true,
+                // **不现在建**:第一次用到它时再扫一遍那一列建出来
+                false,
+            )?;
             if created {
                 built.push((name, column));
             }

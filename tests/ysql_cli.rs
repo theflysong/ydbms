@@ -239,17 +239,13 @@ fn a_database_and_its_rows_survive_across_processes() {
     assert!(text.contains("1 | Alien"), "{text}");
     assert!(text.contains("2 | Aliens"), "{text}");
 
-    // 磁盘上真有那些东西
-    //
-    // 行在**哪儿**:`CREATE TABLE` 那一次提交把空的基表写下去了,两行是后来追加进
-    // `<表>.log` 的(TODO 7.7 之后提交不再重写基表),所以基表只有表头.
+    // 磁盘上真有那些东西:数据在**页式堆文件**里(TODO 7.5),模式在旁路 JSON 里
     let lib = dir.path().join("filmdb");
-    assert!(lib.join("movies.csv").is_file());
+    assert!(lib.join("movies.heap").is_file());
     assert!(lib.join("movies.schema.json").is_file());
-    assert!(lib.join("movies.log").is_file());
     assert!(lib.join("catalog.json").is_file());
-    let log = std::fs::read_to_string(lib.join("movies.log")).unwrap();
-    assert!(log.contains("Alien"), "{log}");
+    let heap = std::fs::read(lib.join("movies.heap")).unwrap();
+    assert!(heap.windows(5).any(|w| w == b"Alien"), "堆文件里该有那一行");
 }
 
 #[test]
@@ -868,11 +864,9 @@ fn a_relative_server_dist_does_not_move_with_cd() {
     );
 
     // 表文件与 `catalog.json` 在同一个库目录里,再起一个进程也读得回来
-    //
-    // 建表那一次提交写下了空的基表,`7` 是后来追加进 `<表>.log` 的(TODO 7.7)
-    assert!(srv.join("bob/t.csv").is_file(), "表文件该在 base/srv/bob");
-    let log = std::fs::read_to_string(srv.join("bob/t.log")).expect("变更日志该在 base/srv/bob");
-    assert!(log.contains('7'), "{log}");
+    assert!(srv.join("bob/t.heap").is_file(), "表文件该在 base/srv/bob");
+    let heap = std::fs::read(srv.join("bob/t.heap")).expect("堆文件该在 base/srv/bob");
+    assert!(heap.windows(1).any(|w| w == b"7"), "堆文件里该有那一行");
     let out = run_in(&base, "srv", &["-U", "bob"], "SELECT a FROM t;\n");
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
     assert!(stdout(&out).contains('7'), "{}", stdout(&out));

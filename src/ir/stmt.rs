@@ -498,6 +498,21 @@ pub trait Server {
     /// `ALTER DATABASE <库> OWNER TO <角色>`,返回一行状态.
     fn set_database_owner(&mut self, role: &str, name: &str, owner: &str) -> Result<String>;
 
+    /// 给 `CREATE TABLE` 造一张**基表**.
+    ///
+    /// 默认给内存里的 [`PhysTab`](crate::db::phys::PhysTab)(内存模式与全部单元测试
+    /// 都走它);服务模式覆盖成磁盘上的**页式堆表**(TODO 7.5)--表多大都不占内存,
+    /// 于是"库比内存大"这件事只在存储层解决,`ir` 一个字都不用改.
+    ///
+    /// `name` 已经是**生效名**(调用方解过 `search_path` 了),与落盘用的文件名主干
+    /// 是同一个.
+    fn new_table(&mut self, name: &str, columns: &[Column]) -> Result<Box<dyn Table>> {
+        Ok(Box::new(PhysTab::new(
+            name,
+            &ColumnsShape::new(columns.to_vec()),
+        )))
+    }
+
     /// 这张表刚建出来(或者已经没了):把它名下的旧授权记录清掉.
     ///
     /// 两处调它:`DROP SCHEMA ... CASCADE` 之后(提交点里表文件被删时)与
@@ -1001,13 +1016,17 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
                 return Err(DbError::DuplicateSymbol { name });
             }
 
-            let shape = ColumnsShape::new(columns.clone());
-            let table = PhysTab::new(&name, &shape);
+            // 造一张基表:服务模式是磁盘上的页式堆表,内存模式是 `PhysTab`
+            // (由 `Server::new_table` 决定,`ir` 不关心它在哪儿)
+            let table = dbs.new_table(&name, columns)?;
             // 有 CHECK 就包一层:所有写路径(INSERT / UPDATE)都过约束
             if checks.is_empty() {
-                symbols.define(name.clone(), table)?;
+                symbols.define_boxed(name.clone(), table)?;
             } else {
-                symbols.define(name.clone(), CheckedTable::new(table, checks.clone()))?;
+                symbols.define_boxed(
+                    name.clone(),
+                    Box::new(CheckedTable::new(table, checks.clone())),
+                )?;
             }
 
             // 新表**先清同名残留**:删过的表名又被建出来时,旧授权不许悄悄生效

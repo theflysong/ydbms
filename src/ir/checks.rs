@@ -18,7 +18,8 @@
 //! `CREATE TABLE` 建的约束只在**本会话**有效,`pers` 读回来的表没有 `CHECK`--
 //! 与 `CREATE INDEX`,`DEFAULT` 是同一类限制,已在各自文档里写明.
 
-use crate::db::phys::PhysTab;
+use std::fmt;
+
 use crate::db::table::{Column, DbError, Result, Row, Table, TabShape, Value};
 
 use super::expr::Prog;
@@ -59,25 +60,35 @@ impl Check {
 
 }
 
-/// 带 `CHECK` 的表:写之前先过约束,其余原样转发给里面的 [`PhysTab`].
+/// 带 `CHECK` 的表:写之前先过约束,其余原样转发给里面那张表.
 ///
-/// 只包 `PhysTab` 而不是 `Box<dyn Table>`:`CHECK` 只对真实存在的表有意义
+/// 包的是 `Box<dyn Table>` 而不是具体的 `PhysTab`:服务模式下的基表是磁盘上的
+/// **页式堆表**(TODO 7.5),而 `CHECK` 对两者都得管.只对真实存在的表挂它
 /// (派生表,连接结果都不接受写入).
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedTable {
-    inner: PhysTab,
+    inner: Box<dyn Table>,
     checks: Vec<Check>,
 }
 
+impl fmt::Debug for CheckedTable {
+    /// 手写 `Debug`:`Box<dyn Table>` 不要求 `Debug`.打印表名与几条约束就够定位问题.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckedTable")
+            .field("name", &self.inner.name())
+            .field("checks", &self.checks.len())
+            .finish()
+    }
+}
+
 impl CheckedTable {
-    /// 给一张物理表挂上若干条 `CHECK`.
-    pub fn new(inner: PhysTab, checks: Vec<Check>) -> Self {
+    /// 给一张表挂上若干条 `CHECK`.
+    pub fn new(inner: Box<dyn Table>, checks: Vec<Check>) -> Self {
         CheckedTable { inner, checks }
     }
 
-    /// 里面的物理表.
-    pub fn inner(&self) -> &PhysTab {
-        &self.inner
+    /// 里面的那张表.
+    pub fn inner(&self) -> &dyn Table {
+        &*self.inner
     }
 
     /// 这张表上的约束.
@@ -123,6 +134,12 @@ impl Table for CheckedTable {
         self.inner.row_ref(r)
     }
 
+    /// "自己落盘"那条口子也照原样转发:页式基表包上 `CHECK` 之后仍然是页式基表
+    /// (提交点问的还是里面那张表,见 [`crate::db::table::Paged`]).
+    fn paged(&self) -> Option<&dyn crate::db::table::Paged> {
+        self.inner.paged()
+    }
+
     fn value(&self, r: usize, c: usize) -> Option<Value> {
         self.inner.value(r, c)
     }
@@ -151,7 +168,7 @@ impl Table for CheckedTable {
     /// 那样拿到的副本就不再强制约束了(事务的撤销记录不再用整表快照,TODO 7.6;
     /// 这条口径留给"真要一份副本"的地方).
     fn snapshot(&self) -> Box<dyn Table> {
-        Box::new(self.clone())
+        Box::new(CheckedTable::new(self.inner.snapshot(), self.checks.clone()))
     }
 
     fn update_row(&mut self, r: usize, row: Row) -> Result<()> {

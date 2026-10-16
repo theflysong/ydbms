@@ -7,10 +7,10 @@
 //! └── <库>/
 //!     ├── catalog.json              {version, name, owner, created_unix, settings}
 //!     ├── .lock                     单写者锁(flock;进程退出即释放)
-//!     ├── manifest.json             提交记录:每张表已提交到哪一行(见 [`Manifest`])
-//!     ├── <表>.csv                  基表(表名带 schema 前缀时就是文件名)
+//!     ├── manifest.json             提交记录:每张表已提交到哪儿(见 [`Manifest`])
+//!     ├── <表>.heap                 基表:页式堆文件(表名带 schema 前缀时就是文件名)
 //!     ├── <表>.schema.json          模式(格式归 [`crate::pers`])
-//!     └── <表>.log                  变更日志:上一次整表重写之后改过的行
+//!     └── <表>.log                  行位置日志:挪过窝的行的新地址
 //! ```
 //!
 //! **一个目录 = 一个库**,这与 [`crate::pers`] 的既有约定一致,也方便手工检查.
@@ -49,14 +49,15 @@
 //! `CREATE DATABASE` 会建出库目录"这句话的落点.`settings`(见 [`Settings`])是
 //! 库级的会话默认值,**新增字段一律 `#[serde(default)]`**,老文件照旧读得回来.
 //!
-//! # 提交是原子的(4.2 / 7.7)
+//! # 提交是原子的(4.2 / 7.5)
 //!
-//! 一次提交要动好几张表:改过的那几行**追加**到各自的 `<表>.log`,要整表重写的写
-//! **暂存**文件(`<表>.csv.new`);全做完了才落下 [`Manifest`](`manifest.json`)--
-//! **它才是提交点**.之后是推广暂存文件,删掉要删的表,最后把记录里那两栏清空.
-//! **打开库时**([`Database::recover`])按记录收尾:还没推广完的补完,每张表的日志
-//! 截到记录里记的条数,没有记录庇护的 `.new` 清掉--两次崩溃之间,库要么全在提交前,
-//! 要么全在提交后.
+//! 基表是**页式堆表**(数据在磁盘上,见 [`crate::pers::heap`]):写只往文件尾追加,
+//! 而"写到哪儿算数"由 [`Manifest`] 说了算--**写清单那一刻才是提交点**.提交要写的
+//! 只有两样:把挪过窝的行的新地址追加进 `<表>.log`,把每张表的位置记进清单;不自己
+//! 落盘的表(兜底)才写**暂存**文件(`<表>.csv.new`)再推广.
+//! **打开库时**([`Database::recover`])按记录收尾:堆文件截到记录的字节数,行位置
+//! 日志截到记录的条数,还没推广完的补完,没有记录庇护的 `.new` 清掉--两次崩溃之间,
+//! 库要么全在提交前,要么全在提交后.
 //! 不做 WAL,也不 `fsync`:这条保证只覆盖**进程崩溃**(含 `kill -9`),不覆盖掉电.
 //!
 //! # 单写者锁
@@ -69,6 +70,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, TryLockError};
+use std::rc::Rc;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -78,10 +80,10 @@ use super::roles;
 use super::{
     now_unix, unknown_role, PasswordAction, RoleAttrChange, RoleAttrs, User, UserStore,
 };
-use crate::db::phys::PhysTab;
 use crate::db::table::{is_file_stem_safe, DbError, Result, Table};
-use crate::pers::csv::{promote, truncate_log};
-use crate::pers::{CsvPersister, Persister, TableCommit, TablePath};
+use crate::pers::csv::promote;
+use crate::pers::heap::{self, truncate_moves, BufferPool, HeapFile, HeapTab};
+use crate::pers::{CsvPersister, Persister, TablePath};
 
 /// `catalog.json` 的格式版本.
 pub const CATALOG_VERSION: u32 = 1;
@@ -101,11 +103,6 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// `manifest.json` 的格式版本(TODO 7.7 把它升到 2:多了一张表的位置).
 pub const MANIFEST_VERSION: u32 = 2;
 
-/// 变更日志超过这个大小(与基表大小取大的那个)就**整理**一次(TODO 7.7).
-///
-/// 整理 = 整表重写一遍 + 日志归零.不整理的话载入那一步每次都要重放越来越长的
-/// 日志,而且同一个行号的旧版本会越攒越多.
-pub const COMPACT_MIN_BYTES: u64 = 1024 * 1024;
 
 /// 库级的会话默认值(`catalog.json` 的 `settings`).
 ///
@@ -193,16 +190,36 @@ impl Catalog {
     }
 }
 
-/// 一张表**已提交到磁盘**的那一部分(TODO 7.7).
+/// 一张表**已提交到磁盘**的那一部分(TODO 7.5).
 ///
-/// `base` 是基表(`<表>.csv`)里的行数,`log` 是变更日志(`<表>.log`)里**算数**的
-/// 记录条数--日志尾巴上多出来的那些是没越过提交点的写,打开库时截掉.
+/// 页式堆表的位置:`heap_bytes` 是堆文件里算数的字节数,`heap_rows` 是行目录里有
+/// 多少行,`moved` 是行位置日志里算数的条数.三个数之外的东西都不算数--打开库时
+/// 一律截掉,"要么全在提交前,要么全在提交后"就是这条.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableFootprint {
-    /// 基表里已提交的行数.
-    pub base: usize,
-    /// 变更日志里已提交的记录条数.
-    pub log: usize,
+    /// 这张表是**页式堆表**吗(老格式的 CSV 基表在迁移之后就都是了).
+    #[serde(default)]
+    pub heap: bool,
+    /// 堆文件里已提交的字节数.
+    #[serde(default)]
+    pub heap_bytes: u64,
+    /// 行目录里已提交的行数.
+    #[serde(default)]
+    pub heap_rows: usize,
+    /// 行位置日志里已提交的条数.
+    #[serde(default)]
+    pub moved: usize,
+}
+
+impl Default for TableFootprint {
+    fn default() -> Self {
+        TableFootprint {
+            heap: false,
+            heap_bytes: 0,
+            heap_rows: 0,
+            moved: 0,
+        }
+    }
 }
 
 /// 库目录里的**提交记录**(`manifest.json`,TODO 7.7).
@@ -305,6 +322,11 @@ impl Manifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceDir {
     root: PathBuf,
+    /// 每个库的**缓冲池预算**(字节,见 [`crate::pers::heap`]).
+    ///
+    /// 由 `cmd` 按环境变量设一次(`ServiceDir::with_pool_bytes`),这里不读环境:
+    /// 与 `root`/`home` 同一个口径--可测.
+    pool_bytes: usize,
 }
 
 impl ServiceDir {
@@ -342,7 +364,16 @@ impl ServiceDir {
         let root = std::path::absolute(&root).map_err(|e| io_err(&root, e))?;
 
         fs::create_dir_all(&root).map_err(|e| io_err(&root, e))?;
-        Ok(ServiceDir { root })
+        Ok(ServiceDir {
+            root,
+            pool_bytes: crate::pers::heap::DEFAULT_POOL_BYTES,
+        })
+    }
+
+    /// 设一次缓冲池预算(见 [`ServiceDir::pool_bytes`]).
+    pub fn with_pool_bytes(mut self, bytes: usize) -> Self {
+        self.pool_bytes = bytes;
+        self
     }
 
     /// 服务目录的根.
@@ -515,6 +546,7 @@ impl ServiceDir {
             catalog,
             grants,
             manifest: Manifest::default(),
+            pool: Rc::new(BufferPool::new(self.pool_bytes)),
             lock,
         };
 
@@ -893,6 +925,10 @@ pub struct Database {
     ///
     /// 与 `grants` 一样:会话手里这一份就是当下那一份(单写者锁保证了没人能同时改).
     manifest: Manifest,
+    /// 这个库的**缓冲池**(所有页式基表共用一份,见 [`crate::pers::heap`]).
+    ///
+    /// 预算决定"最多有多少页常驻",于是 `ysql` 的常驻内存与**库的大小无关**.
+    pool: Rc<BufferPool>,
     /// 单写者锁.**只是持有**:句柄关掉(含进程退出,被 `kill -9`)内核就释放.
     lock: File,
 }
@@ -939,13 +975,30 @@ impl Database {
         self.set_grants(grants)
     }
 
-    /// 把库里所有表读回内存.
+    /// 库里的**缓冲池**(给 `CREATE TABLE` 造页式堆表用的那一份).
+    pub fn pool(&self) -> Rc<BufferPool> {
+        Rc::clone(&self.pool)
+    }
+
+    /// 提交记录里每张表的位置(只读;`CREATE TABLE` 造页式堆表时要问它).
+    pub fn manifest_tables(&self) -> &BTreeMap<String, TableFootprint> {
+        &self.manifest.tables
+    }
+
+    /// 库目录里的堆文件路径(表名 → 文件名主干).
+    pub fn heap_path(&self, name: &str) -> PathBuf {
+        TablePath::new(&self.dir, name).heap_path()
+    }
+
+    /// 把库里所有表读进来.
     ///
-    /// 扫 `*.csv`(暂存文件叫 `*.csv.new`,扩展名不是 `csv`,扫不到;写一半的残渣
-    /// 由 [`Database::recover`] 在打开时清掉),逐个
-    /// [`Persister::load`],并**校验文件主干名与模式里的表名一致**--不一致意味着
-    /// 有人手工动过目录,继续用会在下一次保存时写出两份文件,留下幽灵表.
-    pub fn load_tables(&self) -> Result<Vec<PhysTab>> {
+    /// 扫 `*.heap`(TODO 7.5 之后的基表格式):每个都按模式文件的形状打开一份页式
+    /// 堆表--**只扫记录头建目录**,行体一行都不读.老格式的 `*.csv` 在
+    /// [`Database::recover`] 里已经搬过来了,这里见不到它们.
+    ///
+    /// 文件主干名与模式里的表名要一致:不一致意味着有人手工动过目录,继续用会写出
+    /// 两份文件,留下幽灵表.
+    pub fn load_tables(&self) -> Result<Vec<Box<dyn Table>>> {
         let persister = CsvPersister::new();
         let mut paths = Vec::new();
 
@@ -953,180 +1006,133 @@ impl Database {
         for entry in entries {
             let entry = entry.map_err(|e| io_err(&self.dir, e))?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("csv") {
+            if path.extension().and_then(|e| e.to_str()) == Some("heap") {
                 paths.push(path);
             }
         }
         paths.sort();
 
-        let mut tables = Vec::with_capacity(paths.len());
+        let mut tables: Vec<Box<dyn Table>> = Vec::with_capacity(paths.len());
         for path in paths {
-            let at = TablePath::from_data_path(&path);
-            let mut table = persister.load(&at)?;
-            let stem = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if stem != table.name() {
+            let at = TablePath::new(&self.dir, &stem_of(&path));
+            let (name, shape) = persister.load_schema(&at)?;
+            let stem = stem_of(&path);
+            if stem != name {
                 return Err(DbError::Format {
                     path: path.display().to_string(),
                     line: None,
-                    message: format!("{}", tr!("usr.service.018", arg0 = 
-                        stem, arg1 = 
-                        table.name()
-                    )),
+                    message: format!("{}", tr!("usr.service.018", arg0 = stem, arg1 = name)),
                 });
             }
 
-            // 基表行数要与提交记录对上:对不上就是有人手工动过目录,宁可开不了库
-            if let Some(footprint) = self.manifest.tables.get(&stem) {
-                if footprint.base != table.nrows() {
-                    return Err(DbError::Format {
-                        path: path.display().to_string(),
-                        line: None,
-                        message: format!(
-                            "{}",
-                            tr!("usr.service.038", arg0 = footprint.base, arg1 =  table.nrows())
-                        ),
-                    });
-                }
-            }
-
-            // 变更日志重放(打开库时已经把它截到**已提交**的条数了,见
-            // [`Database::recover`])
-            persister.replay_log(&mut table, &at)?;
-            tables.push(table);
+            let footprint = self
+                .manifest
+                .tables
+                .get(&stem)
+                .copied()
+                .unwrap_or_default();
+            let file = Rc::new(HeapFile::open(&path, footprint.heap_bytes, self.pool())?);
+            let mut table = HeapTab::open(&name, shape, file, footprint.heap_rows)?;
+            // 挪过窝的那些行:新地址在 `<表>.log` 里(见 `pers::heap`)
+            table.apply_moved_log(&at.log_path(), footprint.moved)?;
+            tables.push(Box::new(table));
         }
         Ok(tables)
     }
 
     /// 一次**原子**的多表提交:写 `tables`,删 `removed`,两者要么全做,要么全不做.
     ///
-    /// 协议(TODO 7.7 之后):
+    /// 协议(TODO 7.5):**基表的写是追加式的**,所以提交点只做两件事--把挪过窝的
+    /// 行的新地址追加进 `<表>.log`,把每张表的位置(堆文件字节数 / 行数 / 位置日志
+    /// 条数)写进 `manifest.json`.写清单那一刻是**提交点**:它之前的东西都不算数
+    /// (打开库时截掉),它之后的都必须做完(推广与删表,幂等).
     ///
-    /// 1. 改动**只追加**:有 `delta` 且磁盘上已经有基表的,把那几行追加到
-    ///    `<表>.log`;新表(或者整理过的)才写暂存文件(`<表>.csv.new`);
-    /// 2. 把每张表的**位置**(基表行数 + 日志条数)连同"要推广谁 / 要删谁"一起写进
-    ///    `manifest.json` -- **过了这一点,这次提交就必须完成**;
-    /// 3. 推广 + 删表(幂等),再把清单里那两栏清空重写一遍.
+    /// 不走这条路的表(不自己落盘的那种,兜底)仍然整表写成暂存文件再推广.
     ///
     /// 中途失败(IO 错,进程被杀)只会停在三种位置之一,而这三种在重启时都有确定的
-    /// 去向:清单没写(日志尾巴不算数,截掉就是提交前);清单写了(推广与删表补完
-    /// 就是提交后);清空那一遍没写成(推广与删表再跑一遍,还是提交后).**没有
-    /// "改了一半"这种状态**.
+    /// 去向:清单没写(尾部的字节不算数,截掉就是提交前);清单写了(推广与删表补完
+    /// 就是提交后);清空那一遍没写成(再跑一遍,还是提交后).**没有"改了一半"
+    /// 这种状态**.
     ///
     /// 表名**就是文件名主干**,所以这里是"名字能不能当文件名"的最后一道闸
     /// (见 [`crate::db::table::is_file_stem_safe`]):`ir` 建表时已经拒过一次,
     /// 但真正碰文件系统的是这里--**这道闸不能省**,名字里带 `../` 真的会写到
     /// 别人的库目录(甚至服务目录)里去.
-    pub fn commit(&mut self, tables: &[TableCommit<'_>], removed: &[String]) -> Result<()> {
+    pub fn commit(&mut self, tables: &[&dyn Table], removed: &[String]) -> Result<()> {
         let persister = CsvPersister::new();
         let mut manifest = self.manifest.clone();
         let mut promoted = Vec::new();
-        // 这一次整理过的表:提交点之后要把它们的日志文件真的截掉
-        let mut compacted = Vec::new();
 
-        // 1) 只写改动:能追加日志的就追加,其余整表暂存
-        //
-        // "能追加"要三条同时成立:这一次带着改动行,**磁盘上有基表**,而且**清单里
-        // 记着它的位置**.最后那一条管的是老库(TODO 7.7 之前建的,没有清单)与
-        // 上一次提交崩在半路的表:那种表的位置无从知道,整表重写一遍最省心--顺便
-        // 也就把它"迁"进了新协议.
-        //
-        // 追加上去之后日志可能就超阈值了(`wants_compaction`),那种情况在同一次
-        // 提交里顺手整理:基表重写一遍,清单里记 `log = 0`(刚追加的那些记录打开
-        // 库时被截掉).
-        for commit in tables {
-            let name = checked_table_name(commit.table.name())?;
+        for table in tables {
+            let name = checked_table_name(table.name())?;
             let at = TablePath::new(&self.dir, &name);
-            let known = self.manifest.tables.get(&name).copied();
-            let delta = match (commit.delta, known) {
-                (Some(delta), Some(_)) if at.data_path().is_file() => Some(delta),
-                _ => None,
+            // 模式文件每次提交都写一遍:它只有几百字节,而"表的结构"必须跟着表走
+            // (数据由堆文件自己管,模式不走它)
+            persister.save_schema(*table, &at)?;
+            let Some(paged) = table.paged() else {
+                // 兜底:不自己落盘的表整表重写(暂存 + 推广)
+                persister.stage(*table, &at)?;
+                manifest.tables.insert(name.clone(), TableFootprint::default());
+                promoted.push(name);
+                continue;
             };
-            match (delta, known) {
-                (Some(delta), Some(before)) => {
-                    let appended =
-                        persister.append_delta(commit.table, &at, delta, before.log)?;
-                    // 追加**之后**再看要不要整理:这一次追加完就超阈值的话,顺手把
-                    // 基表重写一遍(日志记 0,多出来的那些记录打开库时被截掉).
-                    if self.wants_compaction(&at) {
-                        persister.stage(commit.table, &at)?;
-                        manifest.tables.insert(
-                            name.clone(),
-                            TableFootprint {
-                                base: commit.table.nrows(),
-                                log: 0,
-                            },
-                        );
-                        compacted.push(name.clone());
-                        promoted.push(name);
-                    } else {
-                        // 基表**没动**:行数还是上一次那个;变的是日志的条数
-                        manifest.tables.insert(
-                            name,
-                            TableFootprint {
-                                base: before.base,
-                                log: before.log + appended,
-                            },
-                        );
-                    }
-                }
-                // 新表(或者清单里没有它的位置):整表重写,日志归零
-                _ => {
-                    persister.stage(commit.table, &at)?;
-                    manifest.tables.insert(
-                        name.clone(),
-                        TableFootprint {
-                            base: commit.table.nrows(),
-                            log: 0,
-                        },
-                    );
-                    promoted.push(name);
-                }
-            }
+
+            // 挪过窝的行:新地址追加进位置日志(账本里那一条数只有在清单写成功之后
+            // 才算数)
+            let before = self.manifest.tables.get(&name).copied().unwrap_or_default();
+            let moves = paged.write_move_log(&at.log_path(), before.moved)?;
+
+            let (bytes, rows) = paged.footprint();
+            manifest.tables.insert(
+                name,
+                TableFootprint {
+                    heap: true,
+                    heap_bytes: bytes,
+                    heap_rows: rows,
+                    moved: moves,
+                },
+            );
         }
         for name in removed {
             manifest.tables.remove(name);
         }
 
-        // 2) 提交点
+        // 提交点
         manifest.promoted = promoted;
         manifest.removed = removed.to_vec();
         manifest.save(&self.dir)?;
 
-        // 3) 做到底,然后把现场"落定"
+        // 做到底,然后把现场"落定"
         self.apply(&manifest)?;
-        // 整理过的那几张表:基表已经是新的了,日志文件里的旧记录不再算数,
-        // 当场截掉(提交点已经过了,崩在这一步也只是留到下次打开再截)
-        for name in &compacted {
-            truncate_log(&TablePath::new(&self.dir, name), 0)?;
-        }
         manifest.promoted.clear();
         manifest.removed.clear();
         manifest.save(&self.dir)?;
+
+        // 认账:从这以后写的东西才算下一轮.`mark_committed` 要改表自己的状态,
+        // 而这里拿到的是 `&dyn Table`--所以走库目录里那一份**存储句柄**:
+        // 页式基表的文件是 `Rc` 共享的,提交点只要把"已提交长度"往前挪一格.
+        for table in tables {
+            if let Some(paged) = table.paged() {
+                paged.mark_committed();
+            }
+        }
         self.manifest = manifest;
         Ok(())
     }
 
-    /// 这次改动之后要不要**整理**这张表(整表重写 + 日志归零).
-    ///
-    /// 判据只看大小:日志比 `max(1 MiB, 基表字节数)` 还大就值得重写一遍--否则
-    /// 载入那一步每次都要把越来越长的日志重放一遍,而日志里的旧版本会越攒越多.
-    fn wants_compaction(&self, at: &TablePath) -> bool {
-        let log = fs::metadata(at.log_path()).map(|meta| meta.len()).unwrap_or(0);
-        let base = fs::metadata(at.data_path()).map(|meta| meta.len()).unwrap_or(0);
-        log > COMPACT_MIN_BYTES.max(base)
-    }
-
-    /// 把一个提交记录做到底:推广暂存文件,删掉要删的表.
+    /// 把一个提交记录做到底:推广暂存文件,删掉要删的表.    /// 把一个提交记录做到底:推广暂存文件,删掉要删的表.
     ///
     /// **幂等**:已经搬过的暂存文件(rename 掉之后 `.new` 就没了)会被跳过,
     /// 删掉的文件再删一次也不算错--所以它可以被"崩在中途"之后的恢复直接重跑.
     fn apply(&self, manifest: &Manifest) -> Result<()> {
         for name in &manifest.promoted {
             let name = checked_table_name(name)?;
-            promote(&TablePath::new(&self.dir, &name))?;
+            let at = TablePath::new(&self.dir, &name);
+            match manifest.tables.get(&name).is_some_and(|at| at.heap) {
+                // 页式堆表暂存的是 `<表>.heap.new`
+                true => heap::promote(&at.heap_path())?,
+                false => promote(&at)?,
+            }
         }
         for name in &manifest.removed {
             self.remove_table_files(name)?;
@@ -1134,15 +1140,18 @@ impl Database {
         Ok(())
     }
 
-    /// 打开库时把上次没写完的提交收尾(TODO 7.7),并清扫暂存残渣.
+    /// 打开库时把上次没写完的提交收尾,把老格式的表搬进堆文件,并清扫残渣.
     ///
-    /// 三步,顺序不能换:
+    /// 四步,顺序不能换:
     ///
     /// 1. 清单里还有 `promoted` / `removed` 的,先做到底(新数据早就在暂存文件里了,
     ///    这是"全在提交后"),然后把那两栏清空重写;
-    /// 2. **把每张表的日志截到清单里记的条数**:多出来的尾巴是没越过提交点的写
-    ///    (这是"全在提交前");
-    /// 3. 清扫没有清单庇护的 `.new` 残渣.
+    /// 2. **老格式(CSV 基表)整表搬进堆文件**(TODO 7.5 的迁移):写堆文件 -> 写清单
+    ///    (提交点)-> 删掉 CSV.崩在中间时,清单里还没有这张表的位置,下次接着搬
+    ///    (堆文件重写一遍,幂等);
+    /// 3. 每张表截到清单里记的位置:行位置日志截到记的条数(堆文件由
+    ///    [`HeapFile::open`] 在打开时截);
+    /// 4. 清扫没有清单庇护的 `.new` 残渣.
     pub fn recover(&mut self) -> Result<()> {
         let mut manifest = Manifest::load_or_empty(&self.dir)?;
         if !manifest.settled() {
@@ -1151,16 +1160,122 @@ impl Database {
             manifest.removed.clear();
             manifest.save(&self.dir)?;
         }
-        self.truncate_logs(&manifest)?;
+
+        // 迁移:还是 CSV 基表的那些表(TODO 7.5 之前建的库)
+        let pending = self.tables_to_migrate(&manifest)?;
+        if !pending.is_empty() {
+            let persister = CsvPersister::new();
+            for name in &pending {
+                let at = TablePath::new(&self.dir, name);
+                let table = persister.load(&at)?;
+                // 写成 `<表>.heap.new`:推广要等提交记录写下去之后(见下面)
+                let bytes = HeapTab::write_dense(&at.heap_path(), &table)?;
+                manifest.tables.insert(
+                    name.clone(),
+                    TableFootprint {
+                        heap: true,
+                        heap_bytes: bytes,
+                        heap_rows: table.nrows(),
+                        moved: 0,
+                    },
+                );
+            }
+            // 提交点:过了这里,堆文件就是这些表的新家了
+            manifest.promoted = pending.clone();
+            manifest.save(&self.dir)?;
+            self.apply(&manifest)?;
+            manifest.promoted.clear();
+            manifest.save(&self.dir)?;
+            for name in &pending {
+                self.remove_csv_files(name)?;
+            }
+        }
+        // 已经迁完但 CSV 还留着(上次崩在删文件那一步):补删
+        for (name, footprint) in &manifest.tables {
+            if footprint.heap {
+                self.remove_csv_files(name)?;
+            }
+        }
+
+        // 死字节太多的堆表:**打开时**整理一次(这一层是唯一能安全重写文件的地方:
+        // 此刻还没有人拿着这份文件读写,见 `pers::heap` 的文件头)
+        self.compact_if_needed(&mut manifest)?;
+
+        self.truncate_moved_logs(&manifest)?;
         self.sweep_staged(&manifest)?;
         self.manifest = manifest;
         Ok(())
     }
 
-    /// 把每张表的变更日志截到**已提交**的条数(清单里没有的表当 0).
+    /// 把死字节太多的页式堆表**密集重写**一遍(打开库时做,`&mut self` 收尾).
     ///
-    /// 只按字节位置截断,不重写内容;多出来的那些是没越过提交点的写.
-    fn truncate_logs(&self, manifest: &Manifest) -> Result<()> {
+    /// 判据在 [`HeapTab::needs_compaction`]:文件比活着的字节多出一倍以上,而且
+    /// 本身够大.重写 = 读出来 -> 写成 `<表>.heap.new` -> 清单记新位置(提交点)
+    /// -> 推广 -> 位置日志归零.崩在中间只会留下一份 `.new`,下次再整理一次.
+    fn compact_if_needed(&self, manifest: &mut Manifest) -> Result<()> {
+        for (name, footprint) in manifest.tables.clone() {
+            if !footprint.heap {
+                continue;
+            }
+            let at = TablePath::new(&self.dir, &name);
+            let (_, shape) = CsvPersister::new().load_schema(&at)?;
+            let file = Rc::new(HeapFile::open(
+                &at.heap_path(),
+                footprint.heap_bytes,
+                self.pool(),
+            )?);
+            let mut table = HeapTab::open(&name, shape, Rc::clone(&file), footprint.heap_rows)?;
+            table.apply_moved_log(&at.log_path(), footprint.moved)?;
+            if !table.needs_compaction() {
+                continue;
+            }
+
+            let bytes = HeapTab::write_dense(&at.heap_path(), &table)?;
+            let rows = table.nrows();
+            let mut settled = manifest.clone();
+            settled.tables.insert(
+                name.clone(),
+                TableFootprint {
+                    heap: true,
+                    heap_bytes: bytes,
+                    heap_rows: rows,
+                    moved: 0,
+                },
+            );
+            settled.promoted = vec![name.clone()];
+            settled.save(&self.dir)?;
+            self.apply(&settled)?;
+            truncate_moves(&at.log_path(), 0)?;
+
+            *manifest = settled;
+            manifest.promoted.clear();
+            manifest.save(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// 还没搬进堆文件的那些表(有 `<表>.csv`,而清单里没有它的堆位置).
+    fn tables_to_migrate(&self, manifest: &Manifest) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err(&self.dir, e))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("csv") {
+                continue;
+            }
+            let stem = stem_of(&path);
+            if manifest.tables.get(&stem).is_some_and(|at| at.heap) {
+                continue;
+            }
+            out.push(stem);
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// 把每张表的行位置日志截到**已提交**的条数(清单里没有的表当 0).
+    fn truncate_moved_logs(&self, manifest: &Manifest) -> Result<()> {
         let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| io_err(&self.dir, e))?;
@@ -1168,12 +1283,22 @@ impl Database {
             if path.extension().and_then(|e| e.to_str()) != Some("log") {
                 continue;
             }
-            let stem = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let committed = manifest.tables.get(&stem).map_or(0, |at| at.log);
-            truncate_log(&TablePath::new(&self.dir, &stem), committed)?;
+            let stem = stem_of(&path);
+            let committed = manifest.tables.get(&stem).map_or(0, |at| at.moved);
+            truncate_moves(&path, committed)?;
+        }
+        Ok(())
+    }
+
+    /// 删掉一张表的老格式基表(`<表>.csv`).不在不算错.
+    ///
+    /// `<表>.log` **不删**:那个名字现在归**行位置日志**(迁移之后它是空的,接着用).
+    fn remove_csv_files(&self, name: &str) -> Result<()> {
+        let at = TablePath::new(&self.dir, name);
+        if let Err(e) = fs::remove_file(at.data_path()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(io_err(at.data_path(), e));
+            }
         }
         Ok(())
     }
@@ -1187,11 +1312,15 @@ impl Database {
         for entry in entries {
             let entry = entry.map_err(|e| io_err(&self.dir, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".csv.new") && !name.ends_with(".schema.json.new") {
+            if !name.ends_with(".csv.new")
+                && !name.ends_with(".schema.json.new")
+                && !name.ends_with(".heap.new")
+            {
                 continue;
             }
             let stem = name
                 .trim_end_matches(".schema.json.new")
+                .trim_end_matches(".heap.new")
                 .trim_end_matches(".csv.new")
                 .to_string();
             if manifest.promoted.contains(&stem) {
@@ -1203,16 +1332,21 @@ impl Database {
         Ok(())
     }
 
-    /// 删掉一张表的三个文件(数据 / 模式 / 变更日志).
+    /// 删掉一张表的全部文件:堆文件,模式,行位置日志,以及老格式的 CSV 与它的日志.
     /// 这是 `DROP SCHEMA ... CASCADE` 的落点.文件不在不算错.
     pub fn remove_table_files(&self, name: &str) -> Result<()> {
         let name = checked_table_name(name)?;
         let at = TablePath::new(&self.dir, &name);
-        let log = at.log_path();
-        for path in [at.data_path(), at.schema_path(), log.as_path()] {
-            if let Err(e) = fs::remove_file(path) {
+        let paths: [std::path::PathBuf; 4] = [
+            at.heap_path(),
+            at.schema_path().to_path_buf(),
+            at.log_path(),
+            at.data_path().to_path_buf(),
+        ];
+        for path in paths {
+            if let Err(e) = fs::remove_file(&path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(io_err(path, e));
+                    return Err(io_err(&path, e));
                 }
             }
         }
@@ -1226,6 +1360,13 @@ impl Drop for Database {
         // 这件事写在代码里,别哪天顺手把 `lock` 字段去掉.
         let _ = self.lock.unlock();
     }
+}
+
+/// 一个路径的**文件名主干**(表名).
+fn stem_of(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// 库名合法性:只是**服务目录下的一个目录名**.
