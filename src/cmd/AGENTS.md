@@ -138,14 +138,36 @@
 - `\set` 自己的回显(`ON_ERROR_STOP:开` / `VERBOSE:开`).所以 `\set VERBOSE on` 会报
   一声,`\set VERBOSE off` 是静悄悄的--它自己已经把状态行关掉了.
 
-**不归它管的两样**:错误(一律 `Session::error` / `report` 的 `Err` 分支,**永远打**--
-否则脚本会静悄悄地什么都没干),查询结果表(`query_out`),以及用户点着名要的输出
-(`\timing` 的回显,`\echo` / `\d` / `\dt` / `\l` / `\du` / `\c` / `\pwd` / `\ls` /
-`EXPLAIN`).加新的状态行时**走 `info`**,别走 `msg`.
+**不归它管的**有几样:错误(一律 `Session::error` / `report` 的 `Err` 分支,**永远打**--
+否则脚本会静悄悄地什么都没干),查询结果表(`query_out`),`\timing` 的回显与
+`\echo` / `\d` / `\dt` / `\l` / `\du` / `\c` / `\pwd` / `\ls` / `EXPLAIN` 这些用户点着名
+要的输出,以及下面那一族**命令标签**.加新的状态行时**走 `info`**,别走 `msg`.
 
 默认 **开**;只有 `ysql -f <脚本>` 由 `cli.rs` 在 `run_file` 之前关掉(**脚本模式默认
 安静**,照 psql 的 `-f`).所以"`-f` 与 `\i` 输出逐字一致"这句话不再成立:同一条执行
 路径,但 `-f` 默认安静(脚本里 `\set VERBOSE on` 随时能打开).
+
+### 命令标签:psql 的**协议**,不是文案,也不归 `VERBOSE` 管
+
+写语句与事务控制各多打一行标签(走 `Session::tag`,只进 `messages`):
+
+| `Outcome` | 标签 |
+|---|---|
+| `Inserted { rows, .. }` | `INSERT 0 <rows>` |
+| `Updated { rows, .. }` | `UPDATE <rows>` |
+| `Transaction { op, applied: true, .. }` | `BEGIN` / `COMMIT` / `ROLLBACK` |
+
+四条规矩:
+
+- **照 psql 原样打,不走 `tr!`**--它是协议,不是给用户看的文案.别"顺手"把它翻译了,
+  也别把它加进文案表(`tests/i18n.rs` 也拿它当机器可读的那一行钉着);
+- **永远打**,`VERBOSE` 关着照样打:`ysql -f` 的脚本模式默认就是关的,而根目录的
+  `summarize.py` 靠这几行(再加 `\timing` 的 `Time: x ms`)把写基准汇总成 JSON.
+  所以它走 `Session::tag` 而**不是** `info`;
+- **只覆盖写语句与事务控制**:`CREATE TABLE`,`SET`,`VACUUM` 之类仍然只有人类可读的
+  状态行.要扩这一族,先把"谁真的需要机器可读"想清楚;
+- **只发一句警告的那种没有标签**(没有事务时的 `COMMIT`,已经在事务里的 `BEGIN`)--
+  与 psql 一致,那是 `applied == false`.
 
 `\echo` 的**去引号**也在引擎里(`unquote_echo`),不在 `metacmd.rs`--那一层只拆词,
 不解释参数.只处理"整行被一对单引号包住",psql 那种逐参数去引号不做(与参考实现

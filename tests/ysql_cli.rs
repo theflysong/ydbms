@@ -67,6 +67,21 @@ fn run_with_stdin(
     password: Option<&str>,
     input: Option<&str>,
 ) -> Output {
+    run_with_lang(dir, args, password, input, "zh-CN")
+}
+
+/// 同 [`run_with_stdin`],但显式指定语言.
+///
+/// 上面那几层钉的是 `zh-CN`(断言写的是中文);要验**机器可读**的那几行
+/// (`summarize.py` 认的 `Time: x ms`)就得切到 `en`--`ydbms-test/ydbms.sh`
+/// 也是这么干的.
+fn run_with_lang(
+    dir: &TempDir,
+    args: &[&str],
+    password: Option<&str>,
+    input: Option<&str>,
+    lang: &str,
+) -> Output {
     let mut command = Command::new(bin());
     command
         .arg("--server-dist")
@@ -76,7 +91,7 @@ fn run_with_stdin(
         .env_remove("PGPASSWORD")
         // 孩子进程报的是中文(默认就是),但这儿显式钉住:断言写的是中文,
         // 不能让开发机的 LANG 决定它过不过
-        .env("YDBMS_LANG", "zh-CN");
+        .env("YDBMS_LANG", lang);
 
     if let Some(password) = password {
         command.env("PGPASSWORD", password);
@@ -853,4 +868,64 @@ fn a_relative_server_dist_does_not_move_with_cd() {
     let out = run_in(&base, "srv", &["-U", "bob"], "SELECT a FROM t;\n");
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
     assert!(stdout(&out).contains('7'), "{}", stdout(&out));
+}
+
+// ------------------------------------------------ 8.9:命令标签(psql 协议)
+
+/// 写基准那两行是**机器可读**的:根目录的 `summarize.py` 按
+/// `^(?:INSERT 0|UPDATE) (\d+)$` 认"写了多少行",按一行裸 `COMMIT` 认提交,
+/// 按 `^Time:\s*([\d.]+)\s*ms\b` 认耗时.这条测试钉的就是这三件事.
+///
+/// 注意它跑的是 `-f`(脚本模式),`VERBOSE` 默认关:状态行一条都没有,标签照常打.
+#[test]
+fn the_write_benchmark_lines_are_psql_shaped() {
+    let dir = TempDir::new("tags");
+    bootstrap(&dir);
+
+    let script = dir.script(
+        "write.sql",
+        "\\timing on\n\
+         BEGIN;\n\
+         CREATE TABLE t (x INT);\n\
+         INSERT INTO t VALUES (1), (2);\n\
+         UPDATE t SET x = x + 1;\n\
+         COMMIT;\n",
+    );
+    let out = run_with_lang(
+        &dir,
+        &["-U", "bob", "-d", "bob", "-f", script.to_str().unwrap()],
+        Some(PASSWORD),
+        None,
+        // `summarize.py` 认的是**英文**那两行(`ydbms-test/ydbms.sh` 也这么设)
+        "en",
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+
+    // 单独成行,没有前缀也没有后缀
+    assert!(lines.contains(&"INSERT 0 2"), "{text}");
+    assert!(lines.contains(&"UPDATE 2"), "{text}");
+    assert!(lines.contains(&"COMMIT"), "{text}");
+    // `-f` 默认安静:标签是唯一的状态输出(没有任何人类可读的状态行)
+    assert!(!text.contains("插入"), "{text}");
+    assert!(!text.contains("-> "), "{text}");
+
+    // 紧跟在写标签后面的那一行就是耗时,形状照 psql
+    let at = lines
+        .iter()
+        .position(|line| *line == "INSERT 0 2")
+        .expect("有 INSERT 标签");
+    let time = lines[at + 1];
+    assert!(time.starts_with("Time: ") && time.ends_with(" ms"), "`{time}` 不像 psql 的耗时行:{text}");
+    // 数值部分要能被正则吃掉(`[\d.]+`)
+    let number = time
+        .trim_start_matches("Time: ")
+        .trim_end_matches(" ms")
+        .to_string();
+    assert!(
+        !number.is_empty() && number.chars().all(|c| c.is_ascii_digit() || c == '.'),
+        "`{number}` 不是 `[\\d.]+`:{text}"
+    );
 }

@@ -609,7 +609,8 @@ fn verbose_is_on_by_default_and_off_silences_the_status_lines() {
     s.run_interactive("CREATE TABLE m (a INT);\nINSERT INTO m VALUES (1);\nSELECT a FROM m;");
 
     let out = s.messages();
-    assert_eq!(out, "", "关掉之后不该再有状态行与汇总:{out}");
+    // 状态行与汇总一条都没有;留下的**只有**命令标签(那是协议,不受 VERBOSE 管)
+    assert_eq!(out, "INSERT 0 1\n", "关掉之后不该再有状态行与汇总:{out}");
     // 结果表照旧走另一路
     assert!(s.query_output().contains('1'), "{}", s.query_output());
 
@@ -623,6 +624,34 @@ fn verbose_is_on_by_default_and_off_silences_the_status_lines() {
         "{}",
         s.messages()
     );
+}
+
+#[test]
+fn command_tags_are_printed_even_with_verbose_off() {
+    // 标签是 psql 的**协议**行,不是"引擎自己的聊天":`-f` 的脚本模式把状态行关掉
+    // 之后,写语句照样要打出 `INSERT 0 N` / `UPDATE N`(`summarize.py` 靠它认行数).
+    let mut s = buffered();
+    s.run_interactive("\\set VERBOSE off");
+    s.run_interactive(
+        "CREATE TABLE m (a INT);
+         BEGIN;
+         INSERT INTO m VALUES (1), (2);
+         UPDATE m SET a = a + 1;
+         COMMIT;",
+    );
+
+    assert_eq!(s.messages(), "BEGIN\nINSERT 0 2\nUPDATE 2\nCOMMIT\n");
+}
+
+#[test]
+fn a_warning_only_statement_gets_no_command_tag() {
+    // 没有事务时的 `COMMIT` 只发一句警告(照 PostgreSQL),它**没有**标签;
+    // 已经在事务里的 `BEGIN` 也一样
+    let mut s = buffered();
+    s.run_interactive("\\set VERBOSE off");
+    s.run_interactive("COMMIT;");
+
+    assert_eq!(s.messages(), "", "只发警告的语句不该有协议标签");
 }
 
 #[test]

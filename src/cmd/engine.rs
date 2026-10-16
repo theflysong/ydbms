@@ -55,6 +55,18 @@
 //! **脚本模式**,由 `cli` 在跑脚本之前关掉(psql 的 `-f` 也是安静的),
 //! 脚本里随时可以 `\set VERBOSE on` 打开.
 //!
+//! # 命令标签:psql 的协议,不归 `VERBOSE` 管
+//!
+//! 写语句与事务控制还会打一行**命令标签**(走 [`Session::tag`],只进 `messages`):
+//! `INSERT 0 <行数>`,`UPDATE <行数>`,以及真做了事的 `BEGIN` / `COMMIT` / `ROLLBACK`.
+//! 它是**机器可读的协议**而不是给用户看的文案,所以:
+//!
+//! * **照 psql 原样打,不走 `tr!`**(换语言也不变);
+//! * **永远打**,`VERBOSE` 关着也打--`ysql -f` 默认就是关的,而根目录的
+//!   `summarize.py` 是靠这几行(再加 `\timing` 的 `Time: x ms`)把写基准汇总成
+//!   JSON 的;
+//! * 只覆盖写语句与事务控制,别的语句仍然只有人类可读的那行状态.
+//!
 //! # 内存模式与服务模式
 //!
 //! [`Session::new`] 造出来的是**内存**会话(`ydbms` 那个实验终端,以及测试):
@@ -1185,6 +1197,19 @@ impl Session {
         }
     }
 
+    /// 一条**命令标签**(psql 的协议,不是文案):不受 `VERBOSE` 管,永远打.
+    ///
+    /// 与状态行([`Session::info`])分开是**有意**的:状态行是"引擎自己的聊天",
+    /// `ysql -f` 的脚本模式默认把它关掉;标签是**机器可读的协议行**(`summarize.py`
+    /// 之类靠它认"这条写语句动了多少行"),psql 也从不随任何 verbose 设置把它收起来.
+    ///
+    /// 因为它是**协议**而不是给用户看的文案,所以照 psql 原样打,**不走 `tr!`**--
+    /// 口径见 `src/cmd/AGENTS.md` 的"命令标签".覆盖面也只有写语句与事务控制:
+    /// 别的语句(建表,`SET`......)仍然只有人类可读的那行状态.
+    fn tag(&mut self, text: &str) {
+        self.messages.write(text);
+    }
+
     fn query(&mut self, text: &str) {
         self.query_out.write(text);
     }
@@ -1331,17 +1356,28 @@ impl Session {
             }
             Ok(Outcome::Inserted { table, rows }) => {
                 self.info(&format!("{}", tr!("cmd.engine.025", arg0 =  head, arg1 =  rows, arg2 =  table)));
+                self.tag(&format!("INSERT 0 {}\n", rows));
             }
             Ok(Outcome::Updated { table, rows }) => {
                 self.info(&format!("{}", tr!("cmd.engine.026", arg0 =  head, arg1 =  rows, arg2 =  table)));
+                self.tag(&format!("UPDATE {}\n", rows));
             }
             Ok(Outcome::NoOp { message }) => {
                 self.info(&format!("{}  → {}\n", head, message));
             }
-            Ok(Outcome::Transaction { message, .. }) => {
+            Ok(Outcome::Transaction {
+                message,
+                applied,
+                op,
+            }) => {
                 // 真做了就是 `BEGIN` / `COMMIT` / `ROLLBACK` 一行状态;做不到时
                 // `message` 本身就是那句警告(照 PostgreSQL 的口径,不是错误)
                 self.info(&format!("{}  → {}\n", head, message));
+                // 标签只给**真做了**的那几种:只发一句警告的(没有事务时的 COMMIT,
+                // 已经在事务里的 BEGIN)照 psql 的口径没有标签
+                if *applied {
+                    self.tag(&format!("{}\n", op.as_str()));
+                }
             }
             Err(e) => self.msg(&format!("{}", tr!("cmd.engine.027", arg0 =  head, arg1 =  e))),
         }

@@ -4,7 +4,7 @@
 //! `AGENTS.md` 的 "六,文案与标点" 里;这里一旦红,就说明有人往代码里塞了硬编码中文,
 //! 全角标点,或者改了文案表却忘了改另一边.
 //!
-//! 检查四件事:
+//! 检查五件事:
 //!
 //! 1. **键一一对应**:`src/**/*.rs` 里 `tr!("键")` 用到的键,与 `locales/zh-CN.yml`
 //!    里的键**完全相同**(不多不少),而且调用点给的占位符与文案表里的 `%{…}` 一致;
@@ -12,7 +12,9 @@
 //! 3. **中文只在文案表里**:`src/**/*.rs` 的**字符串字面量**里不许再出现中文
 //!    (注释里可以--注释是给读代码的人看的,不翻译);
 //! 4. **标点尽可能半角**:`src` 与 `tests` 下源码的注释与字符串,两份文案表,以及我们
-//!    自己的 `*.md`,都不许出现"有半角对应体"的全角标点.
+//!    自己的 `*.md`,都不许出现"有半角对应体"的全角标点;
+//! 5. **机器可读的那一行不许改样**:英文的耗时行是 `summarize.py` 的正则认的
+//!    (见 `the_machine_readable_timing_line_keeps_its_shape`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -446,4 +448,19 @@ fn punctuation_is_halfwidth() {
         "这些地方该用半角标点:\n{}",
         offenders.join("\n")
     );
+}
+
+/// 英文的耗时行**是机器可读的协议**,`summarize.py` 的 `TIME_RE`
+/// (`^Time:\s*([\d.]+)\s*ms\b`)就是照它写的,`ydbms-test/ydbms.sh` 也默认
+/// `YDBMS_LANG=en`.所以查询基准那条路**现在就已经通**,谁也别"顺手"把它翻译成
+/// 别的样子:形状一改,那套汇总就悄悄什么都认不出来了。
+#[test]
+fn the_machine_readable_timing_line_keeps_its_shape() {
+    let en = yaml_entries(&root().join("locales/en.yml"));
+    let value = en
+        .iter()
+        .find(|(key, _)| key == "cmd.engine.016")
+        .map(|(_, value)| value.clone())
+        .expect("cmd.engine.016 要在文案表里");
+    assert_eq!(value, "Time: %{arg0} ms\\n", "英文耗时行的形状被改了");
 }
