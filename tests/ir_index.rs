@@ -160,6 +160,74 @@ fn explain_only_shows_an_index_path_when_the_catalogue_has_one() {
     );
 }
 
+// ------------------------------------------------- `IN` 列表走一列上的索引(3.14(a))
+
+#[test]
+fn explain_shows_the_index_path_for_an_in_list() {
+    let (mut db, _) = counting(&[1, 2, 3]);
+
+    // 没有索引:那条 `IN` 只能逐行算(`((x = 1) OR (x = 3))`)
+    assert_eq!(
+        explain(&db, "SELECT x FROM t WHERE x IN (1, 3)"),
+        "Scan(t, filter=[(x = 1) OR (x = 3)])\n"
+    );
+
+    ok(&mut db, "CREATE INDEX t_x ON t (x)");
+    // 有索引:一次一个键,各键的桶合并就是命中的行(谓词照旧逐行复核)
+    assert_eq!(
+        explain(&db, "SELECT x FROM t WHERE x IN (1, 3)"),
+        "Scan(t, index=[x], filter=[(x = 1) OR (x = 3)])\n"
+    );
+
+    // `NOT IN` **不能**走索引:索引答的是"在不在这些键里",答不了"不在"
+    assert_eq!(
+        explain(&db, "SELECT x FROM t WHERE x NOT IN (1, 3)"),
+        "Scan(t, filter=[(x <> 1) AND (x <> 3)])\n"
+    );
+}
+
+#[test]
+fn an_in_list_reads_only_the_hit_rows() {
+    let (mut db, counts) = counting(&[1, 2, 3, 4, 5]);
+    ok(&mut db, "CREATE INDEX t_x ON t (x)");
+    let after_create = counts.cells.get();
+    let rows_before = counts.rows.get();
+
+    let plan = compile("SELECT x FROM t WHERE x IN (1, 3, 5)", &db).unwrap();
+    let out = execute(&plan, &db).unwrap();
+    assert_eq!(out.nrows(), 3, "三个键各命中一行");
+    // 行号升序(= 表顺序),与顺序扫描的结果行序一致
+    let values: Vec<Value> = (0..out.nrows()).map(|r| out.row(r).unwrap()[0].clone()).collect();
+    assert_eq!(values, vec![Value::Int(1), Value::Int(3), Value::Int(5)]);
+    // 建索引那一趟已经在 `after_create` 里数过了,这里**不该**再动它
+    assert_eq!(counts.cells.get(), after_create, "查 `IN` 不重建索引");
+    assert_eq!(counts.rows.get() - rows_before, 3, "只取命中的三行");
+}
+
+#[test]
+fn an_in_list_with_a_repeated_key_yields_each_row_once() {
+    let (mut db, _) = counting(&[1, 2, 3]);
+    ok(&mut db, "CREATE INDEX t_x ON t (x)");
+
+    // 重复的键(还有别名写法 `IN (1, 1)`)不许把同一行吐两次
+    assert_eq!(rows(&db, "SELECT x FROM t WHERE x IN (1, 1)"), 1);
+    assert_eq!(rows(&db, "SELECT x FROM t WHERE x IN (1, 2, 1, 2)"), 2);
+}
+
+#[test]
+fn an_in_list_with_null_still_probes_and_let_the_predicate_decide() {
+    // `x IN (1, NULL)`:NULL 也是个**真的**键(索引里 NULL 占一个桶),探测它多读
+    // 出来的行由谓词自己复核掉--碰上 NULL 是 UNKNOWN,不是 TRUE,所以只有 1 留下.
+    let (mut db, _) = counting(&[1, 2, 3]);
+    ok(&mut db, "CREATE INDEX t_x ON t (x)");
+
+    assert_eq!(
+        explain(&db, "SELECT x FROM t WHERE x IN (1, NULL)"),
+        "Scan(t, index=[x], filter=[(x = 1) OR (x = NULL)])\n"
+    );
+    assert_eq!(rows(&db, "SELECT x FROM t WHERE x IN (1, NULL)"), 1);
+}
+
 // ---------------------------------------------------------------- 写得对
 
 #[test]

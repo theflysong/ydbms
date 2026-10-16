@@ -21,6 +21,13 @@
 //! * 没有索引的列**不建索引**:查询就是顺序扫描--本版不会为了"也许有用"先把表
 //!   扫一遍(`CREATE INDEX` 才是让人掏这笔钱的地方).
 //!
+//! # 一次查**一组**键(TODO 3.14(a))
+//!
+//! [`IndexSource`] 收的是**一组**键而不是一个:`col IN (常量, ...)` 就是好几个键,
+//! 各键的桶合并([`lookup_many`])起来就是命中的行号(行号升序 = 表顺序,重复的键
+//! 只算一次).不这么办的话,那几个键要对**每一行**各比一次--实测 `update_1k.sql`
+//! 第一条(`name_basics` 50 万行,1000 个键)因此要 84 秒,走索引之后是 0.37 秒.
+//!
 //! # `unique`:主键那一份**真强制**唯一性(TODO 8.7)
 //!
 //! 同样一份"键 → 行号",但 [`IndexSlot::unique`] 是 `true` 的那一份会被语句层
@@ -274,11 +281,14 @@ impl IndexSlot {
 ///
 /// **索引是惰性建的**:槽位里还没有索引时,第一次 [`RowSource::next`] 才建,
 /// 所以 `LIMIT 0` 之下连索引都不会建.
+///
+/// 键是**一组**(TODO 3.14(a)):等值那种只有一个,`IN` 列表有好几个--各键的桶
+/// 合并起来([`lookup_many`])才是要读的行号.
 pub struct IndexSource<'a> {
     table: &'a dyn Table,
     /// 这一列上的索引槽位:目录里的那一个(共享),或者执行器临时建的一个.
     slot: Rc<IndexSlot>,
-    key: Value,
+    keys: Vec<Value>,
     /// 要读的行号;`None` 表示还没查过.
     rids: Option<Vec<usize>>,
     at: usize,
@@ -286,12 +296,12 @@ pub struct IndexSource<'a> {
 }
 
 impl<'a> IndexSource<'a> {
-    /// 在 `table` 上按 `key` 取行,索引放在 `slot` 里.
-    pub fn new(table: &'a dyn Table, slot: Rc<IndexSlot>, key: Value) -> Self {
+    /// 在 `table` 上按这一组 `keys` 取行,索引放在 `slot` 里.
+    pub fn new(table: &'a dyn Table, slot: Rc<IndexSlot>, keys: Vec<Value>) -> Self {
         IndexSource {
             table,
             slot,
-            key,
+            keys,
             rids: None,
             at: 0,
             error: None,
@@ -300,9 +310,28 @@ impl<'a> IndexSource<'a> {
 
     /// 查一次键,结算出要读的行号.失败记进 `self.error`.
     fn fill(&mut self) -> Result<()> {
-        self.rids = Some(self.slot.lookup(self.table, &self.key)?);
+        self.rids = Some(lookup_many(&self.slot, self.table, &self.keys)?);
         Ok(())
     }
+}
+
+/// 一组键的行号:各键的桶**合并**,行号升序(**行号升序 = 表顺序**,输出顺序就是
+/// 它),重复的键只算一次.
+///
+/// 一个键时**不做**排序:桶本来就是按行号追加出来的(升序),`IN` 那种才会走到
+/// 排序 + 去重上--键可以重复(`a IN (1, 1)` 是合法的),不去的活同一行会被读两遍.
+pub fn lookup_many(slot: &IndexSlot, table: &dyn Table, keys: &[Value]) -> Result<Vec<usize>> {
+    if let [key] = keys {
+        return slot.lookup(table, key);
+    }
+
+    let mut rids = Vec::new();
+    for key in keys {
+        rids.extend(slot.lookup(table, key)?);
+    }
+    rids.sort_unstable();
+    rids.dedup();
+    Ok(rids)
 }
 
 impl RowSource for IndexSource<'_> {

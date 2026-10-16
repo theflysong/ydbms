@@ -63,10 +63,14 @@ PhysTab                          ← db::source::materialize
 ### 索引是目录对象(TODO 3.6)
 
 索引**只来自 `CREATE INDEX`**:`SymbolTable` 里记着名字,表与一个
-[`IndexSlot`](../db/index.rs)("列 + 当前那一份索引").三条规矩:
+[`IndexSlot`](../db/index.rs)("列 + 当前那一份索引").四条规矩:
 
 - 优化器只挑**目录里真有**的索引(没有就顺序扫描)--本版不为"也许有用"在建计划时
   先把表扫一遍,那比顺序扫描还贵;
+- 挑出来的键是**一组**(`IndexPath::keys`):等值那一项一个键,`col IN (常量, ...)`
+  每个常量一个键(TODO 3.14(a)),执行时各键的桶合并(行号升序,去重).不这么办
+  就是"那几个键对每一行各比一次"--实测 50 万行上 1000 个键要 84 秒,走索引是
+  0.37 秒;`NOT IN` **不能**走索引(索引答得了"在这几个键里",答不了"不在这几个里");
 - `INSERT` 把新键**追加**进去(`SymbolTable::index_keys_of` + `maintain_indexes`),
   `UPDATE` **只作废"写到的列"上的那一份**(`invalidate_indexes(table, written)`,
   TODO 3.15),下次用到时重建一次.`update_row` 是原地替换,行号不动,所以没被写到的

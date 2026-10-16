@@ -120,10 +120,14 @@ impl JoinStrategy {
     }
 }
 
-/// 一次索引访问:走第 `column` 列上的索引,要查的键由 `key` 求值.
+/// 一次索引访问:走第 `column` 列上的索引,要查的键由 `keys` 求值.
 ///
-/// `key` **不能引用本查询的列**(索引是访问路径而不是算子,它没有输入行,键在
+/// `keys` **不能引用本查询的列**(索引是访问路径而不是算子,它没有输入行,键在
 /// 空的输入行上求值)--这条由 [`Plan::analyze`] 强制.
+///
+/// 键是**一组**而不是一个:`col IN (常量, ...)`(TODO 3.14(a))是一个键一项,
+/// 执行时把各键的桶合并起来就是命中的行号;等值那种只写一个.这一组**至少有一项**
+/// --`IN` 的空列表在降级期就被拒了(`ir.irgen.188`),别的写法也挑不出空的一组.
 ///
 /// # `outer`:相关子查询里作索引探测(TODO 8.7)
 ///
@@ -132,14 +136,15 @@ impl JoinStrategy {
 /// (对不上"键不读列"那条快路),只能退化成 `Scan` 之后的逐行 `Filter`--
 /// 内层每来一行都要把整张表扫一遍.
 ///
-/// `outer` 为 `true` 时 `key` 读的是**外层行**(`Step::Outer`),于是这一列上的
-/// 索引可以当**探测**用:`index=[tconst]` 加一个外层键,内层一次只读命中那几行.
+/// `outer` 为 `true` 时 `keys[0]` 读的是**外层行**(`Step::Outer`),于是这一列上
+/// 的索引可以当**探测**用:`index=[tconst]` 加一个外层键,内层一次只读命中那几行.
+/// 这一种**恰好一个键**(一次探测一个值),`analyze` 会挡下更多的那一种.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexPath {
     /// 索引建在哪一列(**这张表自己**的列下标).
     pub column: usize,
-    /// 要查的键;不读本查询的列,但 `outer` 时**可以**读外层行.
-    pub key: Prog,
+    /// 要查的键(至少一项);不读本查询的列,但 `outer` 时**可以**读外层行.
+    pub keys: Vec<Prog>,
     /// 键读的是**外层行**吗(相关子查询的等值探测).
     pub outer: bool,
 }
@@ -1210,7 +1215,7 @@ fn for_each_program<'a>(op: &'a Op, visit: &mut dyn FnMut(&'a Prog)) {
                 visit(prog);
             }
             if let Some(path) = index {
-                visit(&path.key);
+                path.keys.iter().for_each(&mut *visit);
             }
         }
         Op::Filter { predicate } => visit(predicate),
@@ -1448,6 +1453,9 @@ fn check_program(
 /// * 键不能读列--索引是访问路径而不是算子,键在没有输入行的情况下求值;
 /// * 键与索引列必须**同一大类**--`Value::Int(1)` 与 `Value::Numeric("1")` 在值
 ///   层面不是同一个键,混着用会漏掉本该匹配的行.
+///
+/// 一组键(TODO 3.14(a) 的 `IN` 列表)**每个都要过**这两关:少查一个键就是少一批
+/// 行,而那是安静的错答案.
 fn verify_index_path(path: &IndexPath, table: &str, columns: &[Column], id: NodeId) -> Result<()> {
     let column = columns.get(path.column).ok_or_else(|| {
         invalid(
@@ -1460,36 +1468,51 @@ fn verify_index_path(path: &IndexPath, table: &str, columns: &[Column], id: Node
         )
     })?;
 
-    let ty = path.key.verify(columns).map_err(|e| at(id, e))?;
-    // **常量键**不读列:它在没有输入行的前提下求值(见 [`IndexPath::key`]).
-    //
-    // **外层键**例外(TODO 8.7):降级时(`opt::pushdown` 的 `lower_outer_key`)它被
-    // 重排成"面对**这张表的行**"的程序--外层那一层的列被搬到这张表里**同名**的列
-    // 上,执行时 `Scan` 喂进去的正是外层行(`index_key` 传的就是外层行栈顶那一行).
-    // 于是它**恰好**只读索引那一列;别的列一律算降级坏了.
-    match path.outer {
-        true => {
-            let key_columns = path.key.columns();
-            if key_columns.len() != 1 || !key_columns.contains(&path.column) {
-                return Err(invalid(id, tr!("ir.plan.030").into_owned()));
+    // **外层键**只探测一个值(相关子查询的一行一次):多出来的一律算降级坏了.
+    if path.outer && path.keys.len() != 1 {
+        return Err(invalid(id, tr!("ir.plan.030").into_owned()));
+    }
+
+    for key in &path.keys {
+        let ty = key.verify(columns).map_err(|e| at(id, e))?;
+        // **常量键**不读列:它在没有输入行的前提下求值(见 [`IndexPath::keys`]).
+        //
+        // **外层键**例外(TODO 8.7):降级时(`opt::pushdown` 的 `lower_outer_key`)它被
+        // 重排成"面对**这张表的行**"的程序--外层那一层的列被搬到这张表里**同名**的列
+        // 上,执行时 `Scan` 喂进去的正是外层行(`index_keys` 传的就是外层行栈顶那一行).
+        // 于是它**恰好**只读索引那一列;别的列一律算降级坏了.
+        match path.outer {
+            true => {
+                let key_columns = key.columns();
+                if key_columns.len() != 1 || !key_columns.contains(&path.column) {
+                    return Err(invalid(id, tr!("ir.plan.030").into_owned()));
+                }
+            }
+            false => {
+                if !key.columns().is_empty() {
+                    return Err(invalid(id, tr!("ir.plan.030").into_owned()));
+                }
             }
         }
-        false => {
-            if !path.key.columns().is_empty() {
-                return Err(invalid(id, tr!("ir.plan.030").into_owned()));
+
+        match ty {
+            ScalarType::Value(family) if family == column.ty.family() => {}
+            // 无类型的 `NULL` 键:那是个**真**的键(索引里 NULL 也占一个桶),查它
+            // 只是多读几行,读出来的行由谓词自己复核掉(`x IN (1, NULL)` 碰上 NULL
+            // 是 UNKNOWN,不是 TRUE).等值那种键不会走到这里--降级不认 `x = NULL`.
+            ScalarType::Null => {}
+            other => {
+                return Err(invalid(
+                    id,
+                    format!("{}", tr!("ir.plan.031", arg0 = 
+                        other, arg1 =  column.name, arg2 =  column.ty
+                    )),
+                ))
             }
         }
     }
 
-    match ty {
-        ScalarType::Value(family) if family == column.ty.family() => Ok(()),
-        other => Err(invalid(
-            id,
-            format!("{}", tr!("ir.plan.031", arg0 = 
-                other, arg1 =  column.name, arg2 =  column.ty
-            )),
-        )),
-    }
+    Ok(())
 }
 
 /// 校验一个等值键:两侧各自面对自己那一支的 schema,且**同一大类**.

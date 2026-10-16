@@ -159,7 +159,11 @@ where
                             .symbols
                             .index_of(table, path.column)
                             .unwrap_or_else(|| Rc::new(IndexSlot::new(path.column, false, String::new())));
-                        Box::new(IndexSource::new(relation, slot, index_key(path, ctx, id)?))
+                        Box::new(IndexSource::new(
+                            relation,
+                            slot,
+                            index_keys(path, ctx, id)?,
+                        ))
                     }
                     None => Box::new(TableCursor::new(relation)),
                 };
@@ -1289,31 +1293,39 @@ fn key_of<'k, 's>(
     Ok(values)
 }
 
-/// 索引路径的键:在**没有输入行**的前提下求值(`analyze` 保证它不读列).
+/// 索引路径的一组键:在**没有输入行**的前提下求值(`analyze` 保证它们不读列).
 ///
 /// 两种键:
 ///
-/// * 常量键(平常那种):空环境求值,一次算好;
+/// * 常量键(平常那种):空环境求值,一次算好--`col IN (常量, ...)` 就是好几个
+///   常量键(TODO 3.14(a)),各键的桶由 [`IndexSource`] 合并;
 /// * **外层键**(`path.outer`,相关子查询的等值探测,TODO 8.7):键读的是外层行,
 ///   所以从执行环境的外层行栈里取那一行当输入求值.这个源是在"为外层这一行重开
 ///   一份管道"时建的,栈顶**就是**当前外层行--于是一次探测一个键,正好.
-fn index_key(path: &IndexPath, ctx: &ExecCtx<'_>, node: NodeId) -> Result<Value> {
-    let scalar = match path.outer {
-        false => path.key.eval(&[]),
-        true => {
-            // 栈空说明计划坏了(外层键却不在子查询里);`analyze` 的
-            // `check_subqueries` 本该挡住,这里不 panic,报一声就完事.
-            let outers = ctx.state.outers.borrow();
-            let row = outers.last().cloned().ok_or_else(|| {
-                runtime(node, tr!("ir.exec.026").into_owned())
-            })?;
-            path.key.eval_with(&row, &[], ctx)
-        }
-    };
-    scalar
-        .map_err(|e| e.into_db_error(Some(node)))?
-        .to_value()
-        .ok_or_else(|| runtime(node, tr!("ir.exec.013").into_owned()))
+fn index_keys(path: &IndexPath, ctx: &ExecCtx<'_>, node: NodeId) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(path.keys.len());
+    for key in &path.keys {
+        let scalar = match path.outer {
+            false => key.eval(&[]),
+            true => {
+                // 栈空说明计划坏了(外层键却不在子查询里);`analyze` 的
+                // `check_subqueries` 本该挡住,这里不 panic,报一声就完事.
+                let outers = ctx.state.outers.borrow();
+                let row = outers
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| runtime(node, tr!("ir.exec.026").into_owned()))?;
+                key.eval_with(&row, &[], ctx)
+            }
+        };
+        values.push(
+            scalar
+                .map_err(|e| e.into_db_error(Some(node)))?
+                .to_value()
+                .ok_or_else(|| runtime(node, tr!("ir.exec.013").into_owned()))?,
+        );
+    }
+    Ok(values)
 }
 
 // ------------------------------------------------------------- 连接:哈希

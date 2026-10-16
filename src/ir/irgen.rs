@@ -3876,6 +3876,86 @@ fn lower_aexpr(
     }
 }
 
+/// 这一项是**本层**的裸列吗;是就返回它在扁平 schema 里的下标.
+///
+/// 与 `opt::mod` 的同名函数同一个判据(那边是给连接与下推用的):**外层列不算**
+/// --索引建在这一层的这一列上,键里的外层引用走的是另一条路(`lower_outer_key`).
+fn bare_local_column(node: &Node, scope: &Scope<'_>) -> Option<usize> {
+    let c = match &node.node {
+        Some(node::Node::ColumnRef(c)) => c,
+        _ => return None,
+    };
+    let parts = ref_parts(&c.fields)?;
+    match scope.resolve(&parts).ok()? {
+        Resolved::Local(index) => Some(index),
+        Resolved::Outer { .. } => None,
+    }
+}
+
+/// `col IN (常量, ...)` 的**一组索引键**(TODO 3.14(a)).
+///
+/// 返回 `(裸列的扁平下标, 每一项一个键程序)`,挑不出就返回 `None`:那种情况照样是
+/// 顺序扫描加逐行复核,一分语义都不改(`opt::pushdown` 只拿它**额外**挑一条访问
+/// 路径,见那里的 `index_path`).
+///
+/// 只认这几种形状,别的一律 `None`:
+///
+/// * 非否定的**等值**列表(`col IN (...)`;`NOT IN` 折的是 `<> ... AND ...`,索引
+///   答不了"不在这些键里",给了就是错的);
+/// * 左边是**裸列**(索引只建在一列上),右边是 `List`;
+/// * **每一项都不读列,也没有子查询 / 外层引用**--键是在没有输入行的前提下求值的,
+///   读列会读错行,读外层行走不通(`IN` 在 `UPDATE` 与 `SELECT` 两侧都用得上,
+///   后者的外层键另有 `lower_outer_key` 那条路).
+///
+/// 每一项都按**左边那一列的类型**定型(与 [`lower_in`] 同一个 `expected`),于是
+/// `ts IN ('2024-01-15')` 里的字面量仍然落在时间戳上.`items` 为空时返回 `None`
+/// (真正的拒绝在 [`lower_in`] 里,那句话才是给用户看的).
+pub(crate) fn lower_in_key_set(
+    node: &Node,
+    scope: &Scope<'_>,
+) -> Result<Option<(usize, Vec<Prog>)>> {
+    let a = match &node.node {
+        Some(node::Node::AExpr(a)) => a,
+        _ => return Ok(None),
+    };
+    if AExprKind::try_from(a.kind).unwrap_or(AExprKind::Undefined) != AExprKind::AexprIn {
+        return Ok(None);
+    }
+    if single_string(&a.name).as_deref() != Some("=") {
+        return Ok(None);
+    }
+
+    let Some(lhs) = a.lexpr.as_deref() else {
+        return Ok(None);
+    };
+    let Some(index) = bare_local_column(lhs, scope) else {
+        return Ok(None);
+    };
+    let items = match a.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
+        Some(node::Node::List(list)) => &list.items,
+        _ => return Ok(None),
+    };
+    if items.is_empty() {
+        return Ok(None);
+    }
+
+    let expected = bare_column_type(lhs, scope);
+    let mut keys = Vec::with_capacity(items.len());
+    for item in items {
+        let mut p = ProgBuilder::new();
+        let reg = lower_expr_in(item, scope, expected.as_ref(), None, &mut p)?;
+        let key = p.finish(reg);
+        // 键必须是个**值**:读本表的列(**这一列之外的**也一样)就说明它不是常量,
+        // 子查询与外层引用同理--`Plan::analyze` 还会再挡一次,这里先挑得保守.
+        if !key.columns().is_empty() || key.has_subquery() || key.has_outer() {
+            return Ok(None);
+        }
+        keys.push(key);
+    }
+
+    Ok(Some((index, keys)))
+}
+
 /// `x IN (a, b, c)` 与 `x NOT IN (a, b, c)`.
 ///
 /// 语法树里这是一个 [`AExpr`] (`kind = AexprIn`,`name` 是 `=` 或 `<>`),右边是

@@ -457,7 +457,7 @@ fn analyze_rejects_an_index_key_that_reads_a_column() {
         scan,
         IndexPath {
             column: 0,
-            key: col_prog(0),
+            keys: vec![col_prog(0)],
             outer: false,
         },
     )
@@ -483,7 +483,7 @@ fn analyze_rejects_an_index_key_of_another_family() {
         scan,
         IndexPath {
             column: 0,
-            key,
+            keys: vec![key],
             outer: false,
         },
     )

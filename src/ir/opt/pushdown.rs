@@ -18,7 +18,7 @@ use pg_query::protobuf::Node;
 
 use crate::db::table::Result;
 use crate::ir::expr::{Prog, ProgBuilder};
-use crate::ir::irgen::{lower_expr, lower_outer_key, Range, Scope};
+use crate::ir::irgen::{lower_expr, lower_in_key_set, lower_outer_key, Range, Scope};
 use crate::ir::plan::{IndexPath, NodeId, PlanBuilder};
 use crate::ir::value::{Scalar, ScalarType, Tri};
 
@@ -196,10 +196,13 @@ pub(crate) fn update_index_path(
 
 /// 从推到某一个 FROM 项的合取项里挑一条索引访问路径.
 ///
-/// 两种键,各有一条路:
+/// 三种键,各有一条路:
 ///
 /// * **常量键**:`<这一项的裸列> = <不读列的表达式>`(两侧反过来也行).索引就是
 ///   这一列的"键 → 行号",所以键必须是个**值**而不是列;
+/// * **一组常量键**(TODO 3.14(a)):`<这一项的裸列> IN (常量, ...)`.索引答得了
+///   "在这几个键里",所以整条 `IN` 可以换成几次按键取行号--不这么办的话,那
+///   几个键要对**每一行**各比一次(实测 `update_1k.sql` 第一条因此要 84 秒);
 /// * **外层键**(TODO 8.7):`<这一项的裸列> = <只读外层行的表达式>`.这是**相关
 ///   子查询**里唯一能指望索引的形状:`EXISTS (SELECT 1 FROM c WHERE c.tconst =
 ///   b.tconst)` 的内层只有一张表,`opt::join` 的索引嵌套循环挂不上去(那是给连接
@@ -219,6 +222,11 @@ fn index_path(
     scope: &Scope<'_>,
 ) -> Result<Option<IndexPath>> {
     for (ast, _) in items {
+        // `col IN (常量, ...)`:一组键,与等值那条路互斥(形状就不同)
+        if let Some(path) = in_index_path(ast, range, scope)? {
+            return Ok(Some(path));
+        }
+
         let (lhs, rhs) = match equi_sides(ast) {
             Some(sides) => sides,
             None => continue,
@@ -265,7 +273,7 @@ fn index_path(
                 }
                 return Ok(Some(IndexPath {
                     column,
-                    key: rebased,
+                    keys: vec![rebased],
                     outer: true,
                 }));
             }
@@ -291,12 +299,55 @@ fn index_path(
 
             return Ok(Some(IndexPath {
                 column,
-                key,
+                keys: vec![key],
                 outer: false,
             }));
         }
     }
 
     Ok(None)
+}
+
+/// `<这一项的裸列> IN (常量, ...)` 那条访问路径(TODO 3.14(a)).
+///
+/// 形状的判定与攒键都在 `irgen::lower_in_key_set` 里(它按列类型给每一项定型),
+/// 这里只补"这一列上真有索引,而且每个键都与它同族".
+///
+/// 挑不出来返回 `None`:那条 `IN` 照旧留在 `Scan.filter` / `Stmt::Update::filter`
+/// 里逐行复核,只是慢了--**语义一分都不改**,所以这里的判据可以保守.
+fn in_index_path(ast: &Node, range: &Range, scope: &Scope<'_>) -> Result<Option<IndexPath>> {
+    let Some((index, keys)) = lower_in_key_set(ast, scope)? else {
+        return Ok(None);
+    };
+    if !range.contains(index) {
+        return Ok(None);
+    }
+
+    let column = index - range.offset;
+    let column_family = match scope.column_type_at(index) {
+        Some(ty) => ty.family(),
+        None => return Ok(None),
+    };
+    for key in &keys {
+        match key.verify(&range.columns)? {
+            ScalarType::Value(family) if family == column_family => {}
+            // 无类型的 `NULL` 键(`x IN (1, NULL)`)也放行:它是个真的桶(NULL 在
+            // 索引里也占一个键),多读出来的行由谓词复核掉.真值不走索引.
+            ScalarType::Null => {}
+            // 不同族(`IN` 的键本来也不会跨族)与真值都不走索引
+            _ => return Ok(None),
+        }
+    }
+
+    // 没有索引就走顺序扫描:路径不是"猜"出来的,是目录里查出来的
+    if scope.symbols().index_of(&range.name, column).is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(IndexPath {
+        column,
+        keys,
+        outer: false,
+    }))
 }
 

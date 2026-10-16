@@ -49,7 +49,7 @@ use std::rc::Rc;
 
 use pg_query::protobuf::RawStmt;
 
-use crate::db::index::IndexSlot;
+use crate::db::index::{lookup_many, IndexSlot};
 use crate::db::phys::PhysTab;
 use crate::db::table::{
     is_file_stem_safe, Column, ColumnsShape, DataType, DbError, Result, Row, Table, TypeFamily,
@@ -752,6 +752,8 @@ fn matches_where(filter: Option<&Prog>, row: &[Value]) -> Result<bool> {
 /// 当场作废--不能一边查一边改.查出来的行号还要拿 `WHERE` 整个复核一遍(索引只是
 /// 访问路径).
 ///
+/// 键是**一组**(TODO 3.14(a) 的 `IN` 列表):各键的桶合并([`lookup_many`]).
+///
 /// 目录里那条索引不在了(理论上不会:降级刚查过)就退回顺序扫描:宁可慢,
 /// 不要拿一条不确定的路径去改表.
 fn index_hits(
@@ -761,18 +763,21 @@ fn index_hits(
     path: &IndexPath,
 ) -> Result<Vec<usize>> {
     // 键不读本表的列(`opt::pushdown::index_path` 挑的就是这种),空行上求值
-    let key = path
-        .key
-        .eval(&[])
-        .map_err(|e| e.into_db_error(None))?
-        .to_value()
-        .ok_or_else(|| DbError::IrRuntime {
-            node: None,
-            message: tr!("ir.exec.013").into_owned(),
-        })?;
+    let mut keys = Vec::with_capacity(path.keys.len());
+    for key in &path.keys {
+        keys.push(
+            key.eval(&[])
+                .map_err(|e| e.into_db_error(None))?
+                .to_value()
+                .ok_or_else(|| DbError::IrRuntime {
+                    node: None,
+                    message: tr!("ir.exec.013").into_owned(),
+                })?,
+        );
+    }
 
     match symbols.index_of(table, path.column) {
-        Some(slot) => slot.lookup(relation, &key),
+        Some(slot) => lookup_many(&slot, relation, &keys),
         None => Ok((0..relation.nrows()).collect()),
     }
 }

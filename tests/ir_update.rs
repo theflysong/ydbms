@@ -210,6 +210,33 @@ fn an_update_uses_the_index_access_path() {
 }
 
 #[test]
+fn an_update_with_an_in_list_probes_the_index_per_key() {
+    // TODO 3.14(a):`WHERE k IN (...)` 也是索引路径--**每个键探测一次**,而不是
+    // 拿那几个键对每一行各比一次(实测:1000 个键在 50 万行上要 84 秒).
+    let (mut db, counts) = counting();
+    ok(&mut db, "CREATE INDEX t_k ON t (k)");
+
+    let before = counts.refs.get();
+    ok(&mut db, "UPDATE t SET v = 7 WHERE k IN (3, 5, 9)");
+
+    assert_eq!(
+        counts.refs.get() - before,
+        3,
+        "索引路径:谓词只看命中的三行(顺序扫描要看满 100 行)"
+    );
+    assert_eq!(cell(&db, 3, 1), 7);
+    assert_eq!(cell(&db, 5, 1), 7);
+    assert_eq!(cell(&db, 9, 1), 7);
+    assert_eq!(cell(&db, 4, 1), 40, "没点到的行不动");
+
+    // 重复的键不许把同一行改两次(行号去重),也不许多看一行
+    let before = counts.refs.get();
+    ok(&mut db, "UPDATE t SET v = 8 WHERE k IN (3, 3)");
+    assert_eq!(counts.refs.get() - before, 1);
+    assert_eq!(cell(&db, 3, 1), 8);
+}
+
+#[test]
 fn an_update_only_invalidates_the_indexes_of_the_columns_it_writes() {
     let (mut db, _) = counting();
     ok(&mut db, "CREATE INDEX t_k ON t (k)");

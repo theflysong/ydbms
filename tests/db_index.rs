@@ -177,7 +177,7 @@ fn an_index_source_is_a_row_source_over_one_key() {
 
     // 建索引是**惰性**的:光造游标一行都不读(`LIMIT 0` 之下连索引都不建)
     let slot = Rc::new(IndexSlot::new(0, false, "t_x"));
-    let mut source = IndexSource::new(&table, slot, Value::Int(1));
+    let mut source = IndexSource::new(&table, slot, vec![Value::Int(1)]);
     assert_eq!(table.cells_read(), 0);
     assert_eq!(table.rows_read(), 0);
 
@@ -201,7 +201,7 @@ fn an_index_source_is_a_row_source_over_one_key() {
 fn an_index_source_for_a_missing_key_yields_nothing() {
     let table = CountingTable::new(&[1, 2]);
     let slot = Rc::new(IndexSlot::new(0, false, "t_x"));
-    let mut source = IndexSource::new(&table, slot, Value::Int(99));
+    let mut source = IndexSource::new(&table, slot, vec![Value::Int(99)]);
 
     assert_eq!(source.next(), None);
     assert!(source.error().is_none(), "查不到键不是错误");

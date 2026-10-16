@@ -68,9 +68,11 @@ Option<&[Value]>`(默认给 `None` = "没有可借用的存储").**调用方见�
 索引是**会话级的目录对象**(名字在 `ir/symbol.rs`):`CREATE INDEX` 建一份,
 `INSERT` 追加,`UPDATE` 只作废**写到的那些列**上的那一份(TODO 3.15:
 `update_row` 是原地替换,行号不动,别的列那份"键 → 行号"仍然有效),下次用到时重建.
-四条要注意:`RefCell` 是**必需**的
+五条要注意:`RefCell` 是**必需**的
 (目录是 `&` 借出去的,而失效/重建/追加都要改它);`IndexSource` 仍然是**惰性**的
 (第一次 `next()` 才建,`LIMIT 0` 之下连索引都不建);索引攒的是**行号**而不是行;
+一次可以查**一组**键(`lookup_many` 把各桶合并,行号升序,去重--`IN` 列表就是
+一组键,TODO 3.14(a));
 `unique` 的槽位(`PRIMARY KEY` / `CREATE UNIQUE INDEX` 那一份)**真的强制唯一性**
 --强制点不在这一层,而在语句层那个"这一句见过哪些键"的台账(`ir/stmt.rs` 的
 `IndexKeys`),读索引的键用 [`IndexSlot::keys`](index.rs),所以索引失效着也不会漏掉
