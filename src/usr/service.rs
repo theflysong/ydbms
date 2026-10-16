@@ -68,7 +68,7 @@
 //! (哪怕被 `kill -9`)内核就释放,没有"陈旧锁文件"要清理.恢复也要在锁下做
 //! ([`ServiceDir::open`] 里先上锁,再恢复).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, TryLockError};
 use std::rc::Rc;
 use std::path::{Path, PathBuf};
@@ -83,6 +83,7 @@ use super::{
 use crate::db::table::{is_file_stem_safe, DbError, Result, Table};
 use crate::pers::csv::promote;
 use crate::pers::heap::{self, truncate_moves, BufferPool, HeapFile, HeapTab};
+use crate::pers::Storage;
 use crate::pers::{CsvPersister, Persister, TablePath};
 
 /// `catalog.json` 的格式版本.
@@ -209,6 +210,16 @@ pub struct TableFootprint {
     /// 行位置日志里已提交的条数.
     #[serde(default)]
     pub moved: usize,
+    /// 这张表按 **CSV** 落盘吗(见 [`Storage`](crate::pers::Storage)).
+    ///
+    /// `heap` 与 `csv` **都**是 `false` 时,这张表在清单里**没有格式记录**:那是
+    /// TODO 7.5 之前留下的老库(只有一份 `<表>.csv`),打开库时按会话的存储模式处置
+    /// (堆模式迁进堆文件,CSV 模式就地认领).
+    #[serde(default)]
+    pub csv: bool,
+    /// CSV 表**文件里的行数**(对账用,与堆表的 `heap_bytes` / `heap_rows` 同一口径).
+    #[serde(default)]
+    pub csv_rows: usize,
 }
 
 impl Default for TableFootprint {
@@ -218,6 +229,8 @@ impl Default for TableFootprint {
             heap_bytes: 0,
             heap_rows: 0,
             moved: 0,
+            csv: false,
+            csv_rows: 0,
         }
     }
 }
@@ -327,6 +340,12 @@ pub struct ServiceDir {
     /// 由 `cmd` 按环境变量设一次(`ServiceDir::with_pool_bytes`),这里不读环境:
     /// 与 `root`/`home` 同一个口径--可测.
     pool_bytes: usize,
+    /// 会话的**存储模式**:从这里打开的库,新建的表按它落盘(见 [`Storage`]).
+    ///
+    /// 与 `pool_bytes` 同一个口径:由 `cmd` 设一次(`ServiceDir::with_storage`),
+    /// 这里不读环境,也不读参数.它**只影响以后新建的表**,已有表照旧按提交记录里
+    /// 记的格式读写.
+    storage: Storage,
 }
 
 impl ServiceDir {
@@ -367,12 +386,19 @@ impl ServiceDir {
         Ok(ServiceDir {
             root,
             pool_bytes: crate::pers::heap::DEFAULT_POOL_BYTES,
+            storage: Storage::default(),
         })
     }
 
     /// 设一次缓冲池预算(见 [`ServiceDir::pool_bytes`]).
     pub fn with_pool_bytes(mut self, bytes: usize) -> Self {
         self.pool_bytes = bytes;
+        self
+    }
+
+    /// 设一次存储模式(见 [`ServiceDir::storage`]).
+    pub fn with_storage(mut self, storage: Storage) -> Self {
+        self.storage = storage;
         self
     }
 
@@ -547,6 +573,7 @@ impl ServiceDir {
             grants,
             manifest: Manifest::default(),
             pool: Rc::new(BufferPool::new(self.pool_bytes)),
+            storage: self.storage,
             lock,
         };
 
@@ -928,7 +955,10 @@ pub struct Database {
     /// 这个库的**缓冲池**(所有页式基表共用一份,见 [`crate::pers::heap`]).
     ///
     /// 预算决定"最多有多少页常驻",于是 `ysql` 的常驻内存与**库的大小无关**.
+    /// CSV 模式下不用它(那些表整表在内存里),建一份空池不花什么钱.
     pool: Rc<BufferPool>,
+    /// 这次连接的**存储模式**:新建的表按它落盘(见 [`Storage`]).
+    storage: Storage,
     /// 单写者锁.**只是持有**:句柄关掉(含进程退出,被 `kill -9`)内核就释放.
     lock: File,
 }
@@ -980,6 +1010,11 @@ impl Database {
         Rc::clone(&self.pool)
     }
 
+    /// 这次连接的**存储模式**:新建的表按它落盘(见 [`Storage`]).
+    pub fn storage(&self) -> Storage {
+        self.storage
+    }
+
     /// 提交记录里每张表的位置(只读;`CREATE TABLE` 造页式堆表时要问它).
     pub fn manifest_tables(&self) -> &BTreeMap<String, TableFootprint> {
         &self.manifest.tables
@@ -992,34 +1027,40 @@ impl Database {
 
     /// 把库里所有表读进来.
     ///
-    /// 扫 `*.heap`(TODO 7.5 之后的基表格式):每个都按模式文件的形状打开一份页式
-    /// 堆表--**只扫记录头建目录**,行体一行都不读.老格式的 `*.csv` 在
-    /// [`Database::recover`] 里已经搬过来了,这里见不到它们.
+    /// 扫 `*.heap` 与 `*.csv`,**按每张表自己的格式**打开(见 [`Storage`]):
+    ///
+    /// * 堆表([`HeapTab`]):只扫记录头建行目录,行体一行都不读;
+    /// * CSV 表([`PhysTab`]):整份读进内存(那是 CSV 格式的固有代价).
+    ///
+    /// 格式以**提交记录**为准(`heap` / `csv` 两个标记):两个文件都在时(迁移崩在
+    /// 删 CSV 那一步)也认得出该读哪一份;两个标记都是 `false` 的是 TODO 7.5 之前
+    /// 的老库,那时**有堆文件就是堆表**,否则按 CSV 读(堆模式下这些表在
+    /// [`Database::recover`] 里已经搬完了).
     ///
     /// 文件主干名与模式里的表名要一致:不一致意味着有人手工动过目录,继续用会写出
-    /// 两份文件,留下幽灵表.
+    /// 两份文件,留下幽灵表.行数也要与提交记录对上(CSV 表同样对账).
     pub fn load_tables(&self) -> Result<Vec<Box<dyn Table>>> {
         let persister = CsvPersister::new();
-        let mut paths = Vec::new();
+        let mut names: BTreeSet<String> = BTreeSet::new();
 
         let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| io_err(&self.dir, e))?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("heap") {
-                paths.push(path);
-            }
+            // `.csv.new` / `.heap.new` 的扩展名不是这两个,暂存残渣扫不到
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("heap") | Some("csv") => names.insert(stem_of(&path)),
+                _ => continue,
+            };
         }
-        paths.sort();
 
-        let mut tables: Vec<Box<dyn Table>> = Vec::with_capacity(paths.len());
-        for path in paths {
-            let at = TablePath::new(&self.dir, &stem_of(&path));
+        let mut tables: Vec<Box<dyn Table>> = Vec::with_capacity(names.len());
+        for stem in names {
+            let at = TablePath::new(&self.dir, &stem);
             let (name, shape) = persister.load_schema(&at)?;
-            let stem = stem_of(&path);
             if stem != name {
                 return Err(DbError::Format {
-                    path: path.display().to_string(),
+                    path: at.schema_path().display().to_string(),
                     line: None,
                     message: format!("{}", tr!("usr.service.018", arg0 = stem, arg1 = name)),
                 });
@@ -1031,11 +1072,42 @@ impl Database {
                 .get(&stem)
                 .copied()
                 .unwrap_or_default();
-            let file = Rc::new(HeapFile::open(&path, footprint.heap_bytes, self.pool())?);
-            let mut table = HeapTab::open(&name, shape, file, footprint.heap_rows)?;
-            // 挪过窝的那些行:新地址在 `<表>.log` 里(见 `pers::heap`)
-            table.apply_moved_log(&at.log_path(), footprint.moved)?;
-            tables.push(Box::new(table));
+            let use_heap = match (footprint.heap, footprint.csv) {
+                (true, _) => true,
+                (false, true) => false,
+                // 没有格式记录的老库:盘上有堆文件就是堆表
+                _ => at.heap_path().is_file(),
+            };
+
+            match use_heap {
+                true => {
+                    let file = Rc::new(HeapFile::open(
+                        &at.heap_path(),
+                        footprint.heap_bytes,
+                        self.pool(),
+                    )?);
+                    let mut table = HeapTab::open(&name, shape, file, footprint.heap_rows)?;
+                    // 挪过窝的那些行:新地址在 `<表>.log` 里(见 `pers::heap`)
+                    table.apply_moved_log(&at.log_path(), footprint.moved)?;
+                    tables.push(Box::new(table));
+                }
+                false => {
+                    let table = persister.load(&at)?;
+                    // 认过的 CSV 表要行数对账(与堆表的字节/行数同一口径)
+                    if footprint.csv && footprint.csv_rows != table.nrows() {
+                        return Err(DbError::Format {
+                            path: at.data_path().display().to_string(),
+                            line: None,
+                            message: format!(
+                                "{}",
+                                tr!("usr.service.039",
+                                    arg0 = stem, arg1 = footprint.csv_rows, arg2 = table.nrows())
+                            ),
+                        });
+                    }
+                    tables.push(Box::new(table));
+                }
+            }
         }
         Ok(tables)
     }
@@ -1047,7 +1119,9 @@ impl Database {
     /// 条数)写进 `manifest.json`.写清单那一刻是**提交点**:它之前的东西都不算数
     /// (打开库时截掉),它之后的都必须做完(推广与删表,幂等).
     ///
-    /// 不走这条路的表(不自己落盘的那种,兜底)仍然整表写成暂存文件再推广.
+    /// **不自己落盘**的表(CSV 模式造出来的 `PhysTab`,以及别的兜底)仍然整表写成
+    /// 暂存文件再推广,位置记成"CSV 表 + 行数".两条路共用同一份提交记录与同一套
+    /// 推广(`apply` 按 `footprint.heap` 分派 `heap::promote` / `csv::promote`).
     ///
     /// 中途失败(IO 错,进程被杀)只会停在三种位置之一,而这三种在重启时都有确定的
     /// 去向:清单没写(尾部的字节不算数,截掉就是提交前);清单写了(推广与删表补完
@@ -1070,9 +1144,18 @@ impl Database {
             // (数据由堆文件自己管,模式不走它)
             persister.save_schema(*table, &at)?;
             let Some(paged) = table.paged() else {
-                // 兜底:不自己落盘的表整表重写(暂存 + 推广)
+                // **CSV 表**(与不自己落盘的表):整表写一遍,暂存之后推广.
+                // 位置记"这张表是 CSV 的,文件里有多少行"--行数与堆表的
+                // `heap_bytes` / `heap_rows` 同一个口径:打开库时对账用.
                 persister.stage(*table, &at)?;
-                manifest.tables.insert(name.clone(), TableFootprint::default());
+                manifest.tables.insert(
+                    name.clone(),
+                    TableFootprint {
+                        csv: true,
+                        csv_rows: table.nrows(),
+                        ..Default::default()
+                    },
+                );
                 promoted.push(name);
                 continue;
             };
@@ -1090,6 +1173,7 @@ impl Database {
                     heap_bytes: bytes,
                     heap_rows: rows,
                     moved: moves,
+                    ..Default::default()
                 },
             );
         }
@@ -1161,12 +1245,36 @@ impl Database {
             manifest.save(&self.dir)?;
         }
 
+        // 清单说是堆表而盘上没有那一份:现在就说清楚.再往后走,
+        // `HeapFile::open` 会顺手把文件**建出来**,报出来的变成"文件里的字节数
+        // 不对"--那句话会让人以为文件被截断了.
+        for (name, footprint) in &manifest.tables {
+            if footprint.heap && !TablePath::new(&self.dir, name).heap_path().is_file() {
+                return Err(DbError::Format {
+                    path: TablePath::new(&self.dir, name).heap_path().display().to_string(),
+                    line: None,
+                    message: format!("{}", tr!("usr.service.038", arg0 = name)),
+                });
+            }
+        }
+
         // 迁移:还是 CSV 基表的那些表(TODO 7.5 之前建的库)
         let pending = self.tables_to_migrate(&manifest)?;
         if !pending.is_empty() {
             let persister = CsvPersister::new();
             for name in &pending {
                 let at = TablePath::new(&self.dir, name);
+                // 7.7 那一版的 `<表>.log` 是**行日志**,里面就是数据;本版的日志是
+                // "行位置日志",重放不了.那种库不能迁(迁了就是静默丢掉那几行),
+                // 宁可开不了库让人手工处理.
+                let log = at.log_path();
+                if fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0) > 0 {
+                    return Err(DbError::Format {
+                        path: log.display().to_string(),
+                        line: None,
+                        message: format!("{}", tr!("usr.service.040", arg0 = name)),
+                    });
+                }
                 let table = persister.load(&at)?;
                 // 写成 `<表>.heap.new`:推广要等提交记录写下去之后(见下面)
                 let bytes = HeapTab::write_dense(&at.heap_path(), &table)?;
@@ -1177,6 +1285,7 @@ impl Database {
                         heap_bytes: bytes,
                         heap_rows: table.nrows(),
                         moved: 0,
+                        ..Default::default()
                     },
                 );
             }
@@ -1240,6 +1349,7 @@ impl Database {
                     heap_bytes: bytes,
                     heap_rows: rows,
                     moved: 0,
+                    ..Default::default()
                 },
             );
             settled.promoted = vec![name.clone()];
@@ -1254,8 +1364,18 @@ impl Database {
         Ok(())
     }
 
-    /// 还没搬进堆文件的那些表(有 `<表>.csv`,而清单里没有它的堆位置).
+    /// 还没搬进堆文件的那些表(有 `<表>.csv`,而清单里没有它的**格式记录**).
+    ///
+    /// 两种情况不算:
+    ///
+    /// * 清单里已经记着它是堆表(搬过了)或 **CSV 表**(已认领,见 [`Storage::Csv`]);
+    /// * 这次连接的存储模式就是 **CSV**:老库**就地当 CSV 用**,一个字节都不搬
+    ///   (位置记录留到下一次提交时补上).
     fn tables_to_migrate(&self, manifest: &Manifest) -> Result<Vec<String>> {
+        if self.storage == Storage::Csv {
+            return Ok(Vec::new());
+        }
+
         let mut out = Vec::new();
         let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
         for entry in entries {
@@ -1265,7 +1385,11 @@ impl Database {
                 continue;
             }
             let stem = stem_of(&path);
-            if manifest.tables.get(&stem).is_some_and(|at| at.heap) {
+            if manifest
+                .tables
+                .get(&stem)
+                .is_some_and(|at| at.heap || at.csv)
+            {
                 continue;
             }
             out.push(stem);

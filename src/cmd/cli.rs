@@ -3,12 +3,13 @@
 //! # 参数
 //!
 //! ```text
-//! ysql [-U 用户] [-d 库] [-f 脚本] [--server-dist 目录] [-h]
+//! ysql [-U 用户] [-d 库] [-f 脚本] [--server-dist 目录] [--storage heap|csv] [-h]
 //! ```
 //!
-//! `-U` / `-d` / `-f` 照 psql 的习惯;`--server-dist` 是本项目自己的说法
-//! ("服务目录",psql 没有这个选项),默认 `$HOME/.ydbms`.手写解析:现有依赖里
-//! 没有 `clap`,而这里只认四个选项--为它引一个参数库不划算.
+//! `-U` / `-d` / `-f` 照 psql 的习惯;`--server-dist` 与 `--storage` 是本项目自己的
+//! 说法.`--storage` 定的是**新建表**用哪种格式(见 [`Storage`]),不给就用这个可执行
+//! 文件的预设:[`run`] 给堆,`ysql-csv` 那一支给 CSV([`run_with`]).手写解析:现有
+//! 依赖里没有 `clap`,而这里只认五个选项--为它引一个参数库不划算.
 //!
 //! # 口令从哪来
 //!
@@ -43,9 +44,10 @@
 //!
 //! # 长脚本请包在 `BEGIN; ... COMMIT;` 里
 //!
-//! 一条语句 = 一个事务,所以没包事务的脚本里**每条写语句都要整表重写一次**
-//! (`pers` 落盘是整表重写).`filmdb.sql` 那种 7.6 万条 INSERT 包了事务,只在末尾写
-//! 一次;不包就是另一回事了.这一句在 `-h` 的帮助里也写着.
+//! 一条语句 = 一个事务,所以没包事务的脚本里**每条写语句都要提交一次**:堆表(默认)
+//! 每次提交只把改动的那几行追加下去,而 **CSV 表**(`ysql-csv` / `--storage csv`)是
+//! 整表重写一遍.`filmdb.sql` 那种 7.6 万条 INSERT 包了事务,只在末尾写一次;不包就是
+//! 另一回事了.这一句在 `-h` 的帮助里也写着.
 //!
 //! [`Session::failed`]: crate::cmd::Session::failed
 
@@ -55,6 +57,7 @@ use std::path::PathBuf;
 use super::engine::Session;
 use super::repl;
 use crate::pers::heap::DEFAULT_POOL_BYTES;
+use crate::pers::Storage;
 use crate::usr::service::ServiceDir;
 use crate::usr::{RoleAttrs, User, UserStore};
 
@@ -63,6 +66,18 @@ use crate::usr::{RoleAttrs, User, UserStore};
 /// 是**函数**不是 `const`:文案走 [`tr!`](crate::tr),得在运行时按语言查表.
 pub fn help() -> String {
     tr!("cmd.cli.001").into_owned()
+}
+
+/// `--storage` 的值:`heap` 或 `csv`,别的一律报用法错.
+///
+/// 认全名不认缩写(`h` / `c`),也不认大小写混写:这一个开关决定表怎么落盘,
+/// "猜一个"比报错糟糕得多.
+fn parse_storage(value: &str) -> std::result::Result<Storage, String> {
+    match value {
+        "heap" => Ok(Storage::Heap),
+        "csv" => Ok(Storage::Csv),
+        other => Err(format!("{}", tr!("cmd.cli.028", arg0 =  other, arg1 =  help()))),
+    }
 }
 
 /// 命令行**字面**给出的参数:`None` 表示没给(默认值在 [`resolve`] 里补).
@@ -76,6 +91,10 @@ pub struct Options {
     pub script: Option<PathBuf>,
     /// `--server-dist <目录>`.
     pub server_dist: Option<PathBuf>,
+    /// `--storage <heap|csv>`:新建表用哪种格式.
+    ///
+    /// **字面**给出的值(没给就是 `None`,由 [`run_with`] 的预设补上).
+    pub storage: Option<Storage>,
     /// `-h` / `--help`.
     pub help: bool,
 }
@@ -93,6 +112,8 @@ pub struct Args {
     pub script: Option<PathBuf>,
     /// 服务目录.
     pub server_dist: PathBuf,
+    /// 新建表用哪种格式(字面给了就用字面的,否则是这个可执行文件的预设).
+    pub storage: Storage,
 }
 
 /// 解析参数(`argv` **不含**程序名).认不出来的,缺值的都在 `Err` 里带上用法.
@@ -183,11 +204,23 @@ pub fn resolve(
         database_given,
         script: options.script.clone(),
         server_dist,
+        // 预设已经在 [`run_with`] 里注进 `options` 了(字面给的值优先),
+        // 所以走到这儿一定有个值;真没有就是内存模式那种直连,给默认的
+        storage: options.storage.unwrap_or_default(),
     })
 }
 
-/// `ysql` 的入口.返回值就是进程的退出码.
+/// `ysql` 的入口(预设:堆).返回值就是进程的退出码.
 pub fn run() -> i32 {
+    run_with(Storage::Heap)
+}
+
+/// 同 [`run`],但把**默认的存储模式**换成 `preset`(命令行给了 `--storage` 就听命令行的).
+///
+/// `ysql-csv` 那一支(`src/bin/ysql-csv.rs`)就是拿 [`Storage::Csv`] 调它:同一个程序,
+/// 两个名字,一份代码--不必为它加 cargo feature,也不必把任何一种存储引擎排除出
+/// 二进制(两种格式本来就都在里面,见 `src/pers/mod.rs`).
+pub fn run_with(preset: Storage) -> i32 {
     // 语言先定下来(读 YDBMS_LANG / LC_ALL / LANG;都认不出来就用默认的 zh-CN):
     // 帮助与每一条错误都是 `tr!` 出来的,晚了就成了"半路换语言"
     crate::i18n::init_from_env();
@@ -195,13 +228,17 @@ pub fn run() -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let getenv = |key: &str| std::env::var(key).ok();
 
-    let options = match parse(&argv) {
+    let mut options = match parse(&argv) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}");
             return 1;
         }
     };
+    // 预设只在命令行**没给** `--storage` 时生效
+    if options.storage.is_none() {
+        options.storage = Some(preset);
+    }
 
     if options.help {
         print!("{}", help());
@@ -265,7 +302,9 @@ fn connect(
         .map_err(|e| format!("{}", tr!("cmd.cli.011", e = e)))?
         // 缓冲池预算:页式基表(TODO 7.5)最多常驻多少页由它定,于是 `ysql` 的
         // 常驻内存与库的大小无关.`YDBMS_BUFFER_POOL_MB` 覆盖默认值.
-        .with_pool_bytes(buffer_pool_bytes(getenv));
+        .with_pool_bytes(buffer_pool_bytes(getenv))
+        // 存储模式:新建的表按它落盘(已有表照旧按提交记录里记的格式读写)
+        .with_storage(args.storage);
 
     let user = authenticate(&service, args, getenv)?;
 
@@ -364,7 +403,7 @@ fn password_for(
 
 /// 认出来的选项名.
 fn is_flag(arg: &str) -> bool {
-    matches!(arg, "-U" | "-d" | "-f" | "--server-dist")
+    matches!(arg, "-U" | "-d" | "-f" | "--server-dist" | "--storage")
 }
 
 /// 贴写的选项:`-U用户` / `--server-dist=目录`.
@@ -399,6 +438,7 @@ fn set_value(
         "-d" => options.database = Some(value),
         "-f" => options.script = Some(PathBuf::from(value)),
         "--server-dist" => options.server_dist = Some(PathBuf::from(value)),
+        "--storage" => options.storage = Some(parse_storage(&value)?),
         other => return Err(format!("{}", tr!("cmd.cli.027", arg0 =  other, arg1 =  help()))),
     }
     Ok(())

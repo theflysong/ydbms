@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use ydbms::cmd::cli::{help, parse, resolve, Args, Options};
+use ydbms::pers::Storage;
 
 /// 把参数写成人话(`&["-U", "bob"]`).
 fn argv(items: &[&str]) -> Vec<String> {
@@ -31,8 +32,18 @@ fn no_env() -> impl Fn(&str) -> Option<String> {
 // ------------------------------------------------------------------ 帮助
 
 #[test]
-fn help_lists_the_four_options_and_their_defaults() {
-    for needle in ["-U", "-d", "-f", "--server-dist", "$USER", "$HOME/.ydbms", "PGPASSWORD"] {
+fn help_lists_the_five_options_and_their_defaults() {
+    for needle in [
+        "-U",
+        "-d",
+        "-f",
+        "--server-dist",
+        "--storage",
+        "ysql-csv",
+        "$USER",
+        "$HOME/.ydbms",
+        "PGPASSWORD",
+    ] {
         assert!(help().contains(needle), "帮助里少了 `{needle}`:\n{}", help());
     }
     // 默认值也要写出来
@@ -53,6 +64,7 @@ fn the_four_options_are_parsed_with_and_without_a_space() {
             database: Some("filmdb".to_string()),
             script: Some(PathBuf::from("s.sql")),
             server_dist: Some(PathBuf::from("/x")),
+            storage: None,
             help: false,
         }
     );
@@ -60,6 +72,31 @@ fn the_four_options_are_parsed_with_and_without_a_space() {
     // 贴写:短选项贴值,长选项用 =
     let attached = parse(&argv(&["-Ubob", "-dfilmdb", "-fs.sql", "--server-dist=/x"])).expect("解析");
     assert_eq!(attached, options);
+}
+
+#[test]
+fn the_storage_option_is_parsed_with_and_without_a_space() {
+    let separate = parse(&argv(&["--storage", "csv"])).expect("解析");
+    assert_eq!(separate.storage, Some(Storage::Csv));
+
+    let attached = parse(&argv(&["--storage=heap"])).expect("解析");
+    assert_eq!(attached.storage, Some(Storage::Heap));
+
+    // 没给就是"没给":预设由入口(`run_with`)补,解析这一层不认识预设
+    let none = parse(&argv(&["-U", "bob"])).expect("解析");
+    assert_eq!(none.storage, None);
+}
+
+#[test]
+fn an_unknown_storage_mode_is_a_usage_error() {
+    let err = parse(&argv(&["--storage", "sqlite"])).expect_err("只认 heap 与 csv");
+    assert!(err.contains("sqlite"), "{err}");
+    assert!(err.contains("--storage"), "报错要带上帮助:{err}");
+
+    // 大小写与缩写也不认:这一个开关决定表怎么落盘,猜一个比报错糟糕
+    for value in ["Heap", "CSV", "h", "c"] {
+        assert!(parse(&argv(&["--storage", value])).is_err(), "{value} 不该被认下");
+    }
 }
 
 #[test]
@@ -116,8 +153,18 @@ fn defaults_come_from_user_and_home() {
             database_given: false,
             script: None,
             server_dist: PathBuf::from("/home/bob/.ydbms"),
+            storage: Storage::Heap,
         }
     );
+}
+
+#[test]
+fn the_default_storage_mode_is_heap() {
+    // 预设的注入在入口那一层(`run_with`),这里钉的是"`resolve` 手里没有字面值时的
+    // 兜底":堆.`ysql-csv` 那一支靠入口把预设填进 `Options`,所以它到得了 CSV.
+    let options = parse(&argv(&[])).expect("解析");
+    let args = resolve(&options, &env(&[("USER", "bob"), ("HOME", "/home/bob")])).expect("补默认值");
+    assert_eq!(args.storage, Storage::Heap);
 }
 
 #[test]

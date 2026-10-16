@@ -37,6 +37,10 @@
   (每次提交要写一遍提交记录,并把它记的那些字节"认下来"),几千条 INSERT 也看得出来.
   所以 `-f` / `\i` 的长装载仍然要**包在 `BEGIN; ... COMMIT;` 里**(`filmdb.sql` 本来
   就是这样),这句话在 `ysql -h`,`engine.rs` 文件头与 `repl.rs` 的横幅里都要有.
+- **存储模式**(`--storage heap|csv`,`ysql-csv` 预设 CSV)决定**新建的表**用哪种格式
+  (见 `usr/AGENTS.md` 的"存储模式"):`Store::new_table` 按它造堆表或内存表.已有表
+  照旧按提交记录里记的格式读写,所以两支二进制(乃至同一支的两种模式)都能打开同一个
+  库,两种格式可以同库并存.
 - `Session::commit` 只写 `dirty` 里的表,并把"磁盘上有,符号表里已经没了"的表文件删掉
   (`DROP SCHEMA ... CASCADE` 靠这条落盘,**不需要语句报告删了谁**),最后交给
   `Database::commit`(追加式堆文件 + `manifest.json`,**一次提交是原子的**).

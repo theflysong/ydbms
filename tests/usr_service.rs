@@ -13,6 +13,7 @@ use ydbms::db::table::{Column, ColumnsShape, DataType, Table, Value};
 use ydbms::db::PhysTab;
 use ydbms::pers::heap::encode_row;
 
+use ydbms::pers::Storage;
 use ydbms::usr::service::{Manifest, TableFootprint};
 use ydbms::usr::{ServiceDir, User};
 
@@ -78,6 +79,186 @@ fn open_session(service: &ServiceDir, database: &str, as_user: &User) -> Session
         Sink::buffer(),
     )
     .expect("起会话")
+}
+
+/// 同一个服务目录,但**存储模式预设成 CSV**(新建的表落成 `<表>.csv`).
+fn csv_service(service: &ServiceDir) -> ServiceDir {
+    service.clone().with_storage(Storage::Csv)
+}
+
+// ------------------------------------------------------------ 存储模式(CSV / 堆)
+
+#[test]
+fn a_csv_table_is_written_as_plain_csv_and_read_back() {
+    let dir = TempDir::new("csv-mode");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+
+    {
+        let mut session = open_session(&csv_service(&service), "d", &bob);
+        session.run_script("CREATE TABLE t (x INT, note TEXT); INSERT INTO t VALUES (1, 'a'), (2, 'b');");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+    }
+
+    // 盘上是**标准 CSV**:表头 + 数据行,别的工具直接读
+    let text = std::fs::read_to_string(lib.join("t.csv")).expect("t.csv 该在");
+    assert_eq!(text, "x,note\n1,a\n2,b\n");
+    assert!(!lib.join("t.heap").exists(), "CSV 模式不该落堆文件");
+    let manifest = Manifest::load(&lib).unwrap().expect("提交记录在");
+    let footprint = manifest.tables.get("t").copied().expect("t 的位置");
+    assert!(footprint.csv && !footprint.heap, "{footprint:?}");
+    assert_eq!(footprint.csv_rows, 2);
+
+    // 再开一次(还是 CSV 模式)读回来
+    let session = open_session(&csv_service(&service), "d", &bob);
+    let t = session.symbols().relation("t").expect("t 回来了");
+    assert_eq!(t.nrows(), 2);
+    assert_eq!(t.row(1).unwrap()[1], Value::Text("b".into()));
+}
+
+#[test]
+fn a_csv_table_survives_a_heap_mode_session() {
+    // 格式跟着**表**走:堆模式的会话照旧读得到 CSV 表,而且**不会**把它搬走
+    let dir = TempDir::new("csv-kept");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+
+    {
+        let mut session = open_session(&csv_service(&service), "d", &bob);
+        session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (7);");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+    }
+
+    {
+        // 默认(堆)模式的会话:读得到,而且没把它迁走
+        let mut session = open_session(&service, "d", &bob);
+        let t = session.symbols().relation("t").expect("t 回来了");
+        assert_eq!(t.row(0).unwrap()[0], Value::Int(7));
+        // 在这个会话里再建一张表:它是堆表(两种格式同库并存)
+        session.run_script("CREATE TABLE u (y INT); INSERT INTO u VALUES (9);");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+    }
+
+    assert!(lib.join("t.csv").is_file(), "CSV 表还在");
+    assert!(!lib.join("t.heap").exists(), "CSV 表不该被迁成堆表");
+    assert!(lib.join("u.heap").is_file(), "堆模式新建的是堆表");
+
+    // 两种格式各读一遍(库上只有一个写者,两次会话要**先后**开)
+    {
+        let session = open_session(&service, "d", &bob);
+        assert_eq!(session.symbols().relation("t").unwrap().row(0).unwrap()[0], Value::Int(7));
+        assert_eq!(session.symbols().relation("u").unwrap().row(0).unwrap()[0], Value::Int(9));
+    }
+    // CSV 模式的会话反过来读那张堆表,也一样读得到
+    let csv_only = open_session(&csv_service(&service), "d", &bob);
+    assert_eq!(
+        csv_only.symbols().relation("t").unwrap().row(0).unwrap()[0],
+        Value::Int(7)
+    );
+    assert_eq!(
+        csv_only.symbols().relation("u").unwrap().row(0).unwrap()[0],
+        Value::Int(9)
+    );
+}
+
+#[test]
+fn a_legacy_csv_database_is_adopted_in_place_in_csv_mode() {
+    // 老库(只有 `<表>.csv`,提交记录里没有格式记录)+ CSV 模式 = **一个字节都不搬**
+    let dir = TempDir::new("csv-adopt");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+    write_legacy_csv(&lib);
+
+    let session = open_session(&csv_service(&service), "d", &bob);
+    let t = session.symbols().relation("t").expect("t 回来了");
+    assert_eq!(t.nrows(), 2);
+    assert!(lib.join("t.csv").is_file(), "还是 CSV");
+    assert!(!lib.join("t.heap").exists(), "没有搬成堆文件");
+}
+
+#[test]
+fn a_legacy_csv_database_is_still_migrated_in_heap_mode() {
+    // 同一个老库交给默认(堆)模式:照旧迁进堆文件,CSV 删掉
+    let dir = TempDir::new("csv-migrate");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+    write_legacy_csv(&lib);
+
+    let session = open_session(&service, "d", &bob);
+    let t = session.symbols().relation("t").expect("t 回来了");
+    assert_eq!(t.nrows(), 2);
+    assert!(lib.join("t.heap").is_file(), "搬进堆文件了");
+    assert!(!lib.join("t.csv").exists(), "老 CSV 该删掉");
+}
+
+#[test]
+fn a_csv_table_whose_file_row_count_changed_is_refused() {
+    // 提交记录记着这张表有多少行:对不上就是有人手工动过目录,宁可开不了库
+    let dir = TempDir::new("csv-rows");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+    write_legacy_csv(&lib);
+    std::fs::write(
+        lib.join("manifest.json"),
+        r#"{"version":2,"tables":{"t":{"csv":true,"csv_rows":2}},"promoted":[],"removed":[]}"#,
+    )
+    .unwrap();
+
+    // 手工多加一行:文件说 3,记录说 2(对账在**读回来**那一步)
+    std::fs::write(lib.join("t.csv"), "x,note\n1,a\n2,b\n3,c\n").unwrap();
+    let db = csv_service(&service).open("d", &bob).expect("目录还在");
+    let err = match db.load_tables() {
+        Ok(tables) => panic!("行数对不上就该拒绝(读回来 {} 张表)", tables.len()),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("2") && err.to_string().contains("3"), "{err}");
+}
+
+#[test]
+fn a_legacy_row_log_refuses_to_be_migrated() {
+    // 7.7 那一版的 `<表>.log` 是行日志(数据在里面):本版重放不了,只能拒绝迁移
+    // --迁了就是静默把那几行丢掉
+    let dir = TempDir::new("legacy-log");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+    write_legacy_csv(&lib);
+    std::fs::write(lib.join("t.log"), "U,0,1,a\n").unwrap();
+
+    let err = match service.open("d", &bob) {
+        Ok(_) => panic!("老日志非空就该拒绝迁移"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("t.log"), "{err}");
+    assert!(lib.join("t.csv").is_file(), "拒绝之后老数据一个字节都不动");
+    assert!(!lib.join("t.heap").exists());
+}
+
+/// 手搓一个 TODO 7.5 之前的老库:一份 `<表>.csv` + 模式文件 + 没有格式记录的清单.
+fn write_legacy_csv(lib: &Path) {
+    std::fs::create_dir_all(lib).unwrap();
+    std::fs::write(lib.join("t.csv"), "x,note\n1,a\n2,b\n").unwrap();
+    std::fs::write(
+        lib.join("t.schema.json"),
+        r#"{"version":1,"name":"t","columns":[{"name":"x","ty":"INT"},{"name":"note","ty":"TEXT"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        lib.join("manifest.json"),
+        r#"{"version":2,"tables":{"t":{"base":2,"log":0}},"promoted":[],"removed":[]}"#,
+    )
+    .unwrap();
 }
 
 // ------------------------------------------------------------ 库目录与元数据
@@ -695,6 +876,7 @@ fn crash_after_the_manifest(lib: &Path) {
             heap_bytes: size,
             heap_rows: footprint.heap_rows.max(1),
             moved: footprint.moved,
+            ..Default::default()
         },
     );
     manifest.save(lib).expect("写提交记录");
@@ -716,6 +898,7 @@ fn crash_with_a_staged_heap(lib: &Path) {
             heap_bytes: bytes,
             heap_rows: 1,
             moved: 0,
+            ..Default::default()
         },
     );
     manifest.promoted = vec!["t".to_string()];

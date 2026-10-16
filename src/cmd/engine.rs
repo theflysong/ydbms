@@ -93,9 +93,10 @@
 //! 了;而 `ysql -f filmdb.sql` 那种整段包在 `BEGIN; ... COMMIT;` 里的装载,中途一次
 //! 都不落盘,只在 `COMMIT` 那一条写上 11 张表.
 //!
-//! > **所以整段装载请包在 `BEGIN; ... COMMIT;` 里.** 不包的话,每条写语句都要把整张表
-//! > 重写一遍(`pers` 的表落盘是整表重写),几千条 INSERT 就开始明显变慢--这是
-//! > "一条语句一个事务"的直接代价,文档里要说清(`ysql` 的 `-f` 也一样).
+//! > **所以整段装载请包在 `BEGIN; ... COMMIT;` 里.** 不包的话,每条写语句都要提交
+//! > 一次:堆表(默认)每次提交只把改动的那几行追加下去,而 **CSV 表**(`ysql-csv`)
+//! > 是整表重写一遍--几千条 INSERT 就开始明显变慢.这是"一条语句一个事务"的直接
+//! > 代价,文档里要说清(`ysql` 的 `-f` 也一样).
 //!
 //! `Session::run_sql` 在每条语句之后调 [`Session::commit`],它做三件事:
 //!
@@ -148,6 +149,7 @@ use crate::ir::stmt::{
 use crate::usr::grants::Privilege;
 use crate::ir::{Outcome, Script, StmtResult, Symbol, SymbolTable, TxOp};
 use crate::pers::heap::{HeapFile, HeapTab};
+use crate::pers::Storage;
 use crate::usr::service::{Database, ServiceDir};
 use crate::usr::{PasswordAction, User};
 
@@ -523,19 +525,32 @@ impl Server for Store {
         self.service.set_database_owner(name, owner)
     }
 
-    /// `CREATE TABLE` 造一张**页式堆表**(TODO 7.5):数据写在库目录的 `<表>.heap`
-    /// 里,内存里只留一份行目录与页缓存--表多大都不占内存.
+    /// `CREATE TABLE` 造一张基表:**按这次连接的存储模式**决定它落盘时用哪种格式
+    /// (见 [`Storage`]).
+    ///
+    /// * [`Storage::Heap`](默认):页式堆表(TODO 7.5)--数据写在库目录的
+    ///   `<表>.heap` 里,内存里只留一份行目录与页缓存,表多大都不占内存;
+    /// * [`Storage::Csv`]):内存里的 `PhysTab`--提交时整表写成标准 CSV
+    ///   (`Table::paged` 给 `None`,提交点自然走整表重写那条路).
+    ///
+    /// 造出来的表在**这一次会话里**就是那种格式;盘上怎么记由提交点写进提交记录
+    /// (`TableFootprint` 的 `heap` / `csv`).
     fn new_table(&mut self, name: &str, columns: &[Column]) -> Result<Box<dyn Table>> {
-        let path = self.db.heap_path(name);
-        let footprint = self
-            .db
-            .manifest_tables()
-            .get(name)
-            .copied()
-            .unwrap_or_default();
-        let file = Rc::new(HeapFile::open(&path, footprint.heap_bytes, self.db.pool())?);
         let shape = ColumnsShape::new(columns.to_vec());
-        Ok(Box::new(HeapTab::open(name, shape, file, footprint.heap_rows)?))
+        match self.db.storage() {
+            Storage::Csv => Ok(Box::new(PhysTab::new(name, &shape))),
+            Storage::Heap => {
+                let path = self.db.heap_path(name);
+                let footprint = self
+                    .db
+                    .manifest_tables()
+                    .get(name)
+                    .copied()
+                    .unwrap_or_default();
+                let file = Rc::new(HeapFile::open(&path, footprint.heap_bytes, self.db.pool())?);
+                Ok(Box::new(HeapTab::open(name, shape, file, footprint.heap_rows)?))
+            }
+        }
     }
 
     fn forget_grants(&mut self, table: &str) -> Result<()> {

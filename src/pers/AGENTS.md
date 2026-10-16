@@ -5,11 +5,13 @@
 把表写进介质,再从介质读回来.
 
 - `mod.rs` -- [`Persister`](mod.rs) 抽象;`TablePath { data, schema }` 记住一对文件.
-- `heap.rs` -- [`HeapTab`](heap.rs) / [`BufferPool`](heap.rs):**基表**的格式(页式堆
+- `heap.rs` -- [`HeapTab`](heap.rs) / [`BufferPool`](heap.rs):基表格式之一(页式堆
   文件 + 缓冲池,TODO 7.5).数据在磁盘上,按行号随机访问,写只追加.
-- `csv.rs` -- [`CsvPersister`](csv.rs):数据存标准 CSV,模式存旁路 JSON.基表**不用**
-  它了(改堆文件),它还剩两件事:老库的**迁移**(`load`)与**兜底**(不自己落盘的表
-  整表写出去).
+- `csv.rs` -- [`CsvPersister`](csv.rs):基表格式之一(标准 CSV + 旁路 JSON).数据整份
+  读进内存,整表重写出去,换来"文件别的工具直接读".
+
+**两种基表格式是并列的**,由 [`Storage`](mod.rs) 选(会话级,见 `usr/AGENTS.md` 的
+"存储模式"):一张表用哪一种记在提交记录里,同一个库可以两种并存.
 
 **这一层只依赖 [`Table`](../db/table.rs) 抽象**:`save` 吃的是 `&dyn Table`,所以
 连接表等虚表的结果也能直接落盘.**不要往下假设它是 `PhysTab`.** 反过来,"我自己

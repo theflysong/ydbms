@@ -5,18 +5,19 @@
 //!
 //! # 磁盘布局
 //!
-//! 基表(TODO 7.5 起)是**页式堆文件**(见 [`heap`]),模式仍然放在旁路文件里:
+//! 基表有**两种并列的格式**(见 [`Storage`]),由会话的存储模式决定新建的表用哪一种,
+//! 而一张表自己用的是哪一种记在库目录的 `manifest.json` 里:
 //!
 //! ```text
-//! <dir>/<name>.heap          基表:记录流 [len u32][rid u32][行编码](只追加)
-//! <dir>/<name>.log           行位置日志:挪过窝的行在这里改地址(只追加)
+//! <dir>/<name>.heap          堆表:记录流 [len u32][rid u32][行编码](只追加)
+//! <dir>/<name>.log           堆表:行位置日志,挪过窝的行在这里改地址(只追加)
+//! <dir>/<name>.csv           CSV 表:纯列名表头 + 数据行
 //! <dir>/<name>.schema.json   模式:{version, name, columns:[{name, ty}]}
 //! ```
 //!
-//! 之所以把类型信息放在旁路文件里,是为了让数据与"值怎么写成字节"分开:堆文件里存
-//! 的是**CSV 字段文本**那一套(NULL 是 `\N`),于是老库读得回来,人也能看懂.
-//! 老格式的 CSV 基表(`<name>.csv`)只剩**迁移**这一条路:`usr::service` 打开库时
-//! 把它整表搬进堆文件,然后删掉.
+//! 两种格式**可以在同一个库里并存**,打开库时按记录分派(规则见 `usr/AGENTS.md`).
+//! 之所以把类型信息放在旁路文件里,是为了让数据与"值怎么写成字节"分开:两种格式存的
+//! 都是**CSV 字段文本**那一套(NULL 是 `\N`),于是老库读得回来,人也能看懂.
 //!
 //! **整表重写**分两步:`stage` 把两份文件写成暂存名
 //! (`<name>.csv.new` / `<name>.schema.json.new`),之后再逐个 rename 到正式位置
@@ -43,6 +44,30 @@ pub mod heap;
 
 pub use csv::CsvPersister;
 pub use heap::{BufferPool, HeapTab};
+
+/// 基表落盘用哪种格式.
+///
+/// 一个**会话**有一个默认(新建的表按它落盘),而**表自己的格式**记在库目录的
+/// `manifest.json` 里:两种格式可以在同一个库里并存,打开库时按记录分派
+/// (见 `usr/AGENTS.md` 的"存储模式").`ysql` 默认 [`Storage::Heap`]`,`ysql-csv`
+/// 预设成 [`Storage::Csv`].
+///
+/// 两者的取舍(同一台机器,同一个 IMDb 库上实测):
+///
+/// | | [`Storage::Heap`] | [`Storage::Csv`] |
+/// |---|---|---|
+/// | 打开库 | 只扫记录头,常驻 = 池预算 + 12 字节/行(593 MB 的库约 30 MB) | **整表读进内存**(同一个库约 950 MB) |
+/// | 改一行提交 | 只追加那几条记录 | **整表重写**(38 MB 的表上 200~270 ms) |
+/// | 数据文件 | 二进制的记录流,只能靠 `ysql` 读 | 标准 CSV,别的工具直接读 |
+/// | 顺序扫描的谓词 | 值是解码出来的,**借不出去** | 表是 `PhysTab`,**能借行**(被丢掉的行不克隆) |
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Storage {
+    /// **页式堆文件** + 缓冲池(TODO 7.5):数据不在内存里,写只追加.
+    #[default]
+    Heap,
+    /// **标准 CSV** + 旁路模式文件:整表进内存,提交时整表重写.
+    Csv,
+}
 
 use std::path::{Path, PathBuf};
 
@@ -83,7 +108,10 @@ impl TablePath {
         TablePath { data, schema }
     }
 
-    /// 数据文件路径.
+    /// **CSV 表**的数据文件路径(`<name>.csv`).
+    ///
+    /// 页式堆表的数据在 [`TablePath::heap_path`] 那一份里;两条路径都由这里推出来,
+    /// 磁盘布局的规则只此一处.
     pub fn data_path(&self) -> &Path {
         &self.data
     }

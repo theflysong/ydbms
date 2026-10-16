@@ -22,6 +22,14 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ysql")
 }
 
+/// `ysql-csv` 的二进制:与 `ysql` 在同一个输出目录里,只是名字不同.
+///
+/// 用"兄弟文件"推而不是 `env!("CARGO_BIN_EXE_ysql-csv")`:环境变量名里带横线在
+/// 有些 shell 下不好使,而这两个目标本来就由**同一次** `cargo build` 产出.
+fn csv_bin() -> PathBuf {
+    PathBuf::from(bin()).with_file_name("ysql-csv")
+}
+
 /// 自清理的临时目录(每个用例一个**服务目录**).
 struct TempDir {
     path: PathBuf,
@@ -134,6 +142,60 @@ fn bootstrap(dir: &TempDir) {
     assert!(out.status.success(), "bootstrap 失败:{}", stderr(&out));
     assert!(dir.path().join("users.json").is_file());
     assert!(dir.path().join("bob/catalog.json").is_file(), "默认库一并建出来");
+}
+
+#[test]
+fn a_csv_table_is_plain_csv_on_disk_and_readable_by_the_heap_binary() {
+    // 存储模式两个入口:`ysql --storage csv` 与 `ysql-csv`(预设).两者造的都是一份
+    // **标准 CSV**;而默认(堆)那一支照样读得到它--格式跟着表走,两种可以同库并存.
+    let dir = TempDir::new("storage-csv");
+    bootstrap(&dir);
+
+    let create = dir.script(
+        "create.sql",
+        "CREATE TABLE t (x INT, note TEXT);\nINSERT INTO t VALUES (1, 'a'), (2, 'b');\n",
+    );
+    let out = run(
+        &dir,
+        &["-U", "bob", "-d", "bob", "--storage", "csv", "-f", create.to_str().unwrap()],
+        Some(PASSWORD),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let lib = dir.path().join("bob");
+    assert_eq!(
+        std::fs::read_to_string(lib.join("t.csv")).expect("t.csv 该在"),
+        "x,note\n1,a\n2,b\n",
+        "CSV 表就是标准 CSV"
+    );
+    assert!(!lib.join("t.heap").exists(), "不该落堆文件");
+
+    // 默认(堆)那一支读得回来
+    let query = dir.script("query.sql", "SELECT note FROM t ORDER BY x;\n");
+    let out = run(&dir, &["-U", "bob", "-d", "bob", "-f", query.to_str().unwrap()], Some(PASSWORD));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains('a') && text.contains('b'), "{text}");
+
+    // 再用 `ysql-csv` 那一支建第二张表:同一次构建产出的另一个二进制
+    assert!(csv_bin().is_file(), "同一次 cargo build 该产出 {} ", csv_bin().display());
+    let mut command = Command::new(csv_bin());
+    command
+        .arg("--server-dist")
+        .arg(dir.path())
+        .args(["-U", "bob", "-d", "bob", "-f"])
+        .arg(dir.script("second.sql", "CREATE TABLE u (y INT);\nINSERT INTO u VALUES (9);\n"))
+        .env_remove("PGPASSWORD")
+        .env("PGPASSWORD", PASSWORD)
+        .env("YDBMS_LANG", "zh-CN")
+        .stdin(Stdio::null());
+    let out = command.output().expect("起不了 ysql-csv");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(lib.join("u.csv").is_file(), "ysql-csv 建的表也是 CSV");
+    assert_eq!(
+        std::fs::read_to_string(lib.join("u.csv")).unwrap(),
+        "y\n9\n"
+    );
 }
 
 // ------------------------------------------------------------------ 参数
