@@ -558,9 +558,10 @@ fn distinct_on_is_still_rejected() {
 #[test]
 fn unknown_functions_are_rejected_by_name() {
     let mut db = SymbolTable::new();
-    // `UPPER` / `LEFT` / `CONCAT_WS` / `ROUND` 都已经实现了,挑一个真没有的
-    let err = failure(&mut db, "SELECT LOWER('x') AS x");
-    assert!(err.to_string().contains("lower"), "{err}");
+    // `ROUND` / `UPPER` / `LOWER` / `LEFT` / `LENGTH` / `CONCAT_WS` / `EXTRACT` 都已经
+    // 实现了,挑一个真没有的
+    let err = failure(&mut db, "SELECT TRIM('x') AS x");
+    assert!(err.to_string().contains("trim"), "{err}");
 }
 
 #[test]

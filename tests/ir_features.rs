@@ -284,10 +284,119 @@ fn numeric_cast_turns_integers_into_decimals() {
 #[test]
 fn unsupported_casts_are_rejected() {
     let symbols = db();
-    let err = rejected(&symbols, "SELECT name::int FROM t");
-    assert!(err.to_string().contains("不能把"), "{err}");
+    // 值模型里没有意义的组合仍在**降级期**拒绝:时间戳不能直接当整数用,整数也不能
+    // 直接当日期用(PostgreSQL 也拒绝这两条).`DATE` 与 `TIMESTAMP` 互转同样是拒绝的
+    // --那是记录在案的偏差(`db::table` 的 `TypeFamily` 文档里写着).
+    for sql in ["SELECT joined::int FROM t", "SELECT id::date FROM t"] {
+        let err = rejected(&symbols, sql);
+        assert!(err.to_string().contains("不能把"), "`{sql}`:{err}");
+    }
 }
 
+#[test]
+fn lower_folds_case() {
+    // 期望值对照过 PostgreSQL 18.6
+    let symbols = db();
+    let out = q(
+        &symbols,
+        "SELECT LOWER('AbC') AS l, LOWER(NULL) AS nl, LOWER(name) AS lower_name
+         FROM t WHERE id = 3",
+    );
+    assert_eq!(out.value(0, 0), Some(Value::Text("abc".to_string())));
+    assert_eq!(out.value(0, 1), Some(Value::Null));
+    // 第 3 行的 name 是 'Céline':按字符折,不按字节
+    assert_eq!(out.value(0, 2), Some(Value::Text("céline".to_string())));
+
+    // 非文本参数照样拒绝(PostgreSQL 也是 `function lower(integer) does not exist`)
+    let err = rejected(&symbols, "SELECT LOWER(id) FROM t");
+    assert!(err.to_string().contains("必须是 TEXT"), "{err}");
+}
+
+// ------------------------------------------------------------------ CAST
+
+#[test]
+fn casting_to_text_keeps_the_rendered_form() {
+    let symbols = db();
+
+    let out = q(
+        &symbols,
+        "SELECT CAST(1994 AS TEXT) AS lit,
+                CAST(id AS TEXT) AS id_text,
+                CAST(score AS TEXT) AS score_text,
+                CAST(joined AS TEXT) AS joined_text,
+                CAST(NULL AS TEXT) AS nothing,
+                CAST(name AS TEXT) AS name_text
+         FROM t WHERE id = 1",
+    );
+    assert_eq!(out.value(0, 0), Some(Value::Text("1994".to_string())));
+    assert_eq!(out.value(0, 1), Some(Value::Text("1".to_string())));
+    // `NUMERIC(4,2)` 的 `1.50` 规范化成 `1.5`:这是 `Value::Numeric` 的不变量
+    // (PostgreSQL 会原样保留 `1.50`,那条偏差写在 `db::table` 里)
+    assert_eq!(out.value(0, 2), Some(Value::Text("1.5".to_string())));
+    assert_eq!(
+        out.value(0, 3),
+        Some(Value::Text("2023-01-02 00:00:00.000000".to_string()))
+    );
+    assert_eq!(out.value(0, 4), Some(Value::Null));
+    // 同族恒等
+    assert_eq!(out.value(0, 5), Some(Value::Text("Alice".to_string())));
+
+    // **呈现与渲染逐字相同**:`CAST(9.5 AS TEXT)` 与 `SELECT 9.5` 渲染出来的字面
+    // 一模一样(类型当然不同:一个是 `TEXT`,一个是 `NUMERIC`)
+    let casted = q(&symbols, "SELECT CAST(9.5 AS TEXT) AS x");
+    let rendered = q(&symbols, "SELECT 9.5 AS x");
+    assert_eq!(
+        casted.value(0, 0).unwrap().to_string(),
+        rendered.value(0, 0).unwrap().to_string()
+    );
+    assert_eq!(casted.value(0, 0), Some(Value::Text("9.5".to_string())));
+    assert_eq!(rendered.value(0, 0), Some(Value::Numeric("9.5".to_string())));
+}
+
+#[test]
+fn casting_text_to_numbers_and_dates_parses_the_value_at_run_time() {
+    // 字面量走"按目标类型定型字面量"那条路(`cast_literal_to_int` 已经盯着);
+    // 这里要的是**列**上那一条:类型上放行,值到运行期才解析.
+    let mut symbols = db();
+    for sql in [
+        "CREATE TABLE good (code TEXT, num TEXT, day TEXT, ts TEXT)",
+        "INSERT INTO good VALUES ('0042', '9.5', '2024-01-15', '2024-01-15 08:30:00')",
+        "CREATE TABLE bad (code TEXT, num TEXT, day TEXT, ts TEXT)",
+        "INSERT INTO bad VALUES ('abc', 'abc', 'not-a-date', 'nope')",
+    ] {
+        for r in run_script(sql, &mut symbols).expect("应当能解析") {
+            assert!(r.outcome.is_ok(), "第 {} 条失败了:{:?}", r.index, r.outcome);
+        }
+    }
+
+    let out = q(
+        &symbols,
+        "SELECT CAST(code AS INT) AS a,
+                CAST(num AS NUMERIC) AS b,
+                CAST(day AS DATE) AS c,
+                CAST(ts AS TIMESTAMP) AS d
+         FROM good",
+    );
+    assert_eq!(out.value(0, 0), Some(Value::Int(42)));
+    assert_eq!(out.value(0, 1), Some(Value::Numeric("9.5".to_string())));
+    assert_eq!(out.value(0, 2), Some(Value::Date("2024-01-15".to_string())));
+    assert_eq!(
+        out.value(0, 3),
+        Some(Value::Timestamp("2024-01-15 08:30:00.000000".to_string()))
+    );
+
+    // 解析不了的是**运行期**错误(PostgreSQL 也一样:`invalid input syntax for
+    // type integer: "abc"`),而且只可能是这个值的错--类型那一关已经过了
+    for sql in [
+        "SELECT CAST(code AS INT) FROM bad",
+        "SELECT CAST(num AS NUMERIC) FROM bad",
+        "SELECT CAST(day AS DATE) FROM bad",
+        "SELECT CAST(ts AS TIMESTAMP) FROM bad",
+    ] {
+        let err = rejected(&symbols, sql);
+        assert!(err.to_string().contains("看不懂"), "`{sql}`:{err}");
+    }
+}
 // ------------------------------------------------------- 函数与 CURRENT_DATE
 
 #[test]

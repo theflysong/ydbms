@@ -59,8 +59,9 @@
 //! `CASE`,`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`~*`,`||`(文本连接,两侧必须都是文本--
 //! 这条与 PostgreSQL 的 `text || anynonarray` 是**已知偏差**,见 `expr::BinOp`),
 //! `COALESCE`(变参,惰性,类型按 `CASE` 那条规则统一),
-//! `ROUND`/`UPPER`/`LEFT`/`CONCAT_WS`/
-//! `LENGTH`/`EXTRACT(YEAR FROM ...)`/`CURRENT_DATE`,`::numeric`,
+//! `ROUND`/`UPPER`/`LOWER`/`LEFT`/`CONCAT_WS`/
+//! `LENGTH`/`EXTRACT(YEAR FROM ...)`/`CURRENT_DATE`,
+//! `::numeric` 与 `CAST`(**两个方向**:数值 / 日期 / 时间戳 ↔ `TEXT`),
 //! `CREATE TABLE`(`NOT NULL` / `DEFAULT` / `CHECK` 真强制;`PRIMARY KEY` / `UNIQUE` /
 //! `FOREIGN KEY` 接受并**如实记录为未强制**),`INSERT`,`UPDATE`,
 //! `CREATE INDEX` / `DROP INDEX`,`UNION [ALL]`,

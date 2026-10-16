@@ -2705,19 +2705,25 @@ fn lower_expr_in(
         Some(node::Node::AConst(c)) => lower_const(c, expected, p),
 
         Some(node::Node::TypeCast(tc)) => {
-            // `TYPE 'literal'` / `'literal'::TYPE` 是"给字面量定型":直接按目标类型
-            // 解析那个字面量,与过去完全一样.
+            // `TYPE 'literal'` / `'literal'::TYPE` 是"给字面量定型":能落进目标类型
+            // 就直接按目标类型解析它.
             //
-            // 别的表达式(`x::numeric`)走 `Step::Cast`:只有值模型里真有意义的几组
-            // 转换会通过(同族恒等,`INT → NUMERIC`,`NULL`),别的在验证期就被
-            // `cast_type` 拒绝.
+            // **当且仅当**那个字面量真能落进去才走这一条(`const_coercible`):整数
+            // 落不进 `TEXT`,那就得走下面的 `Step::Cast` 真转(`1994::text` 是
+            // `'1994'`);`1994::date` 则在这条路的另一头被 `cast_type` 明确拒绝
+            // (PostgreSQL 也一样:`cannot cast type integer to date`).
+            //
+            // 别的表达式(`x::numeric`)同样是 `Step::Cast`:只有值模型里真有意义的
+            // 几组转换会通过(同族恒等,`INT → NUMERIC`,数值/日期 ↔ 文本,`NULL`).
             let target = column_type(
                 tc.type_name
                     .as_ref()
                     .ok_or_else(|| unsupported(tr!("ir.irgen.137").into_owned()))?,
             )?;
             match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                Some(node::Node::AConst(c)) => lower_const(c, Some(&target), p),
+                Some(node::Node::AConst(c)) if const_coercible(c, &target) => {
+                    lower_const(c, Some(&target), p)
+                }
                 Some(_) => {
                     let value = lower_expr_in(
                         tc.arg.as_deref().expect(&tr!("ir.irgen.138").into_owned()),
@@ -3114,12 +3120,16 @@ fn lower_func_call(
             Ok(p.call(ScalarFunc::Round, args))
         }
 
-        "upper" => {
+        "upper" | "lower" => {
             let args = match call.args.as_slice() {
                 [value] => vec![lower_expr_in(value, scope, None, agg.as_deref_mut(), p)?],
                 _ => return Err(unsupported(tr!("ir.irgen.162").into_owned())),
             };
-            Ok(p.call(ScalarFunc::Upper, args))
+            let func = match name.as_str() {
+                "lower" => ScalarFunc::Lower,
+                _ => ScalarFunc::Upper,
+            };
+            Ok(p.call(func, args))
         }
 
         "length" => {
@@ -3445,6 +3455,31 @@ fn lower_target_list_agg(
 ///
 /// `expected` 是上下文给出的目标类型:`'Alice'` 在没有上下文时默认 TEXT,在
 /// `WHERE name = 'Alice'` 里则按 `name` 的类型解释.
+/// 这个字面量能按 `ty` **隐式定型**吗(PostgreSQL 的"未知类型字面量"那套规则).
+///
+/// 三个调用点共用一条规则,别各写一份:
+///
+/// * [`lower_const`] 有上下文时按它决定"要不要按目标类型解析";
+/// * `TypeCast` 那一支按它决定"`'literal'::TYPE` 是给字面量定型,还是走
+///   `Step::Cast` 真转"(`1994::text` 落不进 `TEXT` 的隐式定型,得走真转);
+/// * 两处对不上就会出现"同一个表达式在字面量上和在列上行为不同"这种怪事.
+///
+/// 口径(与 PostgreSQL 一致):字符串字面量是"未知类型",可以定成任何类型;
+/// 整数只能落到 `INT` / `NUMERIC`(int → numeric 是隐式放大);小数只能落到
+/// `NUMERIC`(或能整值表示的 `INT`).别的**不硬塞**.
+fn const_coercible(c: &AConst, ty: &DataType) -> bool {
+    let family = ty.family();
+    match &c.val {
+        Some(Val::Sval(_)) => true,
+        Some(Val::Ival(_)) => matches!(family, TypeFamily::Int | TypeFamily::Numeric),
+        Some(Val::Fval(f)) => {
+            matches!(family, TypeFamily::Numeric)
+                || (matches!(family, TypeFamily::Int) && f.fval.parse::<i32>().is_ok())
+        }
+        _ => false,
+    }
+}
+
 fn lower_const(c: &AConst, expected: Option<&DataType>, p: &mut ProgBuilder) -> Result<Reg> {
     if c.isnull {
         // `NULL` 关键字:无类型,靠上下文定型(比较,INSERT 的目标列等)
@@ -3462,18 +3497,7 @@ fn lower_const(c: &AConst, expected: Option<&DataType>, p: &mut ProgBuilder) -> 
     // 于是 `verify` 会报出"两侧类型不同"--这正是 PostgreSQL 的行为
     // (`operator does not exist: text = integer`).
     if let Some(ty) = expected {
-        let family = ty.family();
-        let coercible = match &c.val {
-            Some(Val::Sval(_)) => true,
-            Some(Val::Ival(_)) => matches!(family, TypeFamily::Int | TypeFamily::Numeric),
-            Some(Val::Fval(f)) => {
-                matches!(family, TypeFamily::Numeric)
-                    || (matches!(family, TypeFamily::Int) && f.fval.parse::<i32>().is_ok())
-            }
-            _ => false,
-        };
-
-        if coercible {
+        if const_coercible(c, ty) {
             if let Some(text) = literal_text(c) {
                 let value = ty.parse(&text).map_err(|e| at_value(&text, e))?;
                 return Ok(p.value(value));

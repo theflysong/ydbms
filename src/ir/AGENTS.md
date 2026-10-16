@@ -119,6 +119,33 @@ PhysTab                          ← db::source::materialize
   所以这条决策搬到了**降级**:`Step::Case::widen` 由那次类型探针算出来
   (`irgen.rs` 的 `widen_flag`),`Prog::verify` 再强制它与 `unify_branches` 的结果
   一致--对不上报 `IrInvalid`,**绝不放过一个"类型是 NUMERIC,值是 Int"的程序**.
+
+### `CAST` / `::`:两个方向,以及"字面量定型"那一条捷径
+
+`cast_type` 放行的是:
+
+- **同族恒等**(`x::int`,`name::varchar(3)`);
+- `INT → NUMERIC`(PostgreSQL 里唯一的隐式放大);
+- **数值 / 日期 / 时间戳 → `TEXT`**:呈现就是 `Value` 的 `Display`,所以与"直接查
+  那一列"渲染出来的字面**逐字相同**(`CAST(9.5 AS TEXT)` 与 `SELECT 9.5`);
+- **`TEXT` → 数值 / 日期 / 时间戳**:类型上放行,**值到运行期才解析**
+  (`DataType::parse`,于是 `NUMERIC(N,M)` 的标度,`DATE` 的规范形式,`TIMESTAMP`
+  的定宽规范化全都免费拿到);解析不出来报 `EvalError::BadText`--与 PostgreSQL
+  一样是**运行期**错(`'abc'::int`);
+- `NULL → 任意`.
+
+仍然**拒绝**的:`TIMESTAMP`/`DATE` → `INT`,`INT` → `DATE`,以及 `DATE` ↔ `TIMESTAMP`
+互转(最后一条是**记录在案的偏差**,PostgreSQL 允许;口径见 `db::table` 的 `TypeFamily`).
+
+> **`'literal'::TYPE` 有一条捷径,而它必须与列上那条路一致**:能按目标类型**隐式
+> 定型**的字面量走 `irgen::lower_const`(在**降级期**按目标类型解析,解析不了就是
+> 降级期错误),落不进去的走 `Step::Cast` 真转.判据只有一处
+> (`irgen::const_coercible`),`lower_const` 与 `TypeCast` 那一支共用它--
+> 各写一份就会出现"`1994::text` 在字面量上被当成整数,在列上被转成 `'1994'`"
+> 这种怪事(实测踩过).
+
+`UPPER` / `LOWER` 是同一族严格文本函数(`to_uppercase` / `to_lowercase`,按**字符**
+折);参数不是文本就在降级期拒绝(PostgreSQL 也是 `function lower(integer) does not exist`).
   放行之后运行时得**真的转**(`widen_branches`),否则物化时会被 `TypeMismatch`
   顶回来.这条对照过 PostgreSQL 18.6:
   `pg_typeof(case when true then 1 else 1.5 end)` 就是 `numeric`.

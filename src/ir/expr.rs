@@ -189,6 +189,8 @@ pub enum ScalarFunc {
     Round,
     /// `UPPER(text)`.
     Upper,
+    /// `LOWER(text)`.
+    Lower,
     /// `LEFT(text, n)`(按**字符**数,`n` 为负时去掉右边 `|n|` 个字符).
     Left,
     /// `CONCAT_WS(sep, ...)`:变参,跳过 NULL 参数,分隔符为 NULL 时结果是 NULL.
@@ -209,6 +211,7 @@ impl ScalarFunc {
         match self {
             ScalarFunc::Round => "ROUND",
             ScalarFunc::Upper => "UPPER",
+            ScalarFunc::Lower => "LOWER",
             ScalarFunc::Left => "LEFT",
             ScalarFunc::ConcatWs => "CONCAT_WS",
             ScalarFunc::ExtractYear => "EXTRACT",
@@ -220,7 +223,9 @@ impl ScalarFunc {
     pub fn arity(&self) -> Option<usize> {
         match self {
             ScalarFunc::Round | ScalarFunc::Left => Some(2),
-            ScalarFunc::Upper | ScalarFunc::ExtractYear | ScalarFunc::Length => Some(1),
+            ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::ExtractYear | ScalarFunc::Length => {
+                Some(1)
+            }
             ScalarFunc::ConcatWs => None,
         }
     }
@@ -359,10 +364,16 @@ pub enum Step {
         /// 参数寄存器.
         args: Vec<Reg>,
     },
-    /// 类型转换(`x::numeric`).
+    /// 类型转换(`x::numeric`,`CAST(x AS TEXT)`).
     ///
     /// 只放行**值模型里真有意义**的几组转换,见 `cast_type`:同族恒等,
-    /// `INT → NUMERIC`,`NULL → 任意`.别的(`int::text` 之类)在验证期就拒绝.
+    /// `INT → NUMERIC`,数值 / 日期 / 时间戳 ↔ 文本,`NULL → 任意`.别的
+    /// (`timestamp::int`,`int::date`)在验证期就拒绝.文本 → 数值 / 日期那一条
+    /// 类型上放行,值解析不出来是**运行期**的 [`EvalError::BadText`].
+    ///
+    /// > 字面量的 `'1994'::text` 不走这里:它是"给字面量定型"(`irgen::lower_const`),
+    /// > 只有当那个字面量能按目标类型**隐式定型**时才走(`irgen::const_coercible`);
+    /// > 落不进去的(整数 → 文本)照样落到这个 step 上真转.
     Cast {
         /// 目的寄存器.
         dst: Reg,
@@ -541,6 +552,18 @@ pub enum EvalError {
         /// 出问题的文本.
         value: String,
     },
+    /// `CAST(<文本> AS <数值 / 日期 / 时间戳>)` 解析不了那段文本.
+    ///
+    /// 类型上是**放行**的(`cast_type`),所以失败只可能是这个值的错--与 PostgreSQL
+    /// 一样在**运行期**报(`'abc'::int` 在那边也是运行期错误).
+    BadText {
+        /// 目标类型.
+        ty: DataType,
+        /// 出问题的文本.
+        value: String,
+        /// 底层解析器给的原因.
+        reason: String,
+    },
     /// 需要求值环境却没给([`Prog::eval`] 遇到了 [`Step::Outer`] / [`Step::Subquery`]).
     NoEnv {
         /// 需要什么(渲染给用户看).
@@ -574,6 +597,13 @@ impl EvalError {
             EvalError::BadPattern { reason } => format!("{}", tr!("ir.expr.010", arg0 =  reason)),
             EvalError::BadDate { value } => {
                 format!("{}", tr!("ir.expr.011", arg0 =  value))
+            }
+            EvalError::BadText { ty, value, reason } => {
+                format!("{}", tr!("ir.expr.047", arg0 = 
+                    value, arg1 = 
+                    ty, arg2 = 
+                    reason
+                ))
             }
             EvalError::NoEnv { what } => format!("{}", tr!("ir.expr.012", arg0 =  what)),
             EvalError::Nested(e) => e.to_string(),
@@ -2048,7 +2078,7 @@ fn call_type(func: ScalarFunc, args: &[ScalarType], at: usize) -> Result<ScalarT
             Ok(ScalarType::Value(TypeFamily::Numeric))
         }
 
-        ScalarFunc::Upper => {
+        ScalarFunc::Upper | ScalarFunc::Lower => {
             text_arg(0, &tr!("ir.expr.038").into_owned())?;
             Ok(ScalarType::Value(TypeFamily::Text))
         }
@@ -2120,10 +2150,17 @@ fn apply_call(func: ScalarFunc, args: &[Scalar]) -> std::result::Result<Scalar, 
             Ok(Scalar::Value(rounded))
         }
 
-        ScalarFunc::Upper => {
+        ScalarFunc::Upper | ScalarFunc::Lower => {
             let text = scalar_text(&args[0])?;
             Ok(match text {
-                Some(text) => Scalar::Value(Value::Text(text.to_uppercase())),
+                Some(text) => {
+                    let folded = match func {
+                        // 两个都是按**字符**折的(Rust 的 `to_*case` 走 Unicode 大小写映射)
+                        ScalarFunc::Lower => text.to_lowercase(),
+                        _ => text.to_uppercase(),
+                    };
+                    Scalar::Value(Value::Text(folded))
+                }
                 None => Scalar::Value(Value::Null),
             })
         }
@@ -2206,9 +2243,16 @@ fn scalar_text(value: &Scalar) -> std::result::Result<Option<String>, EvalError>
 
 /// `x::to` 的类型规则.
 ///
-/// 只管**值模型里真有意义**的几组:同族恒等(`x::int`,`name::varchar(3)`),
-/// `INT → NUMERIC`,`NULL → 任意`.别的组合(`int::text`,`timestamp::int`)
-/// 在这里就报 `IrInvalid`--宁可拒绝,也不要给一个安静的错误答案.
+/// 放行的是**值模型里真有意义**的几组:
+///
+/// * 同族恒等(`x::int`,`name::varchar(3)`);
+/// * `INT → NUMERIC`(PostgreSQL 里唯一的隐式放大);
+/// * **数值 / 日期 / 时间戳 → `TEXT`**;
+/// * **`TEXT` → 数值 / 日期 / 时间戳**(上一个的反方向,运行期按目标类型解析);
+/// * `NULL → 任意`.
+///
+/// 别的组合(`timestamp::int`,`int::date`,`date::timestamp`)在这里就报
+/// `IrInvalid`--宁可拒绝,也不要给一个安静的错误答案.
 fn cast_type(from: ScalarType, to: DataType, at: usize) -> Result<ScalarType> {
     let target = ScalarType::Value(to.family());
     if matches!(from, ScalarType::Null) {
@@ -2217,6 +2261,25 @@ fn cast_type(from: ScalarType, to: DataType, at: usize) -> Result<ScalarType> {
     match from {
         ScalarType::Value(family) if family == to.family() => Ok(target),
         ScalarType::Value(TypeFamily::Int) if to.family() == TypeFamily::Numeric => Ok(target),
+        // 数值 / 日期 / 时间戳 → 文本:呈现就是 `Value` 的 `Display`,与渲染逐字相同
+        ScalarType::Value(TypeFamily::Int)
+        | ScalarType::Value(TypeFamily::Numeric)
+        | ScalarType::Value(TypeFamily::Date)
+        | ScalarType::Value(TypeFamily::Timestamp)
+            if to.family() == TypeFamily::Text =>
+        {
+            Ok(target)
+        }
+        // 文本 → 数值 / 日期 / 时间戳:类型上放行,值能不能解析**留给运行期**
+        // (`'abc'::int` 在 PostgreSQL 里也是运行期报错)
+        ScalarType::Value(TypeFamily::Text)
+            if matches!(
+                to.family(),
+                TypeFamily::Int | TypeFamily::Numeric | TypeFamily::Date | TypeFamily::Timestamp
+            ) =>
+        {
+            Ok(target)
+        }
         other => Err(invalid(format!("{}", tr!("ir.expr.045", arg0 = 
             at, arg1 =  other, arg2 =  to
         )))),
@@ -2233,7 +2296,34 @@ fn cast_value(value: Scalar, to: DataType) -> std::result::Result<Scalar, EvalEr
     let converted = match (&value, to.family()) {
         (Value::Null, _) => Value::Null,
         (Value::Int(i), TypeFamily::Numeric) => Value::Numeric(i.to_string()),
-        // 同族恒等(含 INT → INT,以及 typmod 的收窄只发生在 INSERT 时)
+        // 数值 / 日期 / 时间戳 → 文本:呈现就是 `Value` 的 `Display`,所以与"直接查
+        // 那一列"渲染出来的字面一模一样(`cast_to_text` 的那条测试盯着这件事).
+        // 同族的 `TEXT → TEXT` 也落在这里(恒等).
+        (other, TypeFamily::Text) => Value::Text(other.to_string()),
+        // 文本 → 数值 / 日期 / 时间戳:按**目标类型本身**解析,于是 `NUMERIC(N,M)` 的
+        // 标度,`DATE` 的 `YYYY-MM-DD` 规范,`TIMESTAMP` 的定宽规范化全都免费拿到.
+        // 判据是"值本来是文本,而目标大类不是文本",`cast_type` 已经把过关,所以这里
+        // 只可能是那四种目标.解析不了是**这个值**的错,报 `BadText`.
+        (Value::Text(text), family) if family != TypeFamily::Text => match to.parse(text) {
+            Ok(parsed) => parsed,
+            // `BadValue` 的 `Display` 会再包一层列名,这里只要它那句原因
+            Err(DbError::BadValue { reason, .. }) => {
+                return Err(EvalError::BadText {
+                    ty: to,
+                    value: text.clone(),
+                    reason,
+                })
+            }
+            Err(other) => {
+                return Err(EvalError::BadText {
+                    ty: to,
+                    value: text.clone(),
+                    reason: other.to_string(),
+                })
+            }
+        },
+        // 同族恒等(含 `INT → INT`,以及 `TEXT → CHAR(N)` 的 typmod 收窄只发生在
+        // INSERT 时)
         (other, _) => other.clone(),
     };
 
