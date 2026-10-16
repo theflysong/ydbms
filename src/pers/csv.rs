@@ -7,13 +7,29 @@
 //! (`promote`,rename 进正式位置)两步:单表提交两步连着做
 //! ([`Persister::save`]),多表提交由 `usr::service` 攒着一起做,于是崩在中间
 //! 也能补完(原因见 [`crate::pers`] 的文件头).
+//!
+//! # 变更日志(TODO 7.7)
+//!
+//! 一次提交要把整张表重写一遍是 O(表) 的(实测 50 万行 / 38 MB 的表上 200~270 ms,
+//! 改一行也是这个价钱),所以改过的那几行**追加**到 `<name>.log` 里就完事:
+//!
+//! ```text
+//! A,<行号>,<字段>...      往表尾加一行(行号必须正好是当前行数)
+//! U,<行号>,<字段>...      替换第 <行号> 行
+//! ```
+//!
+//! 字段用**数据文件那一套**(NULL 是 `\N`,以 `\` 开头的文本多写一个 `\`,见
+//! [`crate::db::table::DataType::from_csv_field`]),于是值怎么落盘只有一处口径.
+//! 载入时把日志按顺序重放到基表上([`CsvPersister::replay_log`]);**已提交到哪一行**
+//! 记在库目录的 `manifest.json` 里(见 `usr::service`),多出来的尾巴是没越过提交点
+//! 的那些,打开库时被截掉.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Persister, TablePath};
+use super::{Persister, TableDelta, TablePath};
 use crate::db::phys::PhysTab;
 use crate::db::table::{
     Column, ColumnsShape, DbError, Result, Row, Table, TabShape, Value,
@@ -24,6 +40,12 @@ use crate::db::table::{
 /// `load` 遇到不认识的版本会直接报错,而不是按当前格式硬读--宁可失败也不静默
 /// 读错数据.将来改格式时靠它做迁移.
 const SCHEMA_VERSION: u32 = 1;
+
+/// 变更日志里"追加一行"的记录标记.
+const LOG_APPEND: &str = "A";
+
+/// 变更日志里"替换一行"的记录标记.
+const LOG_UPDATE: &str = "U";
 
 /// 旁路模式文件的内容.
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,12 +92,224 @@ impl CsvPersister {
         }
         Ok(())
     }
+
+    /// 把 `delta` 里的改动**追加**到 `<表>.log`(TODO 7.7).
+    ///
+    /// 只写改过的那几行:一次 `COPY` 灌进来的那一段用一个起点表示,原地改过的行号
+    /// 一个一个写.行号是**绝对行号**,所以重放不依赖"写的时候表里有多少行".
+    ///
+    /// 追加式写:文件不重写(重写就又变成 O(表) 了),调用方(`usr::service` 的提交点)
+    /// 把"写到哪儿算数"记在 `manifest.json` 里.
+    pub fn append_delta(
+        &self,
+        table: &dyn Table,
+        at: &TablePath,
+        delta: &TableDelta,
+        committed: usize,
+    ) -> Result<usize> {
+        let path = at.log_path();
+        // **先截到已提交的条数**:上次崩在半路留下的尾巴,或者上一次整理之后残留的
+        // 旧记录,都在这里被清掉--不先清就往后追加,清单里的条数会对到**旧**记录上
+        // (那是安静的错答案)
+        truncate_log(at, committed)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| io_err(&path, e))?;
+
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(file);
+        let mut appended = 0usize;
+
+        if let Some(from) = delta.appended_from {
+            for r in from..table.nrows() {
+                let row = table.row(r).ok_or_else(|| DbError::IrRuntime {
+                    node: None,
+                    message: format!("{}", tr!("pers.csv.001", arg0 = r, arg1 = table.name())),
+                })?;
+                write_log_record(&mut writer, &path, LOG_APPEND, r, &row)?;
+                appended += 1;
+            }
+        }
+        for r in &delta.updated {
+            // 这一轮里**追加**进来的行已经带着最终内容进去了(`A` 那条就是在提交
+            // 这一刻按最终内容写的),不必再写一遍;越界的行号(理论上不会有)也跳过.
+            if delta.appended_from.is_some_and(|from| *r >= from) || *r >= table.nrows() {
+                continue;
+            }
+            let row = table.row(*r).ok_or_else(|| DbError::IrRuntime {
+                node: None,
+                message: format!("{}", tr!("pers.csv.001", arg0 = r, arg1 = table.name())),
+            })?;
+            write_log_record(&mut writer, &path, LOG_UPDATE, *r, &row)?;
+            appended += 1;
+        }
+
+        writer.flush().map_err(|e| io_err(&path, e))?;
+        Ok(appended)
+    }
+
+    /// 把 `<表>.log` 重放到 `table` 上(载入时用,TODO 7.7).
+    ///
+    /// 日志不存在就是没改过,不算错.整份文件都认(打开库时已经把它截到**已提交**
+    /// 的行数了,见 `usr::service` 的恢复那一步);读到半截或者行号对不上都报
+    /// [`DbError::Format`] -- 宁可开不了库,也不要读出一张错位的表.
+    pub fn replay_log(&self, table: &mut PhysTab, at: &TablePath) -> Result<()> {
+        let path = at.log_path();
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err(&path, e)),
+        };
+
+        let columns = table.columns().to_vec();
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(file);
+
+        for record in reader.records() {
+            let record = record.map_err(|e| csv_err(&path, e))?;
+            let line = record.position().map(|p| p.line() as usize);
+            let bad = |message: String| DbError::Format {
+                path: path.display().to_string(),
+                line,
+                message,
+            };
+
+            let op = record.get(0).unwrap_or_default().to_string();
+            let rid: usize = record
+                .get(1)
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| bad(tr!("pers.csv.002").into_owned().to_string()))?;
+
+            let mut row: Row = Vec::with_capacity(columns.len());
+            for (field, column) in record.iter().skip(2).zip(columns.iter()) {
+                row.push(column.ty.from_csv_field(field).map_err(|e| {
+                    bad(format!(
+                        "{}",
+                        tr!("pers.csv.003", arg0 = column.name, arg1 = e)
+                    ))
+                })?);
+            }
+            if row.len() != columns.len() {
+                return Err(bad(format!(
+                    "{}",
+                    tr!("pers.csv.004", arg0 = row.len(), arg1 = columns.len())
+                )));
+            }
+
+            match op.as_str() {
+                LOG_APPEND => {
+                    if rid != table.nrows() {
+                        return Err(bad(format!(
+                            "{}",
+                            tr!("pers.csv.005", arg0 = rid, arg1 = table.nrows())
+                        )));
+                    }
+                    table.insert(row)?;
+                }
+                LOG_UPDATE => {
+                    if rid >= table.nrows() {
+                        return Err(bad(format!(
+                            "{}",
+                            tr!("pers.csv.006", arg0 = rid, arg1 = table.nrows())
+                        )));
+                    }
+                    table.update_row(rid, row)?;
+                }
+                other => {
+                    return Err(bad(format!("{}", tr!("pers.csv.007", arg0 = other))));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
+
+/// 把 `<表>.log` 截到前 `lines` 条**完整**的记录(TODO 7.7).
+///
+/// 日志是追加式的,而"到哪儿算数"记在库目录的 `manifest.json` 里(见
+/// `usr::service`):没越过提交点的尾巴,以及整理之后残留的旧记录,都由它截掉.
+///
+/// 返回截断之后的字节数.文件不在而清单说 0 条不算错;清单说有 n 条而文件里没有
+/// 那么多完整记录**要报错**--那是坏的现场,宁可开不了库.
+pub fn truncate_log(at: &TablePath, lines: usize) -> Result<u64> {
+    let path = at.log_path();
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if lines == 0 {
+                return Ok(0);
+            }
+            return Err(DbError::Format {
+                path: path.display().to_string(),
+                line: None,
+                message: format!("{}", tr!("pers.csv.008", arg0 = lines)),
+            });
+        }
+        Err(e) => return Err(io_err(&path, e)),
+    };
+
+    let offset = log_offset(&file, &path, lines)?;
+    let size = file.metadata().map_err(|e| io_err(&path, e))?.len();
+    if size > offset {
+        file.set_len(offset).map_err(|e| io_err(&path, e))?;
+    }
+    Ok(offset)
+}
+
+/// 第 `lines` 条记录之后的字节偏移(不足那么多**完整**行就报错).
+fn log_offset(file: &File, path: &Path, lines: usize) -> Result<u64> {
+    if lines == 0 {
+        return Ok(0);
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut buffer = Vec::new();
+    let mut offset = 0u64;
+    for seen in 0..lines {
+        buffer.clear();
+        let read = std::io::BufRead::read_until(&mut reader, b'\n', &mut buffer)
+            .map_err(|e| io_err(path, e))?;
+        if read == 0 || buffer.last() != Some(&b'\n') {
+            return Err(DbError::Format {
+                path: path.display().to_string(),
+                line: Some(seen + 1),
+                message: format!("{}", tr!("pers.csv.009", arg0 = lines)),
+            });
+        }
+        offset += read as u64;
+    }
+    Ok(offset)
+}
+
+/// 写一条日志记录:`[标记, 行号, 字段...]`.
+fn write_log_record(
+    writer: &mut csv::Writer<File>,
+    path: &Path,
+    op: &str,
+    rid: usize,
+    row: &Row,
+) -> Result<()> {
+    let fields: Vec<String> = row.iter().map(Value::to_csv_field).collect();
+    writer
+        .write_record(
+            std::iter::once(op.to_string())
+                .chain(std::iter::once(rid.to_string()))
+                .chain(fields),
+        )
+        .map_err(|e| csv_err(path, e))
+}
+
 
 /// 把暂存的一对文件推广到正式位置(各一次 rename,同文件系统内是原子的).
 ///
 /// 两份文件**各 rename 一次**,所以中途崩掉可能只推广了一半--没关系:
-/// 提交意图(`commit.json`)还在,恢复时把还没搬的搬完就对了(两份都指向新数据).
+/// 提交记录(`manifest.json`)里还记着这次要推广谁,恢复时把还没搬的搬完就对了
+/// (两份都指向新数据).
 pub(crate) fn promote(at: &TablePath) -> Result<()> {
     for path in [at.data_path(), at.schema_path()] {
         let staged = match path == at.data_path() {

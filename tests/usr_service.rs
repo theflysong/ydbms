@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ydbms::cmd::{Session, Sink};
 use ydbms::db::table::{Column, ColumnsShape, DataType, Table, Value};
 use ydbms::db::PhysTab;
-use ydbms::pers::{CsvPersister, Persister, TablePath};
-use ydbms::usr::service::CommitIntent;
+use ydbms::pers::{CsvPersister, Persister, TableDelta, TablePath};
+use ydbms::usr::service::{Manifest, TableFootprint};
 use ydbms::usr::{ServiceDir, User};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -234,6 +234,47 @@ fn tables_written_at_commit_are_loaded_by_the_next_session() {
 }
 
 #[test]
+fn a_long_log_is_compacted_back_into_the_base_file() {
+    // 日志攒过阈值(1 MiB 与基表大小里大的那个)就在**同一次提交**里整理:基表
+    // 重写一遍,日志归零.不整理的话,载入那一步要重放越来越长的日志,而同一个
+    // 行号的旧版本会越攒越多(TODO 7.7).
+    let dir = TempDir::new("compact");
+    let service = dir.service();
+    service.create_database("d", "bob").unwrap();
+    let bob = user("bob", true);
+    let lib = dir.path().join("d");
+
+    {
+        let mut session = open_session(&service, "d", &bob);
+        session.run_script("CREATE TABLE t (x INT, pad TEXT); INSERT INTO t VALUES (0, 'seed');");
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+
+        // 一条事务里追加 600 行,每行 2 KB:日志一次就攒到 1 MiB 以上
+        let mut script = String::from("BEGIN;\n");
+        for i in 1..=600 {
+            script.push_str(&format!("INSERT INTO t VALUES ({}, '{}');\n", i, "p".repeat(2000)));
+        }
+        script.push_str("COMMIT;");
+        session.run_script(&script);
+        assert_eq!(session.failed(), 0, "{}", session.messages());
+    }
+
+    let manifest = Manifest::load(&lib).unwrap().expect("提交记录在");
+    let footprint = manifest.tables.get("t").copied().expect("t 的位置");
+    assert_eq!(footprint.base, 601, "整理之后的基表带着全部行");
+    assert_eq!(footprint.log, 0, "整理之后日志归零");
+    assert_eq!(
+        std::fs::metadata(lib.join("t.log")).map(|meta| meta.len()).unwrap_or(0),
+        0,
+        "日志要截掉"
+    );
+
+    // 另一个会话把 601 行读回来(NUL 与转义那条契约照旧)
+    let session = open_session(&service, "d", &bob);
+    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 601);
+}
+
+#[test]
 fn an_update_is_persisted_too() {
     let dir = TempDir::new("update");
     let service = dir.service();
@@ -319,9 +360,15 @@ fn a_write_is_on_disk_before_the_session_ends() {
     session.run_script("CREATE TABLE t (x INT); INSERT INTO t VALUES (9);");
     assert_eq!(session.failed(), 0, "{}", session.messages());
 
-    // 会话还开着(锁也还握着):直接读盘上的那份 CSV
+    // 会话还开着(锁也还握着):直接读盘上的那一对文件
+    //
+    // 注意行在**哪儿**:`CREATE TABLE` 那一次提交把空的基表写下去了,所以 `9` 是
+    // 后来追加进 `<表>.log` 的(TODO 7.7 之后提交不再重写基表).两份文件都要对得上,
+    // 才算"写完就落盘".
     let csv = std::fs::read_to_string(dir.path().join("d/t.csv")).expect("t.csv 应当已经在盘上");
-    assert!(csv.lines().any(|line| line == "9"), "{csv}");
+    assert!(csv.lines().next().is_some(), "表头要在:{csv}");
+    let log = std::fs::read_to_string(dir.path().join("d/t.log")).expect("t.log 应当已经在盘上");
+    assert!(log.lines().any(|line| line == "A,0,9"), "{log}");
 
     let schema = std::fs::read_to_string(dir.path().join("d/t.schema.json")).unwrap();
     assert!(schema.contains("\"name\": \"t\""), "{schema}");
@@ -532,19 +579,20 @@ fn a_transaction_writes_nothing_before_commit() {
         assert_eq!(session.failed(), 0, "{}", session.messages());
         assert!(lib.join("t.csv").is_file());
 
-        // 事务里:插行**不**落盘,也不该留下提交意图
+        // 事务里:插行**不**落盘(基表一个字节都不动,日志也不该长大)
         session.run_script("BEGIN; INSERT INTO t VALUES (1);");
         assert_eq!(session.failed(), 0, "{}", session.messages());
         let csv = std::fs::read_to_string(lib.join("t.csv")).unwrap();
         assert!(!csv.lines().any(|line| line == "1"), "事务里不该落盘:{csv}");
-        assert!(!lib.join("commit.json").exists(), "事务里不该有提交意图");
+        assert!(!lib.join("t.log").exists(), "事务里日志也不该动");
 
-        // `COMMIT` 一次把改动写下去,提交意图用完就删
+        // `COMMIT` 一次把改动追加进日志(TODO 7.7:基表不重写)
         session.run_script("COMMIT;");
         assert_eq!(session.failed(), 0, "{}", session.messages());
+        let log = std::fs::read_to_string(lib.join("t.log")).unwrap();
+        assert!(log.lines().any(|line| line.starts_with("A,0,")), "{log}");
         let csv = std::fs::read_to_string(lib.join("t.csv")).unwrap();
-        assert!(csv.lines().any(|line| line == "1"), "{csv}");
-        assert!(!lib.join("commit.json").exists(), "提交完要把意图删掉");
+        assert!(!csv.lines().any(|line| line == "1"), "基表没被重写:{csv}");
     }
 
     // 另一个会话把它读回来
@@ -594,12 +642,30 @@ fn rollback_after_a_transaction_reports_the_table_before_the_transaction() {
 
 // ------------------------------------------------- 提交的原子性与崩溃恢复(4.2)
 
-/// 造一次"提交崩在中途"的现场:`t` 的正式文件还是旧的那一份,`t` 的下一次内容
-/// 摆在暂存文件里.
-///
-/// `through` 决定停在哪一步:`"stage"` = 只暂存(还没写提交意图),
-/// `"intent"` = 提交意图也写了,`"promote-t"` = 连 `t` 都推广了(崩在推广中途).
-fn crash_scene(dir: &Path, through: &str) {
+/// 造一次"提交崩在提交点**之前**"的现场:`t` 的改动已经追加进日志,而提交记录
+/// (每张表写到了哪儿)还没写.
+fn crash_before_the_manifest(dir: &Path) {
+    let persister = CsvPersister::new();
+    let at = TablePath::new(dir, "t");
+
+    // 把第 0 行改成 2(与 `UPDATE t SET x = 2` 等价的那一条日志)
+    let pending = table_of("t", &[2]);
+    let delta = TableDelta {
+        appended_from: None,
+        updated: [0usize].into_iter().collect(),
+    };
+    let committed = Manifest::load_or_empty(dir)
+        .unwrap()
+        .tables
+        .get("t")
+        .map_or(0, |at| at.log);
+    persister.append_delta(&pending, &at, &delta, committed).unwrap();
+    // 提交记录**没写**:日志尾巴不算数
+}
+
+/// 造一次"提交崩在提交点**之后**"的现场:提交记录已经写了(所以这次提交必须做完),
+/// 但推广那一半只做了一张表.
+fn crash_after_the_manifest(dir: &Path, promote_t: bool) {
     let persister = CsvPersister::new();
     let pending_t = table_of("t", &[2]);
     let pending_u = table_of("u", &[7]);
@@ -610,19 +676,20 @@ fn crash_scene(dir: &Path, through: &str) {
     persister
         .stage(&pending_u, &TablePath::new(dir, "u"))
         .expect("暂存 u");
-    if through == "stage" {
-        return;
-    }
 
-    CommitIntent {
-        version: 1,
-        written: vec!["t".to_string(), "u".to_string()],
-        removed: Vec::new(),
-    }
-    .save(dir)
-    .expect("写提交意图");
+    let mut manifest = Manifest::load_or_empty(dir).unwrap();
+    manifest.tables.insert(
+        "t".to_string(),
+        TableFootprint { base: 1, log: 0 },
+    );
+    manifest.tables.insert(
+        "u".to_string(),
+        TableFootprint { base: 1, log: 0 },
+    );
+    manifest.promoted = vec!["t".to_string(), "u".to_string()];
+    manifest.save(dir).expect("写提交记录");
 
-    if through == "promote-t" {
+    if promote_t {
         // 只推广了 `t`(`save` = 暂存 + 推广,结果一样:`t` 的 `.new` 没了)
         persister
             .save(&pending_t, &TablePath::new(dir, "t"))
@@ -647,42 +714,51 @@ fn crash_fixture(tag: &str) -> (TempDir, ServiceDir, User) {
 }
 
 #[test]
-fn a_crash_before_the_commit_intent_is_all_before_the_commit() {
-    let (dir, service, bob) = crash_fixture("crash-stage");
+fn a_crash_before_the_manifest_is_all_before_the_commit() {
+    let (dir, service, bob) = crash_fixture("crash-log");
     let lib = dir.path().join("d");
 
-    // 上一次提交只走到"暂存"就崩了:正式文件还是旧的,也没有提交意图
-    crash_scene(&lib, "stage");
-    assert!(lib.join("t.csv.new").is_file(), "现场:暂存文件在");
-    assert!(!lib.join("commit.json").exists());
+    // 改动已经追加进日志,提交记录还没写:那份改动**不算数**
+    crash_before_the_manifest(&lib);
+    assert!(lib.join("t.log").is_file(), "现场:日志在");
 
-    // 打开库:暂存残渣被清掉,两行表都还是提交前那一份
+    // 打开库:日志尾巴被截掉,`t` 还是提交前那一份
     let session = open_session(&service, "d", &bob);
     assert_eq!(session.symbols().relation("t").unwrap().nrows(), 1);
-    assert!(!lib.join("t.csv.new").exists(), "残渣要清掉");
-    assert!(!lib.join("t.schema.json.new").exists());
+    assert_eq!(
+        session.symbols().relation("t").unwrap().row(0).unwrap()[0],
+        Value::Int(1),
+        "崩在提交点之前 = 旧数据"
+    );
+    let log = std::fs::read_to_string(lib.join("t.log")).unwrap();
+    assert!(log.contains("A,0,1"), "已提交的那条还在:{log}");
+    assert!(!log.contains("U,0,2"), "没越过提交点的那条要截掉:{log}");
 }
 
 #[test]
-fn a_crash_after_the_commit_intent_replays_to_all_after_the_commit() {
-    let (dir, service, bob) = crash_fixture("crash-intent");
+fn a_crash_after_the_manifest_keeps_the_appended_rows() {
+    let (dir, service, bob) = crash_fixture("crash-manifest");
     let lib = dir.path().join("d");
 
-    // 提交意图已经落盘,但一张表都还没推广:**这份提交必须完成**
-    crash_scene(&lib, "intent");
-    assert!(lib.join("commit.json").is_file());
+    // 改动追加进日志 + 提交记录也写了:这份改动**已经提交**
+    crash_before_the_manifest(&lib);
+    let mut manifest = Manifest::load_or_empty(&lib).unwrap();
+    let entry = manifest.tables.entry("t".to_string()).or_insert(TableFootprint {
+        base: 0,
+        log: 0,
+    });
+    entry.log += 1;
+    manifest.save(&lib).unwrap();
 
     let session = open_session(&service, "d", &bob);
-
-    // `t` 补成了下一次的内容(2),`u` 没被这次提交碰过,照旧
     let t = session.symbols().relation("t").unwrap();
     assert_eq!(t.nrows(), 1);
-    assert_eq!(t.row(0).unwrap()[0], Value::Int(2), "崩在提交之后 = 新数据");
-    assert_eq!(session.symbols().relation("u").unwrap().row(0).unwrap()[0], Value::Int(7));
-
-    // 补完了就把意图删掉,不会无限重放
-    assert!(!lib.join("commit.json").exists(), "补完要删掉提交意图");
-    assert!(!lib.join("t.csv.new").exists(), "暂存文件已经搬进正式位置");
+    assert_eq!(t.row(0).unwrap()[0], Value::Int(2), "崩在提交点之后 = 新数据");
+    assert_eq!(
+        session.symbols().relation("u").unwrap().row(0).unwrap()[0],
+        Value::Int(7),
+        "没被这次提交碰过的表照旧"
+    );
 }
 
 #[test]
@@ -690,43 +766,58 @@ fn a_crash_in_the_middle_of_promoting_still_ends_after_the_commit() {
     let (dir, service, bob) = crash_fixture("crash-promote");
     let lib = dir.path().join("d");
 
-    // 推广到一半:`t` 已经是新的,`u` 还没搬
-    crash_scene(&lib, "promote-t");
+    // 提交记录写了,推广只做了一半(`t` 搬了,`u` 还没)
+    crash_after_the_manifest(&lib, true);
     assert!(!lib.join("t.csv.new").exists(), "t 已经搬过了");
     assert!(lib.join("u.csv.new").is_file(), "u 还没搬");
 
     let session = open_session(&service, "d", &bob);
 
-    // 两张表都停在"提交之后":t 是新的,u 的暂存文件也补上了(内容是 7,与旧的一致)
-    assert_eq!(session.symbols().relation("t").unwrap().row(0).unwrap()[0], Value::Int(2));
-    assert_eq!(session.symbols().relation("u").unwrap().nrows(), 1);
-    assert!(!lib.join("u.csv.new").exists(), "重放要把剩下的搬完");
-    assert!(!lib.join("commit.json").exists());
+    assert_eq!(
+        session.symbols().relation("t").unwrap().row(0).unwrap()[0],
+        Value::Int(2)
+    );
+    assert_eq!(
+        session.symbols().relation("u").unwrap().row(0).unwrap()[0],
+        Value::Int(7),
+        "u 补成下一次的内容"
+    );
+    assert!(!lib.join("u.csv.new").exists(), "补完要把剩下的搬完");
+    // 现场落定之后清单里不再有"没做完"的记号
+    let manifest = Manifest::load(&lib).unwrap().expect("提交记录在");
+    assert!(manifest.settled(), "补完要把 promoted / removed 清掉");
 }
 
 #[test]
-fn a_broken_commit_intent_refuses_to_open_the_database() {
-    // 提交意图坏了:宁可开不了库,也不要静默地当成"没发生过上一次提交"
+fn a_broken_manifest_refuses_to_open_the_database() {
+    // 提交记录坏了:宁可开不了库,也不要静默地当成"没发生过上一次提交"
     let (dir, service, bob) = crash_fixture("crash-broken");
     let lib = dir.path().join("d");
 
-    std::fs::write(lib.join("commit.json"), "{ 这不是 JSON").unwrap();
-    let err = service.open("d", &bob).expect_err("损坏的提交意图要挡住打开");
-    assert!(format!("{err}").contains("commit.json"), "{err}");
+    let original = std::fs::read_to_string(lib.join("manifest.json")).unwrap();
+    std::fs::write(lib.join("manifest.json"), "{ 这不是 JSON").unwrap();
+    let err = service.open("d", &bob).expect_err("损坏的提交记录要挡住打开");
+    assert!(format!("{err}").contains("manifest.json"), "{err}");
 
     // 版本不认识也一样
     std::fs::write(
-        lib.join("commit.json"),
-        r#"{"version": 99, "written": [], "removed": []}"#,
+        lib.join("manifest.json"),
+        r#"{"version": 99, "tables": {}, "promoted": [], "removed": []}"#,
     )
     .unwrap();
     let err = service.open("d", &bob).expect_err("不认识的版本要挡住打开");
     assert!(format!("{err}").contains("99"), "{err}");
 
-    // 修好之后照常打开
-    std::fs::remove_file(lib.join("commit.json")).unwrap();
+    // 修好(把原来那份写回去)之后照常打开
+    //
+    // 注意这里**不能**只删掉清单:那张表的行现在住在 `<表>.log` 里,而"日志里有几条
+    // 算数"只有提交记录说了算--删掉它等于删掉那个账本(旧协议里基表才是账本,所以
+    // 那时删掉 `commit.json` 不会丢东西).
+    std::fs::write(lib.join("manifest.json"), &original).unwrap();
     let session = open_session(&service, "d", &bob);
-    assert_eq!(session.symbols().relation("t").unwrap().nrows(), 1);
+    let t = session.symbols().relation("t").unwrap();
+    assert_eq!(t.nrows(), 1);
+    assert_eq!(t.row(0).unwrap()[0], Value::Int(1));
 }
 
 // ------------------------------------------------- 库级 search_path(5.4)

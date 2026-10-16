@@ -7,9 +7,10 @@
 //! └── <库>/
 //!     ├── catalog.json              {version, name, owner, created_unix, settings}
 //!     ├── .lock                     单写者锁(flock;进程退出即释放)
-//!     ├── commit.json               提交意图:崩在中途时靠它把提交补完
-//!     ├── <表>.csv                  数据(表名带 schema 前缀时就是文件名)
-//!     └── <表>.schema.json          模式(格式归 [`crate::pers`])
+//!     ├── manifest.json             提交记录:每张表已提交到哪一行(见 [`Manifest`])
+//!     ├── <表>.csv                  基表(表名带 schema 前缀时就是文件名)
+//!     ├── <表>.schema.json          模式(格式归 [`crate::pers`])
+//!     └── <表>.log                  变更日志:上一次整表重写之后改过的行
 //! ```
 //!
 //! **一个目录 = 一个库**,这与 [`crate::pers`] 的既有约定一致,也方便手工检查.
@@ -48,13 +49,14 @@
 //! `CREATE DATABASE` 会建出库目录"这句话的落点.`settings`(见 [`Settings`])是
 //! 库级的会话默认值,**新增字段一律 `#[serde(default)]`**,老文件照旧读得回来.
 //!
-//! # 提交是原子的(4.2)
+//! # 提交是原子的(4.2 / 7.7)
 //!
-//! 一次提交要写好几张表,而每张表是"成对的两个文件各自 rename"--崩在中间就会留下
-//! 改了一半的库.所以先写**暂存**文件(`<表>.csv.new`),全写完了才落下
-//! [`CommitIntent`](`commit.json`),再逐个 rename 进正式位置,删掉要删的表.
-//! **打开库时**([`Database::recover`])看到 `commit.json` 就把它补完,看到没有
-//! 意图庇护的 `.new` 就清掉--两次崩溃之间,库要么全在提交前,要么全在提交后.
+//! 一次提交要动好几张表:改过的那几行**追加**到各自的 `<表>.log`,要整表重写的写
+//! **暂存**文件(`<表>.csv.new`);全做完了才落下 [`Manifest`](`manifest.json`)--
+//! **它才是提交点**.之后是推广暂存文件,删掉要删的表,最后把记录里那两栏清空.
+//! **打开库时**([`Database::recover`])按记录收尾:还没推广完的补完,每张表的日志
+//! 截到记录里记的条数,没有记录庇护的 `.new` 清掉--两次崩溃之间,库要么全在提交前,
+//! 要么全在提交后.
 //! 不做 WAL,也不 `fsync`:这条保证只覆盖**进程崩溃**(含 `kill -9`),不覆盖掉电.
 //!
 //! # 单写者锁
@@ -65,6 +67,7 @@
 //! (哪怕被 `kill -9`)内核就释放,没有"陈旧锁文件"要清理.恢复也要在锁下做
 //! ([`ServiceDir::open`] 里先上锁,再恢复).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 
@@ -77,8 +80,8 @@ use super::{
 };
 use crate::db::phys::PhysTab;
 use crate::db::table::{is_file_stem_safe, DbError, Result, Table};
-use crate::pers::csv::promote;
-use crate::pers::{CsvPersister, Persister, TablePath};
+use crate::pers::csv::{promote, truncate_log};
+use crate::pers::{CsvPersister, Persister, TableCommit, TablePath};
 
 /// `catalog.json` 的格式版本.
 pub const CATALOG_VERSION: u32 = 1;
@@ -92,11 +95,17 @@ pub const LOCK_FILE: &str = ".lock";
 /// 用户表的写锁文件名(`users.json` 是**全局**的,它自己那把锁).
 pub const USERS_LOCK_FILE: &str = ".users.lock";
 
-/// 提交意图的文件名(见 [`CommitIntent`]).
-pub const COMMIT_FILE: &str = "commit.json";
+/// 提交记录的文件名(见 [`Manifest`]).
+pub const MANIFEST_FILE: &str = "manifest.json";
 
-/// `commit.json` 的格式版本.
-pub const COMMIT_VERSION: u32 = 1;
+/// `manifest.json` 的格式版本(TODO 7.7 把它升到 2:多了一张表的位置).
+pub const MANIFEST_VERSION: u32 = 2;
+
+/// 变更日志超过这个大小(与基表大小取大的那个)就**整理**一次(TODO 7.7).
+///
+/// 整理 = 整表重写一遍 + 日志归零.不整理的话载入那一步每次都要重放越来越长的
+/// 日志,而且同一个行号的旧版本会越攒越多.
+pub const COMPACT_MIN_BYTES: u64 = 1024 * 1024;
 
 /// 库级的会话默认值(`catalog.json` 的 `settings`).
 ///
@@ -184,82 +193,111 @@ impl Catalog {
     }
 }
 
-/// 一次多表提交的**意图**(`<库>/commit.json`).
+/// 一张表**已提交到磁盘**的那一部分(TODO 7.7).
 ///
-/// 一次提交要把好几张表写回磁盘,而每张表是"成对两个文件各自 rename"--崩在中途
-/// 就会留下"改了一半"的库.所以提交分三段:
+/// `base` 是基表(`<表>.csv`)里的行数,`log` 是变更日志(`<表>.log`)里**算数**的
+/// 记录条数--日志尾巴上多出来的那些是没越过提交点的写,打开库时截掉.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableFootprint {
+    /// 基表里已提交的行数.
+    pub base: usize,
+    /// 变更日志里已提交的记录条数.
+    pub log: usize,
+}
+
+/// 库目录里的**提交记录**(`manifest.json`,TODO 7.7).
 ///
-/// 1. 把每一张表都写成**暂存**文件(`<表>.csv.new` / `<表>.schema.json.new`);
-/// 2. 把这份意图写进 `commit.json` -- **过了这一点,这次提交就必须完成**;
-/// 3. 逐张把暂存文件 rename 进正式位置,删掉要删的表,最后删掉 `commit.json`.
+/// 这份文件是那次提交的**commit record**:写进它之前,磁盘上的一切都还算"提交前"
+/// (日志尾巴不算数,暂存文件不算数);写进它之后,那次提交就**必须做完**.
+/// 于是打开库时只有两种可能,没有第三种:
 ///
-/// 于是启动时只剩两种可能:**没有** `commit.json`(那次提交还没越过第 2 步,
-/// 磁盘上完全是提交前的那一份,暂存残渣清扫掉即可)或**有**(新数据早已全部落盘,
-/// 按它补完就是提交后的那一份).**两种都不会是"改了一半"**.
+/// * 清单里 `promoted` / `removed` 非空:推广暂存文件,删掉该删的--**幂等**,
+///   崩在这一步的哪一处都能再跑一遍;
+/// * 每张表的日志都截到清单里记的条数.
+///
+/// 与老版本那份一次性的 `commit.json` 的差别:这份**一直在**(提交完也留着),
+/// 因为它记的是"磁盘上现在是哪一份",不只是"有一次提交没做完".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitIntent {
-    /// 格式版本,见 [`COMMIT_VERSION`].
+pub struct Manifest {
+    /// 格式版本,见 [`MANIFEST_VERSION`].
     pub version: u32,
-    /// 这次要写的表(生效名)--它们的暂存文件在写下这份意图时**已经就绪**.
-    pub written: Vec<String>,
-    /// 这次要删掉文件的表(`DROP SCHEMA ... CASCADE` 的落点).
+    /// 每张表提交之后的位置(生效名 → 行数).
+    #[serde(default)]
+    pub tables: BTreeMap<String, TableFootprint>,
+    /// 这次提交要把哪些暂存文件推广进正式位置(新表,或者整理过的基表).
+    #[serde(default)]
+    pub promoted: Vec<String>,
+    /// 这次提交要删掉文件的表(`DROP SCHEMA ... CASCADE` 的落点).
+    #[serde(default)]
     pub removed: Vec<String>,
 }
 
-impl CommitIntent {
-    /// 读库目录里的提交意图;没有就是 `None`.
+impl Default for Manifest {
+    fn default() -> Self {
+        Manifest {
+            version: MANIFEST_VERSION,
+            tables: BTreeMap::new(),
+            promoted: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+}
+
+impl Manifest {
+    /// 读库目录里的提交记录;没有就是 `None`(老库,或者刚建的库).
     ///
     /// **读到坏的,或者版本不认识的,一律报错**:宁可开不了库,也不要静默地把
-    /// "上次提交崩在中途"这件事当成没发生(那正是这份文件存在的唯一理由).
-    pub fn load(dir: &Path) -> Result<Option<CommitIntent>> {
-        let path = dir.join(COMMIT_FILE);
+    /// "上次提交崩在中途"这件事当成没发生(那正是这份文件存在的理由).
+    pub fn load(dir: &Path) -> Result<Option<Manifest>> {
+        let path = dir.join(MANIFEST_FILE);
         let raw = match fs::read_to_string(&path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err(&path, e)),
         };
 
-        let intent: CommitIntent = serde_json::from_str(&raw).map_err(|e| DbError::Format {
+        let manifest: Manifest = serde_json::from_str(&raw).map_err(|e| DbError::Format {
             path: path.display().to_string(),
             line: None,
-            message: format!("{}", tr!("usr.service.005", arg0 = 
-                e
-            )),
+            message: format!("{}", tr!("usr.service.005", arg0 = e)),
         })?;
-        if intent.version != COMMIT_VERSION {
+        if manifest.version != MANIFEST_VERSION {
             return Err(DbError::Format {
                 path: path.display().to_string(),
                 line: None,
-                message: format!("{}", tr!("usr.service.006", arg0 = 
-                    intent.version, arg1 =  COMMIT_VERSION
-                )),
+                message: format!(
+                    "{}",
+                    tr!("usr.service.006", arg0 = manifest.version, arg1 = MANIFEST_VERSION)
+                ),
             });
         }
-        Ok(Some(intent))
+        Ok(Some(manifest))
+    }
+
+    /// 读提交记录;没有就用一份空的(每张表的 `log` 都当 0).
+    pub fn load_or_empty(dir: &Path) -> Result<Manifest> {
+        Ok(Self::load(dir)?.unwrap_or_default())
     }
 
     /// 写进**库目录**(临时文件 + rename,与 [`Catalog::save`] 同一套).
+    ///
+    /// 这是**提交点**:这一行返回之后,这次提交就必须做完(见 [`Manifest`]).
     pub fn save(&self, dir: &Path) -> Result<()> {
-        let path = dir.join(COMMIT_FILE);
+        let path = dir.join(MANIFEST_FILE);
         let json = serde_json::to_string_pretty(self).map_err(|e| DbError::Format {
             path: path.display().to_string(),
             line: None,
-            message: format!("{}", tr!("usr.service.007", arg0 =  e)),
+            message: format!("{}", tr!("usr.service.007", arg0 = e)),
         })?;
 
-        let tmp = dir.join(format!("{}.tmp", COMMIT_FILE));
+        let tmp = dir.join(format!("{}.tmp", MANIFEST_FILE));
         fs::write(&tmp, format!("{}\n", json)).map_err(|e| io_err(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))
     }
 
-    /// 删掉提交意图(提交补完之后).不在不算错.
-    pub fn remove(dir: &Path) -> Result<()> {
-        let path = dir.join(COMMIT_FILE);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(&path, e)),
-        }
+    /// 还有没有"没做完"的部分(推广 / 删表).
+    pub fn settled(&self) -> bool {
+        self.promoted.is_empty() && self.removed.is_empty()
     }
 }
 
@@ -471,11 +509,12 @@ impl ServiceDir {
             Err(TryLockError::Error(e)) => return Err(io_err(&lock_path, e)),
         }
 
-        let database = Database {
+        let mut database = Database {
             dir,
             name,
             catalog,
             grants,
+            manifest: Manifest::default(),
             lock,
         };
 
@@ -850,6 +889,10 @@ pub struct Database {
     /// **会话手里的这一份就是当下那一份**:它是唯一能改这个库的写者(单写者锁),
     /// 而跨库改别人库的授权要走 [`ServiceDir::with_grants`].
     grants: Grants,
+    /// 这个库的**提交记录**(打开时读一次,每次提交之后更新).
+    ///
+    /// 与 `grants` 一样:会话手里这一份就是当下那一份(单写者锁保证了没人能同时改).
+    manifest: Manifest,
     /// 单写者锁.**只是持有**:句柄关掉(含进程退出,被 `kill -9`)内核就释放.
     lock: File,
 }
@@ -918,7 +961,8 @@ impl Database {
 
         let mut tables = Vec::with_capacity(paths.len());
         for path in paths {
-            let table = persister.load(&TablePath::from_data_path(&path))?;
+            let at = TablePath::from_data_path(&path);
+            let mut table = persister.load(&at)?;
             let stem = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -933,95 +977,239 @@ impl Database {
                     )),
                 });
             }
+
+            // 基表行数要与提交记录对上:对不上就是有人手工动过目录,宁可开不了库
+            if let Some(footprint) = self.manifest.tables.get(&stem) {
+                if footprint.base != table.nrows() {
+                    return Err(DbError::Format {
+                        path: path.display().to_string(),
+                        line: None,
+                        message: format!(
+                            "{}",
+                            tr!("usr.service.038", arg0 = footprint.base, arg1 =  table.nrows())
+                        ),
+                    });
+                }
+            }
+
+            // 变更日志重放(打开库时已经把它截到**已提交**的条数了,见
+            // [`Database::recover`])
+            persister.replay_log(&mut table, &at)?;
             tables.push(table);
         }
         Ok(tables)
     }
 
-    /// 一次**原子**的多表提交(4.2):写 `tables`,删 `removed`,两者要么全做,
-    /// 要么全不做.协议见 [`CommitIntent`].
+    /// 一次**原子**的多表提交:写 `tables`,删 `removed`,两者要么全做,要么全不做.
     ///
-    /// 中途失败(IO 错,进程被杀)都只会停在三个位置之一,而这三种在重启时都有
-    /// 确定的去向:暂存阶段(没写意图)→ 全在提交前;写了意图之后 → 补完全在提交后;
-    /// **没有"改了一半"这种状态**.
+    /// 协议(TODO 7.7 之后):
+    ///
+    /// 1. 改动**只追加**:有 `delta` 且磁盘上已经有基表的,把那几行追加到
+    ///    `<表>.log`;新表(或者整理过的)才写暂存文件(`<表>.csv.new`);
+    /// 2. 把每张表的**位置**(基表行数 + 日志条数)连同"要推广谁 / 要删谁"一起写进
+    ///    `manifest.json` -- **过了这一点,这次提交就必须完成**;
+    /// 3. 推广 + 删表(幂等),再把清单里那两栏清空重写一遍.
+    ///
+    /// 中途失败(IO 错,进程被杀)只会停在三种位置之一,而这三种在重启时都有确定的
+    /// 去向:清单没写(日志尾巴不算数,截掉就是提交前);清单写了(推广与删表补完
+    /// 就是提交后);清空那一遍没写成(推广与删表再跑一遍,还是提交后).**没有
+    /// "改了一半"这种状态**.
     ///
     /// 表名**就是文件名主干**,所以这里是"名字能不能当文件名"的最后一道闸
     /// (见 [`crate::db::table::is_file_stem_safe`]):`ir` 建表时已经拒过一次,
     /// 但真正碰文件系统的是这里--**这道闸不能省**,名字里带 `../` 真的会写到
     /// 别人的库目录(甚至服务目录)里去.
-    pub fn commit(&self, tables: &[&dyn Table], removed: &[String]) -> Result<()> {
+    pub fn commit(&mut self, tables: &[TableCommit<'_>], removed: &[String]) -> Result<()> {
         let persister = CsvPersister::new();
+        let mut manifest = self.manifest.clone();
+        let mut promoted = Vec::new();
+        // 这一次整理过的表:提交点之后要把它们的日志文件真的截掉
+        let mut compacted = Vec::new();
 
-        // 1) 先把每一张表都写成暂存文件.这一步失败就什么都还没提交:`.new` 是
-        //    孤儿残渣(下次提交覆盖它,恢复时清扫掉).
-        let mut written = Vec::with_capacity(tables.len());
-        for table in tables {
-            let name = checked_table_name(table.name())?;
-            persister.stage(*table, &TablePath::new(&self.dir, &name))?;
-            written.push(name);
+        // 1) 只写改动:能追加日志的就追加,其余整表暂存
+        //
+        // "能追加"要三条同时成立:这一次带着改动行,**磁盘上有基表**,而且**清单里
+        // 记着它的位置**.最后那一条管的是老库(TODO 7.7 之前建的,没有清单)与
+        // 上一次提交崩在半路的表:那种表的位置无从知道,整表重写一遍最省心--顺便
+        // 也就把它"迁"进了新协议.
+        //
+        // 追加上去之后日志可能就超阈值了(`wants_compaction`),那种情况在同一次
+        // 提交里顺手整理:基表重写一遍,清单里记 `log = 0`(刚追加的那些记录打开
+        // 库时被截掉).
+        for commit in tables {
+            let name = checked_table_name(commit.table.name())?;
+            let at = TablePath::new(&self.dir, &name);
+            let known = self.manifest.tables.get(&name).copied();
+            let delta = match (commit.delta, known) {
+                (Some(delta), Some(_)) if at.data_path().is_file() => Some(delta),
+                _ => None,
+            };
+            match (delta, known) {
+                (Some(delta), Some(before)) => {
+                    let appended =
+                        persister.append_delta(commit.table, &at, delta, before.log)?;
+                    // 追加**之后**再看要不要整理:这一次追加完就超阈值的话,顺手把
+                    // 基表重写一遍(日志记 0,多出来的那些记录打开库时被截掉).
+                    if self.wants_compaction(&at) {
+                        persister.stage(commit.table, &at)?;
+                        manifest.tables.insert(
+                            name.clone(),
+                            TableFootprint {
+                                base: commit.table.nrows(),
+                                log: 0,
+                            },
+                        );
+                        compacted.push(name.clone());
+                        promoted.push(name);
+                    } else {
+                        // 基表**没动**:行数还是上一次那个;变的是日志的条数
+                        manifest.tables.insert(
+                            name,
+                            TableFootprint {
+                                base: before.base,
+                                log: before.log + appended,
+                            },
+                        );
+                    }
+                }
+                // 新表(或者清单里没有它的位置):整表重写,日志归零
+                _ => {
+                    persister.stage(commit.table, &at)?;
+                    manifest.tables.insert(
+                        name.clone(),
+                        TableFootprint {
+                            base: commit.table.nrows(),
+                            log: 0,
+                        },
+                    );
+                    promoted.push(name);
+                }
+            }
+        }
+        for name in removed {
+            manifest.tables.remove(name);
         }
 
-        // 2) 提交意图落盘 -- **过了这一点,这次提交就必须完成**
-        let intent = CommitIntent {
-            version: COMMIT_VERSION,
-            written,
-            removed: removed.to_vec(),
-        };
-        intent.save(&self.dir)?;
+        // 2) 提交点
+        manifest.promoted = promoted;
+        manifest.removed = removed.to_vec();
+        manifest.save(&self.dir)?;
 
-        // 3) 补完.重放([`Database::recover`])走的是同一条路.
-        self.replay(&intent)
+        // 3) 做到底,然后把现场"落定"
+        self.apply(&manifest)?;
+        // 整理过的那几张表:基表已经是新的了,日志文件里的旧记录不再算数,
+        // 当场截掉(提交点已经过了,崩在这一步也只是留到下次打开再截)
+        for name in &compacted {
+            truncate_log(&TablePath::new(&self.dir, name), 0)?;
+        }
+        manifest.promoted.clear();
+        manifest.removed.clear();
+        manifest.save(&self.dir)?;
+        self.manifest = manifest;
+        Ok(())
     }
 
-    /// 把一个提交意图做到底:推广暂存文件,删掉要删的表,最后删掉意图本身.
+    /// 这次改动之后要不要**整理**这张表(整表重写 + 日志归零).
+    ///
+    /// 判据只看大小:日志比 `max(1 MiB, 基表字节数)` 还大就值得重写一遍--否则
+    /// 载入那一步每次都要把越来越长的日志重放一遍,而日志里的旧版本会越攒越多.
+    fn wants_compaction(&self, at: &TablePath) -> bool {
+        let log = fs::metadata(at.log_path()).map(|meta| meta.len()).unwrap_or(0);
+        let base = fs::metadata(at.data_path()).map(|meta| meta.len()).unwrap_or(0);
+        log > COMPACT_MIN_BYTES.max(base)
+    }
+
+    /// 把一个提交记录做到底:推广暂存文件,删掉要删的表.
     ///
     /// **幂等**:已经搬过的暂存文件(rename 掉之后 `.new` 就没了)会被跳过,
     /// 删掉的文件再删一次也不算错--所以它可以被"崩在中途"之后的恢复直接重跑.
-    fn replay(&self, intent: &CommitIntent) -> Result<()> {
-        for name in &intent.written {
+    fn apply(&self, manifest: &Manifest) -> Result<()> {
+        for name in &manifest.promoted {
             let name = checked_table_name(name)?;
             promote(&TablePath::new(&self.dir, &name))?;
         }
-        for name in &intent.removed {
+        for name in &manifest.removed {
             self.remove_table_files(name)?;
-        }
-        CommitIntent::remove(&self.dir)
-    }
-
-    /// 打开库时把上次没写完的提交收尾(4.2),并清扫暂存残渣.
-    ///
-    /// 看到 `commit.json` 就**补完**它(新数据早就在暂存文件里了,这是"全在提交后");
-    /// 没有 `commit.json` 而目录里还留着 `.new`,那是**暂存到一半**留下的--删掉
-    /// 就等于回到提交前(这是"全在提交前").两条路都不会留下"改了一半"的库.
-    pub fn recover(&self) -> Result<()> {
-        if let Some(intent) = CommitIntent::load(&self.dir)? {
-            self.replay(&intent)?;
-        }
-        self.sweep_staged()
-    }
-
-    /// 删掉没有提交意图庇护的暂存残渣(`*.csv.new` / `*.schema.json.new`).
-    ///
-    /// **必须在补完提交之后做**:`commit.json` 还留着的时候,那些 `.new` 正是要搬
-    /// 进正式位置的数据,先扫掉就把一次能补完的提交变成一次丢数据的提交了.
-    fn sweep_staged(&self) -> Result<()> {
-        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| io_err(&self.dir, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".csv.new") || name.ends_with(".schema.json.new") {
-                let path = entry.path();
-                fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
-            }
         }
         Ok(())
     }
 
-    /// 删掉一张表的两个文件(`DROP SCHEMA ... CASCADE` 的落点).文件不在不算错.
+    /// 打开库时把上次没写完的提交收尾(TODO 7.7),并清扫暂存残渣.
+    ///
+    /// 三步,顺序不能换:
+    ///
+    /// 1. 清单里还有 `promoted` / `removed` 的,先做到底(新数据早就在暂存文件里了,
+    ///    这是"全在提交后"),然后把那两栏清空重写;
+    /// 2. **把每张表的日志截到清单里记的条数**:多出来的尾巴是没越过提交点的写
+    ///    (这是"全在提交前");
+    /// 3. 清扫没有清单庇护的 `.new` 残渣.
+    pub fn recover(&mut self) -> Result<()> {
+        let mut manifest = Manifest::load_or_empty(&self.dir)?;
+        if !manifest.settled() {
+            self.apply(&manifest)?;
+            manifest.promoted.clear();
+            manifest.removed.clear();
+            manifest.save(&self.dir)?;
+        }
+        self.truncate_logs(&manifest)?;
+        self.sweep_staged(&manifest)?;
+        self.manifest = manifest;
+        Ok(())
+    }
+
+    /// 把每张表的变更日志截到**已提交**的条数(清单里没有的表当 0).
+    ///
+    /// 只按字节位置截断,不重写内容;多出来的那些是没越过提交点的写.
+    fn truncate_logs(&self, manifest: &Manifest) -> Result<()> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err(&self.dir, e))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let committed = manifest.tables.get(&stem).map_or(0, |at| at.log);
+            truncate_log(&TablePath::new(&self.dir, &stem), committed)?;
+        }
+        Ok(())
+    }
+
+    /// 删掉没有提交记录庇护的暂存残渣(`*.csv.new` / `*.schema.json.new`).
+    ///
+    /// **必须在补完提交之后做**:清单里记着的那几个 `.new` 正是要搬进正式位置的
+    /// 数据,先扫掉就把一次能补完的提交变成一次丢数据的提交了.
+    fn sweep_staged(&self, manifest: &Manifest) -> Result<()> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err(&self.dir, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".csv.new") && !name.ends_with(".schema.json.new") {
+                continue;
+            }
+            let stem = name
+                .trim_end_matches(".schema.json.new")
+                .trim_end_matches(".csv.new")
+                .to_string();
+            if manifest.promoted.contains(&stem) {
+                continue;
+            }
+            let path = entry.path();
+            fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
+        }
+        Ok(())
+    }
+
+    /// 删掉一张表的三个文件(数据 / 模式 / 变更日志).
+    /// 这是 `DROP SCHEMA ... CASCADE` 的落点.文件不在不算错.
     pub fn remove_table_files(&self, name: &str) -> Result<()> {
         let name = checked_table_name(name)?;
         let at = TablePath::new(&self.dir, &name);
-        for path in [at.data_path(), at.schema_path()] {
+        let log = at.log_path();
+        for path in [at.data_path(), at.schema_path(), log.as_path()] {
             if let Err(e) = fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     return Err(io_err(path, e));

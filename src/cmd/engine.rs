@@ -127,9 +127,10 @@
 //! `SAVEPOINT`),要撤销就 `ROLLBACK`;事务还开着时退出会话等于丢掉它(与
 //! PostgreSQL 断开连接一致).
 //!
-//! 落盘走 [`Database::commit`]:先全部暂存,写下提交意图 `commit.json`,再一起
-//! rename.所以**一次提交是原子的**--崩在中间只可能全在提交前或全在提交后,打开
-//! 库时由 [`Database::recover`] 收尾.不做 WAL,不 `fsync`(只保证进程崩溃,
+//! 落盘走 [`Database::commit`]:改过的行**追加**到表的数据文件旁(`<表>.log`),
+//! 每张表写到了哪儿记进 `manifest.json`(它才是提交点).所以**一次提交是原子的**
+//! --崩在中间只可能全在提交前(日志尾巴不算数,截掉)或全在提交后(推广与删表补完),
+//! 打开库时由 [`Database::recover`] 收尾.不做 WAL,不 `fsync`(只保证进程崩溃,
 //! 不保证掉电).这些都在 [`Session::commit`] 与各语句的文档里写着.
 
 use std::collections::BTreeSet;
@@ -140,6 +141,7 @@ use std::time::Instant;
 
 use crate::db::phys::PhysTab;
 use crate::db::table::{DbError, Result, TabShape, Table};
+use crate::pers::TableCommit;
 use crate::ir::stmt::{
     AlterRoleRequest, CreateRoleRequest, GrantRequest, GrantRoleRequest, GrantTarget, Server,
 };
@@ -273,6 +275,11 @@ struct Store {
     user: User,
     /// 这次提交要写的表(生效名).
     dirty: BTreeSet<String>,
+    /// 这些表下一次提交**整表重写**,不要追加日志.
+    ///
+    /// 上一次提交失败时把脏表记进来:日志可能已经追加了一半(整行写完但清单没写成),
+    /// 再追加一遍就是重复记录.重写一遍最省心,而这条路上本来就是出错之后的补救.
+    force_full: BTreeSet<String>,
     /// 磁盘上**应该有**的表名:载入时那份,加上已经写成功的.
     known_on_disk: BTreeSet<String>,
 }
@@ -740,6 +747,7 @@ impl Session {
             db,
             user,
             dirty: BTreeSet::new(),
+            force_full: BTreeSet::new(),
             known_on_disk,
         });
         Ok(session)
@@ -1098,13 +1106,13 @@ impl Session {
     /// 见文件头的"提交点"一节.内存模式直接返回;**事务开着时也直接返回**
     /// --提交点是 `COMMIT`,不是"这段跑完了".
     ///
-    /// 落盘走 [`Database::commit`] (影子分页 + `commit.json`):先全部暂存,写下
-    /// 提交意图,再一起推广.所以**一次提交是原子的**--崩在中间只可能全在提交前
-    /// 或全在提交后(4.2).
+    /// 落盘走 [`Database::commit`]:改过的行**追加**到表的数据文件旁,位置记进
+    /// `manifest.json`(先写它,再做推广 / 删表).所以**一次提交是原子的**--
+    /// 崩在中间只可能全在提交前或全在提交后(4.2).
     ///
-    /// 失败时 `dirty` **原样留着**(下次提交再试),而磁盘上什么都不会被动过:
-    /// 失败点要么在暂存阶段(留给恢复清扫),要么在推广阶段(`commit.json` 还在,
-    /// 下次打开时补完).
+    /// 失败时 `dirty` **原样留着**(下次提交再试),而磁盘上什么都不会被动过.
+    /// 重试时这些表会**整表重写**(见 `store.force_full`):日志可能已经追加了一半,
+    /// 再追加一遍就会重复记录--重写一遍最省心,代价只在出错这一条路上.
     pub fn commit(&mut self) -> Result<()> {
         let Some(store) = self.store.as_mut() else {
             return Ok(());
@@ -1128,18 +1136,30 @@ impl Session {
 
         // 没有脏表,也没有要删的表:这条语句什么都没改(只读语句占绝大多数),
         // 一个字节的 IO 都不做.少了这一句,一次纯 `SELECT` 也会去写一遍
-        // `commit.json`--库目录只读(或磁盘写满)时,那会变成"查询成功,
+        // `manifest.json`--库目录只读(或磁盘写满)时,那会变成"查询成功,
         // 却报提交失败"的怪事.
         if store.dirty.is_empty() && gone.is_empty() {
             return Ok(());
         }
 
-        let mut tables: Vec<&dyn Table> = Vec::with_capacity(store.dirty.len());
+        // 这一次提交要写的行(上一次提交点之后改过的那些);先`拿走`,写成功了才
+        // 真的丢掉(见 [`SymbolTable::take_pending`])
+        let pending = self.symbols.take_pending();
+
+        let mut tables: Vec<TableCommit<'_>> = Vec::with_capacity(store.dirty.len());
         for name in store.dirty.iter() {
             // **精确**取表:脏表记的是它自己的生效名,不能再按当时的 `search_path`
             // 解一次--`s.t` 与 `t` 都在,`search_path` 又指向 `s` 时,那会把表存错
             match self.symbols.relation_exact(name) {
-                Some(table) => tables.push(table),
+                Some(table) => {
+                    // 重试的表整表重写(见方法头那段);没有改动行的那种(新建的空表)
+                    // 同样整表重写
+                    let delta = match store.force_full.contains(name) {
+                        true => None,
+                        false => pending.get(name),
+                    };
+                    tables.push(TableCommit { table, delta });
+                }
                 // 这一段里刚建出来又被 `DROP SCHEMA ... CASCADE` 清掉的表:
                 // 没有东西要写,也不算错(它的文件压根没落过盘)
                 None => continue,
@@ -1153,15 +1173,29 @@ impl Session {
             store.db.retire_grants(&gone)?;
         }
 
-        store.db.commit(&tables, &gone)?;
+        let mut gone = gone;
+        let written: Vec<String> = tables
+            .iter()
+            .map(|commit| commit.table.name().to_string())
+            .collect();
+        if let Err(e) = store.db.commit(&tables, &gone) {
+            // 失败:改动行放回去,这些表下一轮**整表重写**(日志可能追加了一半,
+            // 再追加一遍就重复了)
+            drop(tables);
+            self.symbols.restore_pending(pending);
+            store.force_full.extend(store.dirty.iter().cloned());
+            return Err(e);
+        }
+        drop(tables);
 
         // 提交成功了才认账:清掉脏标记,更新"磁盘上应该有哪些"
         store.dirty.clear();
-        for name in gone {
+        store.force_full.clear();
+        for name in gone.drain(..) {
             store.known_on_disk.remove(&name);
         }
-        for table in tables {
-            store.known_on_disk.insert(table.name().to_string());
+        for name in written {
+            store.known_on_disk.insert(name);
         }
 
         Ok(())
