@@ -36,9 +36,11 @@
 //!
 //! * 求值 `Step::Subquery` 时把"本程序面对的那一行"压进**外层行栈**
 //!   (`Step::Outer` 从这里取),然后**再调一次 `build_pipeline`** 造一份内层源;
-//! * 未相关(`SubPlan::correlated == false`)的内层**结果行**只算一次,缓存起来;
-//!   相关的每行重开一份.注意缓存的是**行**,不是最终标量--`x IN (SELECT ...)`
-//!   的左半边逐行不同,缓存真值会安静地给错答案.
+//! * 未相关(`SubPlan::correlated == false`)的内层只算一次,按 [`SubMode`] 缓存的
+//!   **形态不同**(`SubCache`):`EXISTS` 只留一个真值,标量只留那个结果,`IN` 留
+//!   内层那一列的值集合,其余量化才留行.相关的每行重开一份.注意**不能缓存"这个
+//!   子查询的真值"**--`x IN (SELECT ...)` 的左半边逐行不同,缓存真值会安静地给错
+//!   答案.
 //!
 //! 每个 `RowSource` 因此都带着 `Rc<ExecCtx>`,程序一律走 [`Prog::eval_with`];
 //! 只有"键不读列"的索引路径还用它自己的无环境求值.
@@ -52,10 +54,10 @@ use crate::db::index::{IndexSlot, IndexSource};
 use crate::db::phys::PhysTab;
 use crate::db::source::{self, RowSource, TableCursor};
 use crate::db::table::{
-    Column, ColumnsShape, DbError, DecimalOp, Result, Row, Table, TabShape, Value,
+    Column, ColumnsShape, DataType, DbError, DecimalOp, Result, Row, Table, TabShape, Value,
 };
 
-use super::expr::{apply, Env, EvalError, Prog, SubMode, SubPlan};
+use super::expr::{apply, BinOp, Env, EvalError, Prog, SubMode, SubPlan};
 use super::value::{Scalar, Tri};
 use super::plan::{
     passthrough_column, AggFunc, AggSpec, Analysis, EqKey, IndexPath, JoinKind, JoinStrategy,
@@ -122,6 +124,18 @@ where
         let source: Box<dyn RowSource + 'p> = match &node.op {
             Op::SingleRow => Box::new(SingleRowSource::new()),
 
+            // `SELECT COUNT(*) FROM t`(单张基表,没有 `WHERE` / `GROUP BY`):
+            // 一行都不读,直接问表的行数(TODO 3.8).
+            Op::CountRows { table, name } => {
+                let relation =
+                    ctx.symbols
+                        .relation(table)
+                        .ok_or_else(|| DbError::UnknownSymbol {
+                            name: table.clone(),
+                        })?;
+                Box::new(CountRowsSource::new(relation, name, id)?)
+            }
+
             Op::Scan {
                 table,
                 filter,
@@ -144,8 +158,8 @@ where
                         let slot = ctx
                             .symbols
                             .index_of(table, path.column)
-                            .unwrap_or_else(|| Rc::new(IndexSlot::new(path.column)));
-                        Box::new(IndexSource::new(relation, slot, index_key(path, id)?))
+                            .unwrap_or_else(|| Rc::new(IndexSlot::new(path.column, false, String::new())));
+                        Box::new(IndexSource::new(relation, slot, index_key(path, ctx, id)?))
                     }
                     None => Box::new(TableCursor::new(relation)),
                 };
@@ -220,7 +234,7 @@ where
                         let slot = ctx
                             .symbols
                             .index_of(table, column)
-                            .unwrap_or_else(|| Rc::new(IndexSlot::new(column)));
+                            .unwrap_or_else(|| Rc::new(IndexSlot::new(column, false, String::new())));
                         Box::new(IndexJoinSource::new(
                             left,
                             relation,
@@ -298,20 +312,138 @@ where
 ///   [`Step::Subquery`] 求值的那一刻(压进去的是"本程序面对的那一行",也就是
 ///   内层的外层行),内层跑完就弹回来;
 /// * **内层的缓存**:内层计划的 [`Analysis`] 总是只算一次(分析是纯的,查询期间
-///   符号表不动);**未相关**子查询的内层**结果行**也只算一次--它与外层哪一行
-///   无关.相关的必须每行重开一份源.
+///   符号表不动);**未相关**子查询的内层也只算一次--它与外层哪一行无关,而
+///   相关的必须每行重开一份源.按 [`SubMode`] 缓存的**形态不同**([`SubCache`]).
 ///
 /// 缓存按 `SubPlan` 的地址认:计划在一次执行里是稳定的,指针也就稳定.
 ///
-/// > 注意缓存的是**内层的行**,不是最终标量.`x IN (SELECT ...)` 的左半边是外层
+/// > 注意**不能缓存"这个子查询的真值"**:`x IN (SELECT ...)` 的左半边是外层
 /// > 表达式,逐行不同;把最终真值缓存下来会安静地给出错答案(这是实测踩过的坑).
+/// > `IN` 缓存的是内层那一列的**值集合**--它与左半边无关,是对的.
 struct ExecState {
     /// 外层行栈:`[0]` 是最外层,`last()` 是最近一层.
     outers: RefCell<Vec<Row>>,
-    /// 未相关子查询的内层结果行.
-    rows_cache: RefCell<HashMap<*const SubPlan, Rc<Vec<Row>>>>,
+    /// 未相关子查询算过一次之后留下的东西,按 [`SubMode`] 分形态.
+    sub_cache: RefCell<HashMap<*const SubPlan, SubCache>>,
     /// 子查询内层计划的 `Analysis`(`Rc` 是为了给多个源共享).
     analysis_cache: RefCell<HashMap<*const SubPlan, Rc<Analysis>>>,
+}
+
+/// 一个未相关子查询算过一次之后留下的东西(TODO 3.9).
+///
+/// 老写法一律把内层抽干成 `Vec<Row>`,于是 [`combine_subquery`] 自己的短路白搭:
+/// `EXISTS` 只要一行却把整张表读进来,`x IN (...)` 的每一行都在那堆行上线性扫
+/// (O(外层行数 x 内层行数)),标量子查询也要两行就能判"多于一行"却全抽干.
+/// 这里按 [`SubMode`] 只留真正需要的那一点.
+enum SubCache {
+    /// `EXISTS`:未相关时真值是**常量**,一行都不用留.
+    Exists(Tri),
+    /// 标量:未相关时结果就是常量(`Value::Null` = 内层没有行).
+    Scalar(Scalar),
+    /// `= ANY`(就是 `IN`):内层那一列的**值集合**,逐外层行 O(1).
+    In(ValueSet),
+    /// 其余量化(非等值比较 / `ALL`):内层的行,逐行比.
+    Rows(Rc<Vec<Row>>),
+}
+
+impl SubCache {
+    /// 按模式把这份缓存收成一个标量.
+    ///
+    /// 形态与模式由建它的人([`ExecCtx::build_cache`])一处配对,所以这里不需要
+    /// `spec.mode` 的每一种;`Rows` 那一种正是给"只能逐行比"的模式准备的,
+    /// 于是它照旧交给 [`combine_subquery`].
+    fn answer(
+        &self,
+        spec: &SubPlan,
+        test: Option<Scalar>,
+    ) -> std::result::Result<Scalar, EvalError> {
+        match self {
+            SubCache::Exists(truth) => Ok(Scalar::Truth(*truth)),
+            SubCache::Scalar(value) => Ok(value.clone()),
+            SubCache::In(set) => set.answer(test),
+            SubCache::Rows(rows) => combine_subquery(&spec.mode, test, &mut rows.iter().cloned()),
+        }
+    }
+}
+
+/// `x = ANY (SELECT ...)`(也就是 `IN`)的内层**值集合**.
+///
+/// 表里的值一个都不复制给外层用:外层每一行只需 O(1) 的一次查找.
+#[derive(Default)]
+struct ValueSet {
+    keys: HashSet<InKey>,
+    /// 内层有没有 NULL(`x IN (没命中但有 NULL 的集合)` 是 UNKNOWN,不是 FALSE).
+    has_null: bool,
+    /// 内层有多少行:空集与"只有 NULL"在 `ANY` 的语义下**不同**
+    /// (空集是 FALSE,有一行 NULL 是 UNKNOWN).
+    nrows: usize,
+}
+
+impl ValueSet {
+    /// 收一个内层值.`NULL` 也是"一行",只是它不成为一个键.
+    fn push(&mut self, value: Value) {
+        self.nrows += 1;
+        match in_key(&value) {
+            Some(key) => {
+                self.keys.insert(key);
+            }
+            None => self.has_null = true,
+        }
+    }
+
+    /// `外层表达式 = ANY (这一个集合)` 的答案(三值).
+    fn answer(&self, test: Option<Scalar>) -> std::result::Result<Scalar, EvalError> {
+        // 空集:`ANY` 在空集上是 FALSE(SQL 标准)
+        if self.nrows == 0 {
+            return Ok(Scalar::Truth(Tri::False));
+        }
+
+        let test = test.unwrap_or(Scalar::Value(Value::Null));
+        let value = match test {
+            Scalar::Value(value) => value,
+            // 真值当不了比较的一侧(`verify` 早就拦掉了;这里宁可报错)
+            Scalar::Truth(_) => return Err(EvalError::MixedTypes),
+        };
+        // 与 NULL 比较永远是 UNKNOWN,整个 `ANY` 也是 UNKNOWN
+        let Some(key) = in_key(&value) else {
+            return Ok(Scalar::Truth(Tri::Unknown));
+        };
+
+        match (self.keys.contains(&key), self.has_null) {
+            (true, _) => Ok(Scalar::Truth(Tri::True)),
+            (false, true) => Ok(Scalar::Truth(Tri::Unknown)),
+            (false, false) => Ok(Scalar::Truth(Tri::False)),
+        }
+    }
+}
+
+/// `IN` 的哈希键.
+///
+/// `INT` 与 `NUMERIC` 在 [`Value`] 层面**不是同一个值**(`Int(1)` 与
+/// `Numeric("1")`),而运行时的比较会把 `Int` 放大成 `Numeric`(见 `expr::apply`
+/// 与 `widen_numeric`)--直接拿 `Value` 当键就会**安静地漏掉**本该成立的那些行
+/// (`x IN (SELECT n)` 里 `x` 是 `INT`,`n` 是 `NUMERIC` 就是这种写法).所以数值族
+/// 统一归到**规范十进制文本**上;文本的规范化是 `Value` 的不变量(见
+/// [`crate::db::table`] 的 `Numeric`),于是"文本相等"与"数值相等"是同一件事.
+///
+/// 别的大类原样:`Value` 的 `Hash` 与比较同族,而同族是类型检查放行的唯一一种
+/// 相等(比较只放行同族,外加 `INT` ↔ `NUMERIC`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InKey {
+    /// 数值族:`Int` 与 `Numeric` 都归到规范十进制文本上.
+    Number(String),
+    /// 别的大类:原样.
+    Value(Value),
+}
+
+/// 一个值在这个键空间里的样子;`NULL` 没有键(它由 [`ValueSet::has_null`] 记着).
+fn in_key(value: &Value) -> Option<InKey> {
+    match value {
+        Value::Null => None,
+        Value::Int(i) => Some(InKey::Number(i.to_string())),
+        Value::Numeric(text) => Some(InKey::Number(text.clone())),
+        other => Some(InKey::Value(other.clone())),
+    }
 }
 
 /// 求值环境本体:符号表 + 共享状态.
@@ -326,7 +458,7 @@ impl<'s> ExecCtx<'s> {
             symbols,
             state: Rc::new(ExecState {
                 outers: RefCell::new(Vec::new()),
-                rows_cache: RefCell::new(HashMap::new()),
+                sub_cache: RefCell::new(HashMap::new()),
                 analysis_cache: RefCell::new(HashMap::new()),
             }),
         }
@@ -377,19 +509,20 @@ impl<'s> ExecCtx<'s> {
             .analysis_of(spec)
             .map_err(|e| EvalError::Nested(Box::new(e)))?;
 
-        // 未相关:内层的行与外面哪一行无关,算一次,缓存起来
+        // 未相关:内层与外面哪一行无关,算一次,按模式缓存起来(TODO 3.9)
         if !spec.correlated {
             let key = spec as *const SubPlan;
-            let cached = self.state.rows_cache.borrow().get(&key).cloned();
-            let rows = match cached {
-                Some(rows) => rows,
-                None => {
-                    let rows = Rc::new(self.drain(&spec.plan, &analysis)?);
-                    self.state.rows_cache.borrow_mut().insert(key, rows.clone());
-                    rows
+            {
+                let cached = self.state.sub_cache.borrow();
+                if let Some(cache) = cached.get(&key) {
+                    return cache.answer(spec, test);
                 }
-            };
-            return combine_subquery(&spec.mode, test, &mut rows.iter().cloned());
+            }
+            // 建缓存失败(内层报错 / 标量多于一行)就**不入缓存**:下一行照旧报同一个错
+            let cache = self.build_cache(spec, &analysis)?;
+            let answer = cache.answer(spec, test)?;
+            self.state.sub_cache.borrow_mut().insert(key, cache);
+            return Ok(answer);
         }
 
         // 相关:内层每行重开一份源(拉取式之下只是多调一次构建)
@@ -412,22 +545,72 @@ impl<'s> ExecCtx<'s> {
         }
     }
 
-    /// 抽干一个内层计划,返回它的所有行.
-    fn drain(&self, plan: &Plan, analysis: &Analysis) -> std::result::Result<Vec<Row>, EvalError> {
+    /// 把一个未相关子查询算一次,按 [`SubMode`] 收成最省的形态(TODO 3.9).
+    ///
+    /// 各模式**只取它真正需要的那一点**:
+    ///
+    /// * `EXISTS` -- 一行就够(真值是常量);
+    /// * 标量 -- 最多两行(第二行就是"多于一行"的错,与 PostgreSQL 一样在第二行收手);
+    /// * `= ANY`(`IN`)-- 内层那一列的值(`spec.arity == 1` 由降级保证);
+    /// * 其余量化 -- 内层的行,没别的办法.
+    fn build_cache(
+        &self,
+        spec: &SubPlan,
+        analysis: &Analysis,
+    ) -> std::result::Result<SubCache, EvalError> {
         let inner_ctx = Rc::new(ExecCtx {
             symbols: self.symbols,
             state: self.state.clone(),
         });
-        let mut source = build_pipeline(plan, analysis, &inner_ctx)
+        let mut source = build_pipeline(&spec.plan, analysis, &inner_ctx)
             .map_err(|e| EvalError::Nested(Box::new(e)))?;
 
-        let mut rows = Vec::new();
-        while let Some(row) = source.next() {
-            rows.push(row);
-        }
+        let cache = match &spec.mode {
+            SubMode::Exists => {
+                let some = source.next().is_some();
+                SubCache::Exists(if some { Tri::True } else { Tri::False })
+            }
+
+            SubMode::Scalar => {
+                let first = source.next();
+                // 多于一行是**运行期**错误(SQL 要求标量子查询最多给一行)
+                if first.is_some() && source.next().is_some() {
+                    return Err(EvalError::ScalarSubqueryRows { rows: 2 });
+                }
+                let value = first
+                    .and_then(|row| row.into_iter().next())
+                    .map(Scalar::Value)
+                    .unwrap_or(Scalar::Value(Value::Null));
+                SubCache::Scalar(value)
+            }
+
+            // `IN` 与 `= ANY` 是同一件事(`lower_sublink` 把两者都编成
+            // `op: Eq, all: false`);别的比较与 `ALL` 走下面那一支.
+            SubMode::Quantified {
+                op: BinOp::Eq,
+                all: false,
+                ..
+            } => {
+                let mut set = ValueSet::default();
+                while let Some(row) = source.next() {
+                    set.push(row.into_iter().next().unwrap_or(Value::Null));
+                }
+                SubCache::In(set)
+            }
+
+            SubMode::Quantified { .. } => {
+                let mut rows = Vec::new();
+                while let Some(row) = source.next() {
+                    rows.push(row);
+                }
+                SubCache::Rows(Rc::new(rows))
+            }
+        };
+
+        // 提前收手也可能是出错:`None` 有两个意思(正常结束 / 出错)
         match source.error() {
             Some(e) => Err(EvalError::Nested(Box::new(e.clone()))),
-            None => Ok(rows),
+            None => Ok(cache),
         }
     }
 }
@@ -623,6 +806,48 @@ impl RowSource for SingleRowSource {
     }
 }
 
+/// 一张表的**行数**,一行都不读(TODO 3.8).
+///
+/// `SELECT COUNT(*) FROM t`(单张基表,没有 `WHERE` / `GROUP BY`)走它:
+/// `Table::nrows()` 是现成的事实,为了一行答案把整张表拉一遍再数一遍是白干.
+/// 取行数不读任何一行(`nrows` 是 O(1) 的),所以这里没有"拉"这个动作.
+struct CountRowsSource<'a> {
+    /// 那一张表:只为 [`RowSource::name`] 与错误报文留着.
+    table: &'a dyn Table,
+    /// 输出 schema:一列 `INT`,名字与 `Aggregate` 那条路一样(`count`).
+    columns: Vec<Column>,
+    /// 那一行答案;吐过一次就没有了.
+    row: Option<Row>,
+}
+
+impl<'a> CountRowsSource<'a> {
+    /// `relation.nrows()` 装不进 `INT` 时报错(与 `Aggregate` 那条路同一句:
+    /// [`AggFunc::Count`](crate::ir::plan::AggFunc) 也是 `i32::try_from`).
+    fn new(relation: &'a dyn Table, name: &str, node: NodeId) -> Result<Self> {
+        let count = i32::try_from(relation.nrows())
+            .map_err(|_| runtime(node, tr!("ir.exec.021").into_owned()))?;
+        Ok(CountRowsSource {
+            table: relation,
+            columns: vec![Column::new(name, DataType::Int)],
+            row: Some(vec![Value::Int(count)]),
+        })
+    }
+}
+
+impl RowSource for CountRowsSource<'_> {
+    fn name(&self) -> &str {
+        self.table.name()
+    }
+
+    fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        self.row.take()
+    }
+}
+
 /// 扫描:**访问路径**(顺序游标或索引)逐行给行,再逐行跑下推的谓词.
 ///
 /// 索引只是访问路径:谓词照旧逐行求值,所以路径挑错也只是慢,不会算错.
@@ -696,6 +921,12 @@ impl RowSource for ScanSource<'_> {
 struct FilterSource<'a> {
     input: Box<dyn RowSource + 'a>,
     predicate: &'a Prog,
+    /// 谓词是**恒不成立**的常量吗(`Filter([false])` / `Filter([NULL])`).
+    ///
+    /// 是就一行都不拉:恒假谓词丢得掉每一行,而"每一行都要来一趟再被丢掉"正是
+    /// `WHERE 1 = 0` 白干的地方(TODO 3.7).只认常量--`Step::And` 的惰性仍然
+    /// 由求值自己保证,这里不替它做决定.
+    empty: bool,
     /// 求值环境(外层行栈 + 子查询缓存).
     ctx: Rc<ExecCtx<'a>>,
     node: NodeId,
@@ -709,9 +940,11 @@ impl<'a> FilterSource<'a> {
         ctx: Rc<ExecCtx<'a>>,
         node: NodeId,
     ) -> Self {
+        let empty = matches!(predicate.as_const(), Some(Scalar::Truth(t)) if !t.is_true());
         FilterSource {
             input,
             predicate,
+            empty,
             ctx,
             node,
             error: None,
@@ -730,7 +963,7 @@ impl RowSource for FilterSource<'_> {
     }
 
     fn next(&mut self) -> Option<Row> {
-        if self.error.is_some() {
+        if self.error.is_some() || self.empty {
             return None;
         }
 
@@ -1057,10 +1290,27 @@ fn key_of<'k, 's>(
 }
 
 /// 索引路径的键:在**没有输入行**的前提下求值(`analyze` 保证它不读列).
-fn index_key(path: &IndexPath, node: NodeId) -> Result<Value> {
-    // 索引键不读列,也就用不上外层行 / 子查询(`analyze` 保证键不引用列)
-    path.key
-        .eval(&[])
+///
+/// 两种键:
+///
+/// * 常量键(平常那种):空环境求值,一次算好;
+/// * **外层键**(`path.outer`,相关子查询的等值探测,TODO 8.7):键读的是外层行,
+///   所以从执行环境的外层行栈里取那一行当输入求值.这个源是在"为外层这一行重开
+///   一份管道"时建的,栈顶**就是**当前外层行--于是一次探测一个键,正好.
+fn index_key(path: &IndexPath, ctx: &ExecCtx<'_>, node: NodeId) -> Result<Value> {
+    let scalar = match path.outer {
+        false => path.key.eval(&[]),
+        true => {
+            // 栈空说明计划坏了(外层键却不在子查询里);`analyze` 的
+            // `check_subqueries` 本该挡住,这里不 panic,报一声就完事.
+            let outers = ctx.state.outers.borrow();
+            let row = outers.last().cloned().ok_or_else(|| {
+                runtime(node, tr!("ir.exec.026").into_owned())
+            })?;
+            path.key.eval_with(&row, &[], ctx)
+        }
+    };
+    scalar
         .map_err(|e| e.into_db_error(Some(node)))?
         .to_value()
         .ok_or_else(|| runtime(node, tr!("ir.exec.013").into_owned()))

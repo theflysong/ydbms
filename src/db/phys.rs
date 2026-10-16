@@ -97,6 +97,12 @@ impl Table for PhysTab {
         self.rows.get(r).cloned()
     }
 
+    /// 借用式读取的 trait 版本(inherent 的 [`PhysTab::row_ref`] 那条快路径,
+    /// 见 [`Table::row_ref`]):`UPDATE` 的 `WHERE` 靠它做到"只有命中的行才克隆".
+    fn row_ref(&self, r: usize) -> Option<&[Value]> {
+        PhysTab::row_ref(self, r)
+    }
+
     /// 单格读取:只克隆**一个**值,不克隆整行.
     ///
     /// 默认实现走 [`Table::row`] (整行克隆).索引建表要逐行读**一列**
@@ -152,6 +158,13 @@ impl Table for PhysTab {
             return Err(DbError::RowOutOfBounds { index: r, nrows });
         }
         self.rows.remove(r);
+        Ok(())
+    }
+
+    /// 一次做完(`Vec::truncate` 的语义就是"保留前 n 行",`n` 越界是不动):
+    /// 事务的追加式撤销记录用它(见 [`Table::truncate_to`]).
+    fn truncate_to(&mut self, n: usize) -> Result<()> {
+        self.rows.truncate(n);
         Ok(())
     }
 }

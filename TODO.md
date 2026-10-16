@@ -19,7 +19,8 @@
 它**不是**阶段 7 的前置:全量装载实测只占 593 MB,内存不是这个库的瓶颈.
 **语法与元命令那一类已经补齐**,`init.sql` 也能把全量数据装进去(`\copy` 落地);
 写基准的脚本(`insert_*` / `update_*`)与小样本上的 `tests.sql` 都能跑到底;
-剩下的一条是访问路径(8.7),再往后是全量跑批(8.8).
+**访问路径(8.7)也做完了**:`PRIMARY KEY` / 单列 `UNIQUE` 自动建索引,主键那份还
+真强制唯一性,于是全量 `tests.sql` 的 74 条全部跑完.再往后是全量跑批(8.8).
 
 难度标记:**[易]** 半天内,改动集中;**[中]** 一到两天,要动一两层;**[难]** 需要新机制或重写.
 
@@ -32,40 +33,58 @@
 | **0** | 跑通 `tests/script/db1/` 的 query4 / query5 | 0 | 0.1 `EXTRACT` / `ORDER BY <序号>`,0.2 子查询 |
 | **1** | 跑通 project1 的测试套件(`ydbms-test/`) | 1 | 1.1 `\timing` / `\set`,1.6 REPL 多行,1.4 查询层特性,1.5 事务与 schema,1.2 DDL 约束与 `DEFAULT`,1.3 `DATE` + `length()` |
 | **2** | 正确性收尾(与 PostgreSQL 的已知偏差) | 0 | 2.1 `CASE` 两分支放大,2.2 `CASE`/`AND`/`OR` 的惰性(修法 A) |
-| **3** | 性能与架构(索引,哈希连接,下推,重排,UPDATE) | 12 | 3.0 拉取式执行模型,3.1 索引 / 索引嵌套循环,3.2 哈希连接,3.3 谓词下推,3.5 `UPDATE`,3.6 索引进目录 + 可空侧下推 |
+| **3** | 性能与架构(索引,哈希连接,下推,重排,UPDATE) | 6 | 3.0 拉取式执行模型,3.1 索引 / 索引嵌套循环,3.2 哈希连接,3.3 谓词下推,3.5 `UPDATE`,3.6 索引进目录 + 可空侧下推,3.7 常量折叠与恒真 / 恒假谓词,3.8 `COUNT(*)` 问 `nrows()`,3.9 未相关子查询按模式缓存,3.15 `UPDATE` 的三处白干,3.16 `UPDATE ... WHERE` 走访问路径,3.17 追加式写的撤销记录不必克隆整表 |
 | **4** | 真事务(`BEGIN` / `COMMIT` / `ROLLBACK`)与原子提交 | 0 | 4.1 写前整表快照 + 目录快照 + 逐条隐式提交,4.2 影子分页 + `commit.json` 重放 |
 | **5** | 服务目录,数据库与"写完就落盘"(`--server-dist` / `-d`) | 0 | 5.1 库目录 / `catalog.json` / `CREATE`·`DROP DATABASE`,5.2 打开即载入 + 只写脏表的提交点,5.3 服务目录与单写者锁(随阶段 6 一起做),5.4 库级会话默认值(`ALTER DATABASE ... SET search_path`) |
 | **6** | 用户系统(`src/usr/`)与 `ysql` 命令行 | 0 | 6.1 用户表与认证,6.2 `ysql` 命令行,6.3 端到端验收与文档,6.4 角色 / 授权 / `\c`·`\l`·`\du` |
 | **7** | 超大型数据库:数据不再要求全在内存 | 9 | (未开始) |
-| **8** | 跑通 `script/` 下的基准脚本(init / insert / update / tests) | 2 | 8.1 `\copy` / `COPY`(全量 177 万行装进四张表),8.2 `\ir`,8.3 `VACUUM` / `ANALYZE` 空转,8.4 `\|\|`,8.5 `COALESCE`,8.6 `LOWER` 与两个方向的 `CAST`,8.9 写基准的命令标签(`insert_*` / `update_*` 已能跑到底,`tests.sql` 小样本 72 条零失败) |
+| **8** | 跑通 `script/` 下的基准脚本(init / insert / update / tests) | 1 | 8.1 `\copy` / `COPY`(全量 177 万行装进四张表),8.2 `\ir`,8.3 `VACUUM` / `ANALYZE` 空转,8.4 `\|\|`,8.5 `COALESCE`,8.6 `LOWER` 与两个方向的 `CAST`,8.9 写基准的命令标签,8.7 `PRIMARY KEY` / 单列 `UNIQUE` 自动建索引(全量 `tests.sql` **74 条全跑完**) |
 
 **当前基线**(改动前先确认还成立):
 
 ```text
 db.sql 52/0 · query1 4/0 · query2 5/0 · query3 8/0 · query4 6/0 · query5 9/0
 (格式:成功 / 失败)
-cargo test --offline → 689 通过(2 个 #[ignore]:两个基准),0 warning;约 5 秒
+cargo test --offline → 740 通过(2 个 #[ignore]:两个基准),0 warning;约 5 秒
 (端到端那套是 crate 内自带的 tests/script/filmdb/,11 张表 68 行,不再读仓库外的资源)
 执行模型:拉取式 -- ir::exec 的每个节点产出一个 RowSource,
           只有需要随机访问 / 重扫 / 哈希 build / 最终结果才物化(见 ir/exec.rs)
 访问路径:WHERE 的合取项下推到单表 Scan(LEFT JOIN 的可空侧只放行 null-rejecting 的
-          谓词,且连接之上仍留一份);索引是**目录对象**(CREATE INDEX / DROP INDEX
-          建与删,INSERT 追加,UPDATE 作废重建),只有目录里真有的索引才走;
-          连接有嵌套循环 / 哈希 / 索引嵌套循环三种策略(见 ir/plan.rs 的 JoinStrategy)
+          谓词,且连接之上仍留一份);索引是**目录对象**(CREATE TABLE 的 PRIMARY KEY /
+          单列 UNIQUE 顺手建一条,CREATE INDEX / DROP INDEX 建与删,INSERT 追加,
+          UPDATE 只作废**写到的列**上的那一份,下次用到时重建),只有目录里真有的
+          索引才走;INSERT / COPY 走追加式写入口,撤销记录因此不复制数据(见 3.17);**主键那份强制唯一性**(重复键
+          报错,`Column::unique` 落盘,打开库时 rebuild_indexes 重建);
+          **相关子查询的等值谓词**也能当索引探测(`IndexPath.outer`:键读外层行,
+          按列名重排到内层表上),于是 `EXISTS (... WHERE c.k = b.k)` 的内层不再整表重扫;
+          连接有嵌套循环 / 哈希 / 索引嵌套循环三种策略(见 ir/plan.rs 的 JoinStrategy);
+          **UPDATE 的 WHERE 也走访问路径**(opt::pushdown::update_index_path 挑索引,
+          执行时先按它把命中的**行号**选完,再逐行改--见 3.16),
+          而改名的那一步只在**命中**的行上克隆整行(见 3.15)
 连接规模:两张 N 行的表等值连接(debug 档),N=2000 时嵌套循环 1.63 秒 →
           哈希 6.0 毫秒,索引嵌套循环 4.3 毫秒,N 翻倍后者约 ×2
           (跑 tests/ir_join.rs 里 #[ignore] 的 join_scaling_benchmark 可复现;
           手写计划的索引嵌套循环走"本地槽位"那条兜底,与目录里的索引同价)
 子查询:内层是一份**自足**的 Plan(Step::Subquery / Step::Outer),执行时按外层行
-        重开一份源,未相关的缓存内层**行**(见 ir/exec.rs 的 ExecCtx);
-        派生表走 PlanBuilder::splice,UNION [ALL] 走 Op::Union
+        重开一份源,未相关的只算一次,而且**按模式只留需要的那些**(EXISTS 一个真值 /
+        标量一个结果 / `IN` 一列值集合,见 ir/exec.rs 的 SubCache);缓存的是内层的值,
+        **不是最终真值**;派生表走 PlanBuilder::splice,UNION [ALL] 走 Op::Union
 表达式惰性:CASE 的两个分支与 AND/OR 的右侧是**自足子程序**(Step::Case / And / Or),
         只有被选中时才求值(死分支里的除零不再冒出来);AND/OR 按书写顺序,
         左侧能定胜负就不算右侧(见 ir/expr.rs 与 tests/ir_lazy.rs)
+常量折叠:降级期就把算得出来的算术 / 比较 / 函数调用算掉(ProgBuilder 的 consts 旁表),
+        不读列的程序整个折成一条 Const;折叠**只在类型也过得去时**做,折不动
+        (`1/0` 之类)原样留着,--错误仍在运行期报(与惰性那条口径一致);
+        合取项里的恒真项丢掉,恒不成立项让整条 WHERE 只剩它:Filter([false]) 一行都不拉,
+        而**那张表仍旧留在计划里**(权限检查靠 Plan::used_columns)
+        见 tests/ir_fold.rs 与 ir/AGENTS.md 的"两条规则式降级"
+聚合捷径:SELECT COUNT(*) FROM t(单张基表,没有 WHERE / GROUP BY)不建 Aggregate 也不扫表,
+        直接问 Table::nrows()(Op::CountRows,一行都不读);有 WHERE / 别的聚合照旧走
+        Aggregate(见 irgen::count_rows_directly 与 tests/ir_agg.rs)
 DDL/DML:CREATE TABLE 的 NOT NULL / DEFAULT / CHECK **真强制**(CHECK 见 ir/checks.rs),
         PRIMARY KEY / UNIQUE / FOREIGN KEY 接受并**如实记录为未强制**;
         INSERT 缺列补 DEFAULT(没有就补 NULL),UPDATE 逐行改(值在旧行上求值,
-        整行一次落库,先整体作废索引)
+        整行一次落库,只作废写到的列上的索引,名字只解一次,被过滤掉的行不克隆)
 类型:INT / TEXT / CHAR / VARCHAR / TIMESTAMP / DATE / NUMERIC(date 定宽 YYYY-MM-DD)
 模块:ir/value.rs(值层),ir/irgen.rs(降级),ir/opt/(优化器),ir/checks.rs(CHECK
         强制点),usr/(用户与库)
@@ -94,9 +113,10 @@ DDL/DML:CREATE TABLE 的 NOT NULL / DEFAULT / CHECK **真强制**(CHECK 见 ir/c
       字符串字面量里不许再有中文,注释/文案/我们自己的 *.md 里不许出现有半角对应体的
       全角标点(口径与映射表见根 AGENTS.md 的 "六,文案与标点")
 事务:BEGIN / COMMIT / ROLLBACK **真生效**--撤销记录在符号表里:事务开始时快照目录
-      (符号名,索引,schema,search_path),事务里**第一次**要写或要删某张表之前
-      整表克隆一份(Table::snapshot),ROLLBACK 按快照重建(DDL 一起回滚,回滚后索引
-      整体作废);没有显式 BEGIN 时**每条语句自成一个隐式事务**(成功即提交,失败即
+      (符号名,索引,schema,search_path),事务里**第一次**要写或要删某张表之前记一笔:
+      **纯追加**(INSERT / COPY)只记"截断回原来的行数"(Table::truncate_to,表里的值
+      一个都不复制),**原地改写**(UPDATE / 删表)才整表克隆(Table::snapshot);
+      ROLLBACK 按快照重建(DDL 一起回滚,回滚后索引整体作废);没有显式 BEGIN 时**每条语句自成一个隐式事务**(成功即提交,失败即
       回滚这一句),BEGIN 会把这个隐式事务升级成显式;BEGIN 套 BEGIN 与无事务的
       COMMIT/ROLLBACK 照 PostgreSQL 只发警告(不是错误);没有 SAVEPOINT / 嵌套事务 /
       "事务已中止"状态,事务里语句失败不整句回滚(要撤销就 ROLLBACK),退出会话时
@@ -126,16 +146,27 @@ script/:另一套基准(IMDb 四张表),**与 `ydbms-test/` 无关**.`schema.sql
       `search_path`,四条 `\copy` 把 1770672 行装进四张表,末尾自检数出
       499999 / 499999 / 499999 / 270675(见 8.8 的全量口径)
 script/ 的全量实测(**内存不是瓶颈**,release 档,库目录即 `pers` 的 CSV 格式,
-      四个 TSV 共 1770672 行 / 约 100 MB;这一组是**手工装载**测出来的,
-      `init.sql` 跑通之后要按 8.8 的口径重测):
-      * 装载:四张表全部载入常驻 **593 MB**,1.71 秒(在 `ulimit -v 4G` 下毫无压力);
-      * `tests.sql`:前 **51 条零失败**,第 52 条(Test 10.3 的相关 `EXISTS`)3 分钟
-        无进展--**卡在时间上,不是内存上**(见 8.7);
-      * 主键访问**全是全表扫**:Test 2.1 取一行 118.6 ms,2.3 取十行 359.6 ms,
-        2.4 取 101 行 181.3 ms,而 Test 1.1 整表 dump(499999 行)才 417.0 ms.
-        参考:PostgreSQL 上 Test 2 那几条是 0.0x ms.原因是 `PRIMARY KEY` 不建索引(8.7);
-      * 全量下最慢的都在连接与聚合:Test 5.3 四表连接 3394.6 ms,6.3.b 2635.7 ms,
-        5.2 2298.1 ms,6.3.a 1891.0 ms
+      四个 TSV 共 1770672 行 / 约 100 MB;`init.sql` 与 `tests.sql` 这一组是
+      8.7 落地之后重测的,口径见 8.8):
+      * 装载:`init.sql` 全量跑通(四张表 1770672 行),末尾自检数出
+        499999 / 499999 / 499999 / 270675,进程常驻约 **593 MB**;四条 `\copy`
+        分别是 2.74 / 1.27 / 1.15 / 0.87 秒,整脚本 13.5 秒;
+      * `tests.sql`:**74 条语句全部跑完,零失败**(8.7 之前停在第 52 条);
+        语句耗时合计 **30.7 秒**(PostgreSQL 那边约 9 秒);
+      * 主键访问真的走索引了:Test 2.1 取一行 **0.13 ms**(原来是 118.6 ms),
+        Test 2.2 取一行 name_basics **0.03 ms**;Test 2.3 的 `IN` 列表
+        453.9 ms(原来 359.6 ms,`IN` 还不走索引--见 3.14),Test 2.4 的区间
+        244.4 ms(原来 181.3 ms,范围谓词同上);
+      * 相关子查询不再整表重扫:Test 10.3(相关 `EXISTS`)1.01 秒,
+        Test 10.4(`NOT EXISTS` 反连接)0.86 秒--**原来是 3 分钟无进展**;
+      * 全量下最慢的都在连接与聚合:Test 5.3 四表连接 1140.7 ms(原来 3394.6 ms),
+        Test 1.1 整表 dump 274.1 ms;
+      * `update_*.sql` 那一组是**这次改动之前**的实测:每条 `UPDATE` **75~90 秒**
+        (当时它不建计划,不走索引,每条语句都要全表扫,而且改完还要按新数据把唯一
+        索引重建一遍).**这一组数字没有重测**(这个 checkout 里没有 `script/`),
+        3.15 / 3.16 的验收以 `tests/ir_update.rs` 里的计数器与 `EXPLAIN` 为准--
+        它们盯的正是那三处白干(名字每行重解一次,被过滤掉的行也克隆,写无关列也把
+        索引整体作废)与访问路径(有索引的列上 `WHERE k = v` 只读命中那几行)
 ```
 
 > **测试台只数成败,不比对结果.** 所以"某条查询不报错"不等于"算对了"--
@@ -203,11 +234,14 @@ AFFAIR test {
 
 # 阶段 3 -- 性能与架构
 
-这一阶段只剩 3.4(连接重排 + 代价估算)一项**大工程**;3.7 起是另一类--
-**简单的规则式优化**:不改语义,不建代价模型,挑不出来就退回原来的做法(与
-`ir/opt` 现有的两条规则同一个口径,见 `src/ir/opt/mod.rs` 的文件头).它们多半是
-"把已经算出来的东西少算一遍""把已经知道的事实用上",量级都在一两天,彼此不阻塞.
-**先做 3.7 起的这些,3.4 留到最后.**
+这一阶段只剩 3.4(连接重排 + 代价估算)一项**大工程**(统计信息 + 代价 + 搜索),
+以及 3.10~3.14 那几条;另一类--**简单的规则式优化**(常量折叠,`COUNT(*)` 的捷径,
+子查询按模式缓存,`UPDATE` 的三处白干与访问路径,追加式写的撤销记录,即原来的
+3.7 / 3.8 / 3.9 / 3.15 / 3.16 / 3.17)--**都已经做完**,口径写在代码的 `//!` 与
+`src/ir/AGENTS.md` 的"两条规则式降级"那一段里(测试见 `tests/ir_fold.rs`,
+`tests/ir_update.rs`,`tests/ir_tx.rs` 与 `tests/ir_agg.rs` / `tests/ir_subquery.rs`).
+它们不改语义,不建代价模型,挑不出来就退回原来的做法(与 `ir/opt` 现有的两条规则
+同一个口径,见 `src/ir/opt/mod.rs` 的文件头).
 
 下面各条引用的计划都是**实测**的(`EXPLAIN` 的输出,拿
 `CREATE TABLE t(a INT, b TEXT, c INT)` 这类小表就能复现).
@@ -220,82 +254,6 @@ AFFAIR test {
 
 - **量级**:一个项目(统计信息 + 代价 + 搜索).
 - **验收**:多表连接里,重排后的计划在实测上优于 `FROM` 的书写顺序.
-
-## 3.7 [易]常量折叠与恒真 / 恒假谓词
-
-**缺在哪**:降级时把表达式**原样**编成程序,一次都不折.两条实测:
-
-```text
-EXPLAIN SELECT a FROM t WHERE a = 1 + 1;
-  Project(names=[a], exprs=[a])
-    Scan(t, filter=[a = (1 + 1)])
-
-EXPLAIN SELECT a FROM t WHERE 1 = 0;
-  Project(names=[a], exprs=[a])
-    Filter([1 = 0])
-      Scan(t, filter=[])
-```
-
-第一条每行都要再算一次 `1 + 1`;第二条是个恒假谓词,今天照样把全表拉完,逐行求值.
-
-- **要点**:降级完一个程序之后,若它**不读列,也没有子查询 / 外层引用**,就 `eval`
-  一次,把结果折成一个常量 `Step`.再往上一步:拆合取项时(`opt::pushdown` 已经有
-  `conjuncts`),恒假的项让整条 `WHERE` 变成"空结果",连 `Scan` 都不必建;恒真的项
-  直接丢掉.`index_path` 已经在用"读不读列"这个判据(`key.columns().is_empty()`),
-  这里是同一个判据往前推一步.
-- **坑(必须记)**:把整棵计划换成常量,会让那张表**从计划里消失**--而语句层的权限
-  检查正是拿 `Plan::used_columns` 问"读了哪些表 / 哪些列"的(`ir/stmt.rs` 的
-  `check_query_privileges`).所以短路要么发生在**权限检查之后**,要么让计划仍然
-  记着那张表;否则一条 `WHERE 1 = 0` 就能绕开 `SELECT` 权限.**3.8 是同一个坑.**
-- **另**:`1/0` 这类会从运行期错误变成**降级期**错误(PostgreSQL 的常量折叠同样在
-  计划期报错,口径一致),要写进文档注释,别让人以为是回归.
-- **量级**:一到两天,集中在 `irgen` 与 `opt/pushdown.rs`.
-- **验收**:`EXPLAIN` 里 `a = (1 + 1)` 变成 `a = 2`;`WHERE 1 = 0` 的计划不再拉行;
-  既有测试结果逐值不变,并加一条"权限仍然拦得住".
-
-## 3.8 [易]`COUNT(*)` 无 `WHERE` 时直接问 `nrows()`
-
-**缺在哪**:实测
-
-```text
-EXPLAIN SELECT COUNT(*) FROM t;
-  Project(names=[?column?], exprs=[count])
-    Aggregate(names=[count], group_by=[], aggs=[COUNT(*)])
-      Scan(t, filter=[])
-```
-
-为了一行答案把整张表拉一遍再数一遍.
-
-- **要点**:单张基表,没有 `WHERE`,没有 `GROUP BY`,聚合只有 `COUNT(*)` 时,
-  答案就是 `Table::nrows()`.
-- **坑**:与 3.7 同一个--权限检查靠 `used_columns`,把计划换掉就等于跳过那张表.
-  这条捷径上要显式走一次"读了这张表"的标记(或者干脆在权限检查之后再换).
-- **量级**:半天.
-- **验收**:`EXPLAIN` 里这条查询不再有 `Aggregate` 与 `Scan`;`tests/ir_agg.rs` 加
-  两条--一条对答案,一条对"权限仍然拦得住".
-
-## 3.9 [中]未相关子查询按模式缓存
-
-**缺在哪**:求值环境对**未相关**子查询一律 `drain` 成 `Vec<Row>` 再缓存
-(`ir/exec.rs` 的 `ExecState::rows_cache`),然后把行喂给 `combine_subquery`.
-而 `combine_subquery` **自己**是会短路的(`EXISTS` 见到第一行就收工,`ANY` 定胜负
-就 `break`)--但它拿到的迭代器已经把内层抽干了,短路白搭:
-
-- `WHERE EXISTS (SELECT 1 FROM big)` --只要**一行**,今天把 `big` 整张读进内存;
-- `WHERE x IN (SELECT id FROM big)` --外层**每一行**都在那个 `Vec` 上线性扫一遍,
-  O(外层行数 x 内层行数);
-- `WHERE x = (SELECT ...)` --只要两行就能判"多于一行",今天同样全抽干.
-
-- **要点**:按 `SubMode` 分三种缓存形态:`Exists` 在未相关时真值是**常量**,
-  直接缓存 `Tri`(一行都不用留);`Quantified` 的 `= ANY`(就是 `IN`)缓存**值集合**
-  (`HashSet<Value>`),逐外层行 O(1);标量最多拉两行.相关的每行重开(今天已经对)
-  不动.
-- **坑**:文档注释里那句"缓存的是**行**,不是最终标量"防的是"把 `x IN (...)` 的
-  真值缓存起来"(左半边逐行不同).本项改的是**缓存形态**,不是推翻那句:`IN` 缓存
-  值集合仍然与左半边无关,是对的.
-- **量级**:一到两天,改动集中在 `ir/exec.rs` 的 `run_subquery` 与 `ExecState`.
-- **验收**:未相关 `EXISTS` 不再抽干内层(用计数器核对:内层 `Scan` 只吐一行);
-  `IN` 的大子查询不再 O(n x m);`tests/ir_subquery.rs` 各加一条.
 
 ## 3.10 [中]`HAVING` 里只引用分组键的部分推到聚合之下
 
@@ -395,50 +353,6 @@ EXPLAIN SELECT a FROM t WHERE a IN (1,2,3);
 - **量级**:(a) 一到两天;(b) 三到五天(新索引类型 + 规划 + 测试).
 - **验收**:(a) `IN` 的 `EXPLAIN` 里出现 `index=[a]`;(b) 范围查询拉取的行数随
   选择率下降,而不是恒等于全表.
-
-## 3.15 [易]`UPDATE` 的三处白干
-
-**缺在哪**:`ir/stmt.rs` 的 `Stmt::Update` 那一支,三件事都在白干:
-
-1. `symbols.relation(table)` 在**每一行**里重新解一次名,只为拿 `row(r)`;
-2. `t.row(r)` 在 `WHERE` **之前**就把**整行克隆**一份--被过滤掉的行白克隆
-   (整行克隆 = 每个文本值各一次堆分配);
-3. `symbols.invalidate_indexes(table)` **无条件**作废这张表上的全部索引,于是下次
-   用到索引时要**整表重建**,哪怕这次 `SET` 根本没碰那个索引列.
-
-- **要点**:1 提到循环外;2 给 `Table` 加一条**借用行**的快路径(`PhysTab` 已经有
-  inherent 的 `row_ref`,把它升到 trait 上并给一个保守的默认实现),过滤在借用值上
-  做,只有命中的行才克隆;3 只作废"**写到的列**"上的索引--`update_row` 是原地替换,
-  行号不动,所以没被写入的索引列,它那份"键 → 行号"仍然**完全有效**.
-- **量级**:一到两天.
-- **验收**:几百万行,`WHERE` 只命中一行的表上,`UPDATE` 之后紧跟一次索引查找
-  **不触发整体重建**;一次全表 `UPDATE` 的结果与现在逐值相同.
-
-## 3.16 [中]`UPDATE ... WHERE` 走计划(下推与索引)
-
-**缺在哪**:`lower_update` 里是 `Scope::from_range(..., scan: None, ...)`,注释写着
-"`UPDATE` 不建计划,所以这一项既不下推也不走索引".于是 `UPDATE t SET x = 1 WHERE
-id = 5` 今天**永远全表扫**--哪怕 `id` 上有索引.
-
-- **要点**:给 `UPDATE` 的 `WHERE` 也建一个 `Scan`(复用 `opt::pushdown` 的合取项
-  拆分与 `index_path` 的挑路径),执行时按索引命中的**行号集合**去改.
-- **为什么不能"边扫边改"**:改的过程中访问路径会失效(3.15 之后是"写到的列上的
-  索引"失效),而 `SET` 完全可能改到 `WHERE` 引用的列.稳妥的做法是**先把命中的
-  行号选出来**,再逐行改,别让脚下的路径在扫的中途变动.
-- **量级**:两到三天.
-- **验收**:有索引的列上 `UPDATE ... WHERE k = v`,拉取的行数从"全表"降到"命中数"
-  (计数器);无索引时行为不变.
-
-## 3.17 [易]追加式写的撤销记录不必克隆整表
-
-**缺在哪**:事务里第一次写某张表,`snapshot_before_write` 就 `clone` **整张表**
-(`ir/symbol.rs`).而 `INSERT` 是**纯追加**:撤销只需要"把表截断回原来的 N 行".
-
-- **要点**:撤销记录加一种"**截断到 N 行**"的形态(`INSERT` 走它),表里的值一个都
-  不用复制;`UPDATE` 仍然整表克隆--真要省掉那一条,是 7.6(撤销日志 / MVCC).
-- **量级**:半天到一天.
-- **验收**:在显式事务里往一张大表 `INSERT` 一行,内存增量与表大小无关;`ROLLBACK`
-  之后逐行与写之前相同.
 
 # 阶段 5 -- 服务目录与"写完就落盘"的收尾
 
@@ -650,13 +564,13 @@ id = 5` 今天**永远全表扫**--哪怕 `id` 上有索引.
 # 阶段 8 -- 跑通 `script/` 下的基准脚本
 
 `script/` 是**另一套**基准:IMDb 四张表(共 1770672 行,四个 TSV 约 100 MB).
-`init.sql` 全量装载,`insert_*.sql` / `update_*.sql` 测写,`tests.sql` 是 72 条语句的查询基准,
+`init.sql` 全量装载,`insert_*.sql` / `update_*.sql` 测写,`tests.sql` 是 74 条语句的查询基准,
 产物交给根目录的 `summarize.py` → `stats.py` → `plot.py` 出图.
 它与 `ydbms-test/`(阶段 1)是两套数据,两套口径:那边断言**结果对不对**,
 这边只量**快不快**--所以"跑通"的口径就是"每条语句都不报错,并打出耗时".
 
 **失败点是逐条探测出来的**(拿现成的 `ysql` 跑真脚本,`\set ON_ERROR_STOP off` 之后一次收全;
-下面这一列是**补齐 8.2~8.6 与 8.9 之后**重新实测的结果):
+下面这一列是**补齐 8.2~8.6,8.9 与 8.7 之后**重新实测的结果):
 
 | 脚本 | 现状 |
 |---|---|
@@ -665,64 +579,38 @@ id = 5` 今天**永远全表扫**--哪怕 `id` 上有索引.
 | `insert_1k/5k/10k/50k.sql` | **能跑到底**(`\ir` 与末尾的多表 `ANALYZE` 都补齐了).实测:`insert_1k.sql` 装进 1000/1000/1000/512 行,`insert_5k.sql` 装进 5000/5000/5000/2670 行,退出码 0. |
 | `update_1k/5k/10k/50k.sql` | **能跑到底**,`title_crew` 那一句的 `COALESCE` 与 `||` 补齐了(实测 `update_1k.sql` 四条 UPDATE 各 1000/1000/1000/512 行). |
 | `tests.sql` | 小样本(3512 行)上 **72 条零失败**(11.1 / 11.3 / 11.4 / 14.3 都过了),退出码 0. |
-| **全量** `tests.sql` | **仍停在第 52 条**:前 51 条零失败,零内存告急,卡在 Test 10.3 的相关 `EXISTS`--3 分钟无进展.根因**不是内存**(装载只占 593 MB,见基线),而是**没有索引**(见 8.7). |
+| **全量** `tests.sql` | **74 条全部跑完,零失败**(8.7 之后重测:先前停在第 52 条 Test 10.3 的相关 `EXISTS`,3 分钟无进展;现在 10.3 是 1.01 秒,10.4 是 0.86 秒).语句耗时合计 30.7 秒. |
 | `gen_sample.py` | 与引擎无关(纯 Python 生成 SQL),不用动. |
 
 **跑法已经有了**:`ydbms-test/ydbms.sh`--与 `postgresql/postgresql.sh` 同构,
 四个阶段(init -> tests × 10 -> update × 5 -> insert × 5)与 SQL 文件都不改写,
 默认导出 `YDBMS_LANG=en`.本阶段要做的就是让它能跑到底.
 
-**剩下两条**:8.7 是全量 `tests.sql` 跑不完的那个真原因(也是 `init.sql` 之后全量跑批
-的前置),8.8 是全量验收与基线数字.
+**只剩 8.8 一条**:8.7 已经落地(`PRIMARY KEY` / 单列 `UNIQUE` 自动建索引 + 主键强制
+唯一性,口径写在 `src/ir/AGENTS.md` 与 `src/db/AGENTS.md`),全量 `tests.sql` 的 74 条
+跑得完了;8.8 是四个阶段的全量跑批与基线数字.
 `script/old/` 里那几份(`filmdb.sql` / `tests.sql` / `tests.yql`)是另一条线,
 归阶段 1 与 1.7,不在这里重复.
 
-## 8.7 [中] 主键 / UNIQUE 要自动建唯一索引(全量停在第 52 条的真原因)
-
-**缺在哪**:`schema.sql` 只写 `PRIMARY KEY`,一条 `CREATE INDEX` 都没有--它的注释还写着
-"只建主键,不额外建索引,索引留给查询实验",这句在 PostgreSQL 那边**是成立的**
-(主键本身就是索引),在 ydbms 这边却是"什么都没建":`PRIMARY KEY` / `UNIQUE` 归到
-"**接受但如实记进 `unenforced`**"(`src/ir/AGENTS.md`),而 `create_index` 只在
-`CREATE INDEX` 那条语句里被调用(`src/ir/stmt.rs`).于是主键上**没有任何访问路径**.
-全量实测(1770672 行)的后果:
-
-- **整个 Test 2(主键访问)退化成全表扫**:取一行 118.6 ms,取十行(`IN` 列表)359.6 ms,
-  取 101 行的区间 181.3 ms--而 Test 1.1 把 499999 行整表 dump 出来才 417.0 ms,
-  两者同量级.参考:PostgreSQL 上这几条是 0.0x ms.
-- **Test 10.3 跑不完**,而它是全量 `tests.sql` 卡住的**唯一**地方(前 51 条零失败):
-  `WHERE EXISTS (SELECT 1 FROM title_crew c WHERE c.tconst = b.tconst ...)`
-  外层 50 万行,内层没有索引可走,只能一行一行重扫.3 分钟无进展.同构的 Test 10.4
-  (`NOT EXISTS` 对着 title_ratings)紧随其后,一样过不去.
-- **要点**:`CREATE TABLE` 见到 `PRIMARY KEY` / `UNIQUE` 时顺手把索引建进目录
-  (机制现成:`CREATE INDEX` 那条路 + `IndexPath` 挑路径).两件事**要先定**:
-  一是**唯一性要不要跟着真强制**--今天 PK/UNIQUE 明确不强制,建了索引之后"唯一"就变成
-  事实上的半强制,要么借这次一起强制(报重复键),要么索引**只当访问路径**,
-  重复键仍然放行,口径必须写进 `src/ir/AGENTS.md`;
-  二是**索引的名字与生命周期**:隐含索引叫什么,`DROP INDEX` 能不能单独删掉它
-  (PostgreSQL 不允许),`DROP TABLE` / `DROP SCHEMA ... CASCADE` / 事务回滚时怎么跟着走
-  (索引已经在目录里,这几条路本来就该覆盖).
-- **不做解相关也可以**:有了主键索引,Test 10.3 变成 50 万次索引探测(基线里索引嵌套循环
-  N=2000 是 4.3 ms 量级),够用了.**把相关子查询展平成半连接是另一件事**
-  (3.9 那条线管的是**未相关**子查询的缓存形态),不在本项.
-- **量级**:一到两天(索引跟着 PK 建 + 名字与生命周期口径 + 两条相关子查询的验收).
-- **验收**:全量下 Test 2 从"全表扫的百毫秒"降到索引探测量级;Test 10.3 / 10.4 在
-  499999 行上**跑得完**;`tests/ir_index.rs` 加一条"`CREATE TABLE ... PRIMARY KEY` 之后
-  那条谓词走索引";`DROP TABLE` / `DROP SCHEMA` 之后不留悬挂索引.
-
 ## 8.8 [中] 全量跑到底:数字记进基线
 
-**缺在哪**:8.1 与 8.2~8.6 / 8.9 都已经补齐(`init.sql` 能把全量数据装进去),
-`ydbms-test/ydbms.sh` 的四个阶段**只差 8.7** 那道坎:全量 `tests.sql` 停在第 52 条.
+**缺在哪**:8.1,8.2~8.6,8.7 与 8.9 都已补齐:全量 `tests.sql` 的 74 条跑得完
+(语句耗时合计 30.7 秒,见基线).剩下的是**把四个阶段整套跑完并记数**--而卡住它的
+是 `update_*.sql`:每条 `UPDATE` 75~90 秒(全表扫,`UPDATE` 不建计划,见 3.16),
+四个规模一整套跑下来是几十分钟到一小时.
 
 - **要点**:按 `ydbms-test/ydbms.sh` 的默认参数跑一遍(init -> tests × 10 -> update × 5 ->
-  insert × 5),记录:每张表的装载耗时与全程峰值 RSS,72 条查询的耗时,四个规模的
+  insert × 5),记录:每张表的装载耗时与全程峰值 RSS,74 条查询的耗时,四个规模的
   insert / update 耗时.结果写进本文档顶部的"当前基线".
+  **查询那一半已经量了**(`TEST_REPEAT=1`:74 条零失败 / 语句合计 30.7 秒;`init.sql`
+  13.5 秒 / 约 593 MB),还差的是 `× 10` 的重复与 update / insert 两组--后两组眼下
+  受制于 3.16,先跑一两个样本就够把基线填上.
   **内存这一项已经不用焦虑**:实测全量四张表载入常驻 **593 MB**,1.71 秒,
   在 `ulimit -v 4G` 下跑完 51 条语句毫无压力--所以本项**不是**阶段 7 的前置,
   阶段 7 要解决的是"库比内存大",不是"这个库".
 - **量级**:一到两天的跑批与记录(不加功能).
 - **验收**:`init.sql` 末尾的四条自检行数是 499999 / 499999 / 499999 / 270675;
-  `tests.sql` 72 条零失败;三个 `*_timing.txt` 都能喂进 `summarize.py`(查询基准那份与
+  `tests.sql` 74 条零失败;三个 `*_timing.txt` 都能喂进 `summarize.py`(查询基准那份与
   写基准那两份**都已经能喂**--写基准靠 8.9 补的命令标签);本文档顶部的"当前基线"
   里多出这一组数字.
 

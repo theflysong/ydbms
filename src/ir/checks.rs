@@ -118,6 +118,11 @@ impl Table for CheckedTable {
         self.inner.row(r)
     }
 
+    /// 借用式的行读取照原样转发:装饰器不改变行本身.
+    fn row_ref(&self, r: usize) -> Option<&[Value]> {
+        self.inner.row_ref(r)
+    }
+
     fn value(&self, r: usize, c: usize) -> Option<Value> {
         self.inner.value(r, c)
     }
@@ -155,5 +160,11 @@ impl Table for CheckedTable {
 
     fn delete(&mut self, r: usize) -> Result<()> {
         self.inner.delete(r)
+    }
+
+    /// 截断**不经过** `check`:被丢掉的是**表尾那几行**,留下来的前缀一行都没变
+    /// (追加式的撤销记录要的就是这件事,见 [`Table::truncate_to`]).
+    fn truncate_to(&mut self, n: usize) -> Result<()> {
+        self.inner.truncate_to(n)
     }
 }

@@ -14,14 +14,16 @@
 //! [`Table::row`] 的签名是 `fn row(&self, r: usize) -> Option<Row>`,返回**拥有
 //! 所有权**的行,而不是 `Option<&[Value]>`.这是为了让"连接表"这类**虚表**
 //! 也能实现本 trait:连接的结果是查询时才计算出来的,没有一块现成的内存可以
-//! 借用.物理表另有一套 inherent 的借用快路径(
-//! [`PhysTab::row_ref`](crate::db::phys::PhysTab::row_ref) /
-//! [`PhysTab::cell_ref`](crate::db::phys::PhysTab::cell_ref))用来避免拷贝.
+//! 借用.物理表另有一套借用快路径([`Table::row_ref`] /
+//! [`PhysTab::cell_ref`](crate::db::phys::PhysTab::cell_ref))用来避免拷贝:
+//! `row_ref` 是**可选**的(默认给 `None`),调用方见到 `None` 就退回 `row`.
 //!
 //! # 为什么变更操作有默认实现
 //!
-//! [`Table::insert`] / [`Table::update`] / [`Table::delete`] 的默认实现一律返回
-//! [`DbError::ReadOnly`].物理表会覆盖它们;而连接表之类的只读表什么都不用写,
+//! [`Table::insert`] / [`Table::update`] / [`Table::delete`] /
+//! [`Table::truncate_to`] 的默认实现一律返回
+//! [`DbError::ReadOnly`](`truncate_to` 是"从尾部逐行 `delete`",只读表在那一层
+//! 自然拒绝).物理表会覆盖它们;而连接表之类的只读表什么都不用写,
 //! 默认就是只读的.
 //!
 //! # 随机访问 vs. 顺序拉取
@@ -1009,6 +1011,62 @@ pub struct Column {
     /// 老模式文件里没有这个键,`#[serde(default)]` 会读成 `None`.
     #[serde(default)]
     pub default: Option<String>,
+    /// 这一列的唯一性标记(`PRIMARY KEY` / `UNIQUE`,TODO 8.7).
+    ///
+    /// **要落盘的原因只有一个**:索引是会话级的目录对象,而"这一列上本该有一条
+    /// 访问路径,强不强唯一性"是**表的事实**.打开库时
+    /// [`crate::ir::SymbolTable::rebuild_indexes`] 按它把索引重建回来,否则
+    /// `ysql` 一重启,主键又变回全表扫.
+    ///
+    /// **强制点不在这里**:`Table::validate` 只管 typmod 与 `NOT NULL`;主键的唯一性
+    /// 由语句层在写路径上判(见 `src/ir/stmt.rs` 的 `IndexKeys`),因为判据要与索引
+    /// (`IndexSlot::unique`)对齐,而这一层不认识索引目录.
+    ///
+    /// 老模式文件里没有这个键,`#[serde(default)]` 会读成
+    /// [`Unique::None`];写盘时那个"无"**不写出来**(旧文件的字节因此原样不变).
+    #[serde(default, skip_serializing_if = "Unique::is_none")]
+    pub unique: Unique,
+}
+
+/// 一列的 `PRIMARY KEY` / `UNIQUE` 标记.
+///
+/// 三态而不是一个 `bool`,因为两者**有意不同**(口径见 `src/ir/AGENTS.md`):
+/// 主键唯一性**真强制**,`UNIQUE` 只建索引,重复键照旧放行.
+///
+/// 单列主键才到这里:多列的 `PRIMARY KEY (a, b)` 本版索引表达不了,仍然只是
+/// "接受并记录"(不强制,也不建索引).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Unique {
+    /// 没写(默认).
+    #[default]
+    None,
+    /// **单列** `PRIMARY KEY`:建索引,并且**强制**唯一性.
+    Key,
+    /// 列级 / 单列表级 `UNIQUE`:只建索引,**不**强制唯一性.
+    Unique,
+}
+
+impl Unique {
+    /// 这个标记不需要写进模式文件吗(见 [`Unique::None`]).
+    pub fn is_none(&self) -> bool {
+        *self == Unique::None
+    }
+
+    /// 这一列的索引强不强制唯一性(只有主键那份强制).
+    pub fn enforced(&self) -> bool {
+        *self == Unique::Key
+    }
+}
+
+impl fmt::Display for Unique {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unique::None => Ok(()),
+            Unique::Key => f.write_str(" PRIMARY KEY"),
+            Unique::Unique => f.write_str(" UNIQUE"),
+        }
+    }
 }
 
 impl Column {
@@ -1019,6 +1077,7 @@ impl Column {
             ty,
             not_null: false,
             default: None,
+            unique: Unique::None,
         }
     }
 
@@ -1029,12 +1088,19 @@ impl Column {
             ty,
             not_null: true,
             default: None,
+            unique: Unique::None,
         }
     }
 
     /// 带 `DEFAULT` 的列(参数必须是 **CSV 字段形式**,见 [`Column::default`]).
     pub fn with_default(mut self, default: impl Into<String>) -> Self {
         self.default = Some(default.into());
+        self
+    }
+
+    /// 标上"这一列来自 `PRIMARY KEY` / 单列 `UNIQUE`"(见 [`Column::unique`]).
+    pub fn with_unique(mut self, unique: Unique) -> Self {
+        self.unique = unique;
         self
     }
 
@@ -1063,6 +1129,9 @@ impl fmt::Display for Column {
         if let Some(default) = &self.default {
             write!(f, " DEFAULT {}", default)?;
         }
+        // `unique` 只是一个标记(索引是目录对象),但它是**用户写在建表语句里的
+        // 那个约束**的唯一残留,所以呈现出来.
+        write!(f, "{}", self.unique)?;
         Ok(())
     }
 }
@@ -1261,6 +1330,19 @@ pub enum DbError {
         /// 约束名(没写名字时是约束原文).
         constraint: String,
     },
+    /// 一个候选行违反了一条**唯一索引**(`PRIMARY KEY`,TODO 8.7).
+    ///
+    /// 与 [`CheckViolation`](DbError::CheckViolation) 同一个位置报出来:都在写路径
+    /// 上,都在行落库之前/维护索引那一步.**只有唯一索引才报它**--`UNIQUE` 列上
+    /// 的索引不强制唯一性,重复键照样放行(口径见 `src/ir/AGENTS.md`).
+    DuplicateKey {
+        /// 索引名(生效名,例如 `imdb.title_basics_pkey`).
+        index: String,
+        /// 哪一列上撞了(列名).
+        column: String,
+        /// 撞上的那个键(呈现用的文本).
+        value: String,
+    },
     /// 一个值无法被解释成目标类型,或超出了该类型的 typmod 限制.
     ///
     /// 覆盖:`VARCHAR(3)` 插 4 个字符,`NUMERIC(4,2)` 插 `1234.56`,
@@ -1367,6 +1449,11 @@ impl fmt::Display for DbError {
                 "new row for table `{}` violates check constraint `{}`",
                 table, constraint
             ),
+            DbError::DuplicateKey {
+                index,
+                column,
+                value,
+            } => write!(f, "{}", tr!("db.index.005", arg0 = index, arg1 = column, arg2 = value)),
             DbError::BadValue {
                 column,
                 ty,
@@ -1431,6 +1518,20 @@ pub trait Table: TabShape {
     /// 取出第 `r` 行的副本;越界返回 `None`.
     fn row(&self, r: usize) -> Option<Row>;
 
+    /// **借用**第 `r` 行,不发生拷贝;没有可借用的存储就返回 `None`(TODO 3.15).
+    ///
+    /// 这是一条**可选**的快路径,不是契约:虚表(连接结果之类)的行是算出来的,
+    /// 没有一块现成的内存可以借,默认就返回 `None` -- 调用方见到 `None` 要退回
+    /// [`row`](Table::row).物理表 `PhysTab` 覆盖成它现成的 inherent `row_ref`.
+    ///
+    /// 为什么值得升到 trait 上:`UPDATE` 的 `WHERE` 要为**每一行**算一次谓词,而
+    /// 老写法在谓词**之前**就 `row(r)` 克隆整行--被过滤掉的行白克隆(整行克隆
+    /// = 每个文本值各一次堆分配).有这条快路径之后,只有命中的行才克隆.
+    fn row_ref(&self, r: usize) -> Option<&[Value]> {
+        // 保守默认:没有可借用的存储,调用方走 `row`.
+        let _ = r;
+        None
+    }
     /// 取出第 `r` 行第 `c` 列的值;越界返回 `None`.
     fn value(&self, r: usize, c: usize) -> Option<Value> {
         self.row(r)?.into_iter().nth(c)
@@ -1521,6 +1622,23 @@ pub trait Table: TabShape {
         Err(DbError::ReadOnly {
             table: self.name().to_string(),
         })
+    }
+
+    /// 把表**截断到前 `n` 行**;`n` 不小于现在的行数就什么都不做.
+    ///
+    /// 只有**追加式写的撤销记录**用它(TODO 3.17):`INSERT` / `COPY` 只往表尾追加,
+    /// 所以事务回滚只需要"把表截回原来的 N 行",一个值都不用复制.`UPDATE` 是原地
+    /// 改写,它那条撤销记录仍然是一份整表克隆([`Table::snapshot`]).
+    ///
+    /// 默认实现是"从尾部逐行 [`delete`](Table::delete)":对覆盖了 `delete` 的表都
+    /// 成立,物理表(与装饰它的 `CheckedTable`)覆盖成一次做完.只读表在 `delete`
+    /// 那一层自然拒绝 -- 而只读表也**写不进去**,本来就不会有追加式的撤销记录.
+    fn truncate_to(&mut self, n: usize) -> Result<()> {
+        while self.nrows() > n {
+            let last = self.nrows() - 1;
+            self.delete(last)?;
+        }
+        Ok(())
     }
 
     /// 深拷贝一份完整的自己 -- 事务回滚用的**整表快照**(见

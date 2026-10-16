@@ -41,21 +41,45 @@
 - **`ir` 那一层**:`CHECK`(`ir/checks.rs` 的 `CheckedTable` 装饰器)与 `DEFAULT`
   (`ir/irgen.rs` 在 INSERT 缺列时补).它们要 `Prog`,而 `db` 不认识 IR.
 
-### 整表快照(`Table::snapshot`)
+### 撤销记录:`Table::snapshot` 与 `Table::truncate_to`
 
-事务回滚要一份"改之前的表",所以 trait 上有一个 `snapshot()`:**物理表与带 `CHECK`
-的表都覆盖成 `clone`**,其余实现走默认(按形状与逐行 `row` 物化).
+事务回滚要一份"改之前的表",所以 trait 上有两条口子(TODO 3.17):
 
-- **默认实现会把装饰丢掉**:`CheckedTable` 若走默认,回滚之后那张表就不再强制
-  `CHECK` 了--**新的装饰器实现必须覆盖 `snapshot`**;
-- 默认实现存在的唯一理由是让只读的虚表(测试里的计数表之类)不用为它做任何事.
+- `snapshot()` -- **整表克隆**,给"原地改写"的语句(`UPDATE`)与删表的路径用.
+  物理表与带 `CHECK` 的表都覆盖成 `clone`,其余实现走默认(按形状与逐行 `row`
+  物化).**默认实现会把装饰丢掉**:`CheckedTable` 若走默认,回滚之后那张表就不再
+  强制 `CHECK` 了--**新的装饰器实现必须覆盖 `snapshot`**;
+- `truncate_to(n)` -- **截断到前 n 行**,给"纯追加"的语句(`INSERT` / `COPY`)用:
+  追加式写的撤销记录只需要"回到原来的行数",表里的值**一个都不用复制**.默认实现
+  是"从尾部逐行 `delete`",物理表与 `CheckedTable` 覆盖成一次做完.
+
+默认实现存在的唯一理由是让只读的虚表(测试里的计数表之类)不用为它们做任何事;
+**能 `insert` 的表也该覆盖 `truncate_to`**,否则回滚追加时只能报错(`ir.symbol.004`).
+
+### 借用行(`Table::row_ref`)
+
+`row(r)` 返回 owned 的 `Row`;想免掉这次拷贝的实现可以覆盖 `row_ref(r) ->
+Option<&[Value]>`(默认给 `None` = "没有可借用的存储").**调用方见到 `None` 必须
+退回 `row`**.现在只有一处用它:`UPDATE` 的 `WHERE`(TODO 3.15)--
+谓词在借来的值上逐行求值,只有命中的行才克隆整行.
 
 ### 索引(`IndexSlot`)
 
 索引是**会话级的目录对象**(名字在 `ir/symbol.rs`):`CREATE INDEX` 建一份,
-`INSERT` 追加,`UPDATE` 作废,下次用到时重建.三条要注意:`RefCell` 是**必需**的
+`INSERT` 追加,`UPDATE` 只作废**写到的那些列**上的那一份(TODO 3.15:
+`update_row` 是原地替换,行号不动,别的列那份"键 → 行号"仍然有效),下次用到时重建.
+四条要注意:`RefCell` 是**必需**的
 (目录是 `&` 借出去的,而失效/重建/追加都要改它);`IndexSource` 仍然是**惰性**的
-(第一次 `next()` 才建,`LIMIT 0` 之下连索引都不建);索引攒的是**行号**而不是行.
+(第一次 `next()` 才建,`LIMIT 0` 之下连索引都不建);索引攒的是**行号**而不是行;
+`unique` 的槽位(`PRIMARY KEY` / `CREATE UNIQUE INDEX` 那一份)**真的强制唯一性**
+--强制点不在这一层,而在语句层那个"这一句见过哪些键"的台账(`ir/stmt.rs` 的
+`IndexKeys`),读索引的键用 [`IndexSlot::keys`](index.rs),所以索引失效着也不会漏掉
+强制(TODO 8.7).
+
+`Column::unique`(`ir/db::table::Unique`)是这条链的**落盘那一半**:索引不落盘,而
+"这一列上本该有一条索引,强不强唯一性"是表的事实,跟着模式文件走.打开库时
+`SymbolTable::rebuild_indexes` 按它把索引重建回来.字段是 `#[serde(default)]` 的,
+`Unique::None` 还 `skip_serializing_if`,所以旧模式文件一个字节都不用改.
 
 ### 不变式
 

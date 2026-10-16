@@ -10,7 +10,10 @@
 //!
 //! 结果都对照过 **PostgreSQL 18.6**(`tests/script/db1/query4.sql` 那六条也逐值比过).
 
-use ydbms::db::table::{Table, Value};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use ydbms::db::table::{Column, ColumnsShape, DataType, TabShape, Table, Value};
 use ydbms::db::PhysTab;
 use ydbms::ir::{compile, execute, run_script, SymbolTable};
 
@@ -544,4 +547,228 @@ fn analyze_rejects_a_subquery_whose_outer_chain_is_wrong() {
 
     let err = plan.analyze(&symbols).expect_err("外层链对不上,应当报非法");
     assert!(err.to_string().contains("外层"), "{err}");
+}
+
+// -------------------------------------- 未相关子查询按模式缓存(TODO 3.9)
+
+/// 一张会数数的表:每次 `row()`(整行读)记一笔.
+struct CountingTable {
+    name: String,
+    shape: ColumnsShape,
+    rows: Vec<Vec<Value>>,
+    reads: Rc<Cell<usize>>,
+}
+
+impl CountingTable {
+    fn new(name: &str, column: &str, values: Vec<Value>, reads: &Rc<Cell<usize>>) -> Self {
+        CountingTable {
+            name: name.to_string(),
+            shape: ColumnsShape::new(vec![Column::new(column, DataType::Int)]),
+            rows: values.into_iter().map(|value| vec![value]).collect(),
+            reads: Rc::clone(reads),
+        }
+    }
+}
+
+impl TabShape for CountingTable {
+    fn columns(&self) -> &[Column] {
+        self.shape.columns()
+    }
+}
+
+impl Table for CountingTable {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn nrows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row(&self, r: usize) -> Option<Vec<Value>> {
+        self.reads.set(self.reads.get() + 1);
+        self.rows.get(r).cloned()
+    }
+
+    fn value(&self, r: usize, c: usize) -> Option<Value> {
+        self.rows.get(r).and_then(|row| row.get(c)).cloned()
+    }
+}
+
+/// 内侧 100 行的库,外加它的读数计数器.
+///
+/// ```text
+/// t: x = 1, 2, 3      外层三行
+/// u: y = 0 .. 99      内层,足够大:"老写法会把整张表读进来"看得见
+/// ```
+fn counting() -> (SymbolTable, Rc<Cell<usize>>) {
+    let reads = Rc::new(Cell::new(0));
+    let mut symbols = SymbolTable::new();
+    let outer: Vec<Value> = (1..=3).map(Value::Int).collect();
+    symbols
+        .define("t", CountingTable::new("t", "x", outer, &Rc::new(Cell::new(0))))
+        .expect("建 t");
+    let inner: Vec<Value> = (0..100).map(Value::Int).collect();
+    symbols
+        .define("u", CountingTable::new("u", "y", inner, &reads))
+        .expect("建 u");
+    (symbols, reads)
+}
+
+#[test]
+fn an_uncorrelated_exists_stops_at_the_first_inner_row() {
+    let (symbols, reads) = counting();
+
+    // 内层 100 行,`EXISTS` 只要知道"有没有一行"
+    let out = q(
+        &symbols,
+        "SELECT x FROM t WHERE EXISTS (SELECT y FROM u) ORDER BY x",
+    );
+    assert_eq!(out.nrows(), 3, "三行都满足");
+    assert_eq!(reads.get(), 1, "内层只该被读一行");
+}
+
+#[test]
+fn an_uncorrelated_scalar_stops_at_the_second_inner_row() {
+    let (symbols, reads) = counting();
+
+    // 标量子查询最多要两行:第一行是答案,第二行就是"多于一行"的错
+    let plan = compile("SELECT (SELECT y FROM u) AS v", &symbols).expect("降级");
+    let err = execute(&plan, &symbols).expect_err("多于一行,应当报错");
+    let message = err.to_string();
+    assert!(message.contains("标量子查询"), "{message}");
+    assert_eq!(reads.get(), 2, "第二行就该收手,不必把 100 行读完");
+}
+
+#[test]
+fn an_uncorrelated_scalar_reads_on_to_rule_out_a_second_row() {
+    let (symbols, reads) = counting();
+
+    let out = q(&symbols, "SELECT (SELECT y FROM u WHERE y = 7) AS v");
+    assert_eq!(out.nrows(), 1);
+    assert_eq!(out.value(0, 0), Some(Value::Int(7)));
+
+    // "多于一行"只能靠**拉到结尾**排除(命中那一行在第 8 个),所以这里读满 100:
+    // 标量那条捷径省掉的是"两行就判错"那一半,不是"确认只有一行"这一半.
+    assert_eq!(reads.get(), 100, "要确认没有第二行,只能拉到结尾");
+}
+
+#[test]
+fn in_matches_across_int_and_numeric() {
+    // `x IN (SELECT n)`:左半边是 INT,内层是 NUMERIC -- 运行时的比较会把 INT
+    // 放大成 NUMERIC,集合查找也得跟着认这两个是**同一个键**(不然会安静地漏行)
+    let mut symbols = SymbolTable::new();
+    symbols
+        .define("t", ints("t", "x", &[Value::Int(1), Value::Int(2), Value::Int(3)]))
+        .expect("建 t");
+    symbols
+        .define(
+            "n",
+            numerics("n", "v", &["1.0", "3"]),
+        )
+        .expect("建 n");
+
+    assert_eq!(
+        names(&symbols, "SELECT x FROM t WHERE x IN (SELECT v FROM n) ORDER BY x"),
+        vec!["1", "3"]
+    );
+    assert_eq!(
+        names(&symbols, "SELECT x FROM t WHERE x NOT IN (SELECT v FROM n) ORDER BY x"),
+        vec!["2"]
+    );
+
+    // 反向:左半边是 NUMERIC,内层是 INT
+    let mut symbols = SymbolTable::new();
+    symbols
+        .define(
+            "t",
+            numerics("t", "p", &["1", "2.5", "4"]),
+        )
+        .expect("建 t");
+    symbols
+        .define("i", ints("i", "q", &[Value::Int(1), Value::Int(4)]))
+        .expect("建 i");
+
+    assert_eq!(
+        names(&symbols, "SELECT p FROM t WHERE p IN (SELECT q FROM i) ORDER BY p"),
+        vec!["1", "4"]
+    );
+    assert_eq!(
+        names(&symbols, "SELECT p FROM t WHERE p NOT IN (SELECT q FROM i) ORDER BY p"),
+        vec!["2.5"]
+    );
+}
+
+#[test]
+fn in_over_a_set_with_a_null_is_unknown_not_false() {
+    // 内层集合是 {1, NULL, 3}
+    let mut symbols = SymbolTable::new();
+    symbols
+        .define(
+            "t",
+            ints("t", "k", &[Value::Int(1), Value::Int(2), Value::Int(3)]),
+        )
+        .expect("建 t");
+    symbols
+        .define(
+            "u",
+            ints("u", "v", &[Value::Int(1), Value::Null, Value::Int(3)]),
+        )
+        .expect("建 u");
+
+    // 命中就是 TRUE(有 NULL 也不影响)
+    assert_eq!(
+        names(&symbols, "SELECT k FROM t WHERE k IN (SELECT v FROM u) ORDER BY k"),
+        vec!["1", "3"]
+    );
+    // 没命中,可是集合里有 NULL -> UNKNOWN -> 一行都不留(`NOT IN` 同理)
+    assert_eq!(
+        names(&symbols, "SELECT k FROM t WHERE k NOT IN (SELECT v FROM u)"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn in_over_an_empty_set_is_false() {
+    let mut symbols = SymbolTable::new();
+    symbols
+        .define("t", ints("t", "k", &[Value::Int(1), Value::Int(2)]))
+        .expect("建 t");
+    symbols
+        .define("u", ints("u", "v", &[Value::Int(9)]))
+        .expect("建 u");
+
+    // 空集:`ANY` 是 FALSE(SQL 标准),于是 `NOT IN` 是**全部**--与"有 NULL"不同
+    assert_eq!(
+        names(&symbols, "SELECT k FROM t WHERE k IN (SELECT v FROM u WHERE v > 100)"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names(
+            &symbols,
+            "SELECT k FROM t WHERE k NOT IN (SELECT v FROM u WHERE v > 100) ORDER BY k"
+        ),
+        vec!["1", "2"]
+    );
+}
+
+/// 一张单列 `INT` 的物理表(测试里搭小样本用).
+fn ints(name: &str, column: &str, values: &[Value]) -> PhysTab {
+    let shape = ColumnsShape::new(vec![Column::new(column, DataType::Int)]);
+    let mut tab = PhysTab::new(name, &shape);
+    for value in values {
+        tab.insert(vec![value.clone()]).expect("插入");
+    }
+    tab
+}
+
+/// 一张单列 `NUMERIC` 的物理表.
+fn numerics(name: &str, column: &str, values: &[&str]) -> PhysTab {
+    let shape = ColumnsShape::new(vec![Column::new(column, DataType::NumericAny)]);
+    let mut tab = PhysTab::new(name, &shape);
+    for value in values {
+        tab.insert(vec![Value::numeric(value).expect("NUMERIC")])
+            .expect("插入");
+    }
+    tab
 }

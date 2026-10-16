@@ -353,6 +353,35 @@ fn a_query_that_reads_no_column_still_needs_a_privilege_on_the_table() {
     assert_eq!(alice.failed(), 0, "{}", alice.messages());
 }
 
+#[test]
+fn a_constant_false_where_clause_still_asks_for_the_table() {
+    // `WHERE 1 = 0` 在降级期就折成一个恒不成立的常量谓词(TODO 3.7),一行都不拉;
+    // 但**那张表仍旧留在计划里**,所以权限检查照问不误--把计划换成"空结果"
+    // 就等于一条 `WHERE 1 = 0` 绕开了 `SELECT` 权限.
+    let s = scene("constant-false");
+    {
+        let mut owner = open(&s.service, "filmdb", &s.owner);
+        owner.run_script("GRANT CONNECT ON DATABASE filmdb TO alice;");
+        assert_eq!(owner.failed(), 0, "{}", owner.messages());
+    }
+
+    // 一点表权限都没有:拦得住
+    let mut alice = open(&s.service, "filmdb", &s.alice);
+    alice.run_script("SELECT title FROM movies WHERE 1 = 0;");
+    assert_eq!(alice.failed(), 1, "{}", alice.messages());
+    drop(alice);
+
+    // 授了它真正读到的那一列就过得去
+    {
+        let mut owner = open(&s.service, "filmdb", &s.owner);
+        owner.run_script("GRANT SELECT (title) ON movies TO alice;");
+        assert_eq!(owner.failed(), 0, "{}", owner.messages());
+    }
+    let mut alice = open(&s.service, "filmdb", &s.alice);
+    alice.run_script("SELECT title FROM movies WHERE 1 = 0;");
+    assert_eq!(alice.failed(), 0, "{}", alice.messages());
+}
+
 // -------------------------------------------------- 授权表的寿命与"谁有资格"
 
 #[test]

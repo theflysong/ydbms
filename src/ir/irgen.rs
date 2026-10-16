@@ -74,7 +74,7 @@ use pg_query::protobuf::{
 };
 
 use crate::db::table::{
-    Column, DataType, DbError, Result, TypeFamily, Value,
+    Column, DataType, DbError, Result, TypeFamily, Unique, Value,
     DEFAULT_TIMESTAMP_PRECISION,
     MAX_TIMESTAMP_PRECISION,
 };
@@ -83,7 +83,7 @@ use crate::usr::{Password, PasswordAction, RoleAttrChange, RoleAttrs};
 
 use super::checks::Check;
 use super::expr::{
-    unified_branch_type, BinOp, Prog, ProgBuilder, Reg, ScalarFunc, SubMode, SubPlan, UnOp,
+    unified_branch_type, BinOp, Prog, ProgBuilder, Reg, ScalarFunc, Step, SubMode, SubPlan, UnOp,
 };
 use super::value::ScalarType;
 use super::opt;
@@ -1079,18 +1079,21 @@ fn collect_role_specs(node: &Node, out: &mut Vec<String>) -> Result<()> {
 
 // ------------------------------------------------------------- CREATE INDEX
 
-/// `CREATE [IF NOT EXISTS] INDEX name ON table (col)` 的降级.
+/// `CREATE [UNIQUE] INDEX name ON table (col)` 的降级.
 ///
-/// 只认**裸列**,单列,非唯一:本版的索引是"键 → 行号"的哈希表(见
-/// [`crate::db::index`]),唯一性它不强制;表达式键与多列键表达不了,于是显式
-/// 拒绝--宁可拒绝,也不要给一个安静的错答案.
+/// 只认**裸列**,单列:本版的索引是"键 → 行号"的哈希表(见
+/// [`crate::db::index`]),表达式键与多列键表达不了,于是显式拒绝--宁可拒绝,
+/// 也不要给一个安静的错答案.
+///
+/// `UNIQUE` **认下来了**(TODO 8.7):`CREATE UNIQUE INDEX` 建出来的那一份**真的
+/// 强制唯一性**(与主键那份同价).其余选项仍然一律拒绝.
 ///
 /// 真正建索引的动作在 [`crate::ir::SymbolTable::create_index`] 里(那里才有表).
 fn lower_create_index(index: &IndexStmt, symbols: &SymbolTable) -> Result<Stmt> {
-    if index.unique || index.primary {
-        return Err(unsupported(
-            tr!("ir.irgen.035").into_owned(),
-        ));
+    // `index.primary` 只可能是 `ALTER TABLE ... ADD PRIMARY KEY` 那种路径来的,
+    // 单条 `CREATE INDEX` 里永远是 false;留着这一条是为了不让它悄悄过去.
+    if index.primary {
+        return Err(unsupported(tr!("ir.irgen.035").into_owned()));
     }
     if index.concurrent {
         return Err(unsupported("CREATE INDEX CONCURRENTLY"));
@@ -1149,6 +1152,7 @@ fn lower_create_index(index: &IndexStmt, symbols: &SymbolTable) -> Result<Stmt> 
         name: index.idxname.clone(),
         table,
         column: at,
+        unique: index.unique,
         if_not_exists: index.if_not_exists,
     })
 }
@@ -1162,9 +1166,13 @@ fn lower_create_index(index: &IndexStmt, symbols: &SymbolTable) -> Result<Stmt> 
 /// * **真强制**:列级 `NOT NULL`(进 [`Column::not_null`]),`DEFAULT`(进
 ///   [`Column::default`],缺列时补),`CHECK`(降级成 [`Prog`] 挂到表的
 ///   `CheckedTable` 上,写行时求值);
+/// * **建索引**(TODO 8.7):**单列** `PRIMARY KEY` / `UNIQUE` 在列上留下
+///   [`Column::unique`],执行时顺手建一条索引--主键那份还**真的强制唯一性**,
+///   `UNIQUE` 那份只当访问路径(口径见 `src/ir/AGENTS.md`);
 /// * **接受但如实记录**(进 `unenforced`,建表消息里列出来):`PRIMARY KEY`,
-///   `UNIQUE`,`FOREIGN KEY ... REFERENCES ...`--本版不做唯一性与引用检查,
-///   也不做 `ON DELETE` / `ON UPDATE` 的动作(没有 `DELETE`,动作没有语义);
+///   `UNIQUE`,`FOREIGN KEY ... REFERENCES ...`--**多列**的那两种不建索引,
+///   不强制,外键不做引用检查,也不做 `ON DELETE` / `ON UPDATE` 的动作
+///   (没有 `DELETE`,动作没有语义);
 /// * **拒绝**(有行为语义或会静默违规的):`DEFERRABLE` / `INITIALLY DEFERRED` /
 ///   `NOT VALID`,`IDENTITY`,`GENERATED`,`COLLATE`,`EXCLUDE`.
 ///
@@ -1213,6 +1221,9 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
     // `(表达式, 约束名, 合成名)`:**所有列都收齐之后**才降级,因为 CHECK 面对的是
     // 整张表的扁平 schema(列级 CHECK 也一样能引用别的列)
     let mut checks: Vec<(&Node, Option<String>, String)> = Vec::new();
+    // 表级约束里认出来的**单列唯一性标记**:`(列名, 是主键还是 UNIQUE)`.
+    // 列定义可能在这条约束**后面**(实测两种顺序都有),所以标在收齐所有列之后.
+    let mut unique_keys: Vec<(String, Unique)> = Vec::new();
 
     let mut elts: Vec<&Node> = create.table_elts.iter().collect();
     elts.extend(create.constraints.iter());
@@ -1241,6 +1252,8 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
 
                 let mut not_null = false;
                 let mut default: Option<String> = None;
+                // 列级 `PRIMARY KEY` / `UNIQUE`:这一列的标记(TODO 8.7)
+                let mut unique = Unique::None;
                 for constraint in &def.constraints {
                     let c = column_constraint(constraint)?;
                     reject_constraint_attributes(c)?;
@@ -1263,11 +1276,17 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                             checks.push((expr, conname(c), synth));
                         }
 
-                        // 接受,但本版不做唯一性检查,必须让它看得见.
+                        // 列级 `PRIMARY KEY`:建索引 + **真的强制唯一性**(TODO 8.7).
+                        // 约束本身仍然记进 `unenforced`--那一栏说的是"引用完整性 /
+                        // 复合约束没有被检查",主键这条现在只做了一半(唯一性做了,
+                        // 与 `NOT NULL` 的组合也做了,因为它本来就写在列上).
                         ConstrType::ConstrPrimary => {
+                            unique = Unique::Key;
                             unenforced.push(constraint_text(c, &format!("PRIMARY KEY ({})", def.colname)));
                         }
+                        // 列级 `UNIQUE`:只建索引(访问路径),唯一性**不**强制.
                         ConstrType::ConstrUnique => {
+                            unique = Unique::Unique;
                             unenforced.push(constraint_text(c, &format!("UNIQUE ({})", def.colname)));
                         }
                         // 外键:接受 + 记录,**不做引用检查**(本版也没有 DELETE,
@@ -1292,18 +1311,25 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                 if let Some(text) = default {
                     column = column.with_default(text);
                 }
+                if !unique.is_none() {
+                    column = column.with_unique(unique);
+                }
                 columns.push(column);
             }
 
             // 表级约束(`PRIMARY KEY (a, b)` 写在列定义之外)
             Some(node::Node::Constraint(c)) => {
                 reject_constraint_attributes(c)?;
-                let body = match ConstrType::try_from(c.contype).unwrap_or(ConstrType::Undefined) {
-                    ConstrType::ConstrPrimary => {
-                        format!("PRIMARY KEY ({})", constraint_keys(&c.keys)?)
-                    }
-                    ConstrType::ConstrUnique => format!("UNIQUE ({})", constraint_keys(&c.keys)?),
-                    ConstrType::ConstrForeign => describe_foreign(c, None)?,
+                let (body, kind) = match ConstrType::try_from(c.contype).unwrap_or(ConstrType::Undefined) {
+                    ConstrType::ConstrPrimary => (
+                        format!("PRIMARY KEY ({})", constraint_keys(&c.keys)?),
+                        Some(Unique::Key),
+                    ),
+                    ConstrType::ConstrUnique => (
+                        format!("UNIQUE ({})", constraint_keys(&c.keys)?),
+                        Some(Unique::Unique),
+                    ),
+                    ConstrType::ConstrForeign => (describe_foreign(c, None)?, None),
                     ConstrType::ConstrCheck => {
                         let expr = c
                             .raw_expr
@@ -1317,6 +1343,12 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
                         return Err(unsupported(format!("{}", tr!("ir.irgen.056", arg0 =  other : {:?}))));
                     }
                 };
+                // **只认单列**:多列的 `PRIMARY KEY (a, b)` 本版的索引表达不了
+                // (单列哈希索引),于是仍然只是"接受并记录"(口径见
+                // `src/ir/AGENTS.md`).列名先收着,等所有列都齐了再标.
+                if let (Some(kind), Some(column)) = (kind, single_key_column(c)?) {
+                    unique_keys.push((column, kind));
+                }
                 unenforced.push(constraint_text(c, &body));
             }
 
@@ -1330,6 +1362,15 @@ fn lower_create_table(create: &CreateStmt, symbols: &SymbolTable) -> Result<Stmt
 
     if columns.is_empty() {
         return Err(unsupported(tr!("ir.irgen.058").into_owned()));
+    }
+
+    // 表级约束里认出来的单列 `PRIMARY KEY` / `UNIQUE`:现在标的列一定都在 `columns`
+    // 里了.认不出的列名照旧**不报错**--那条约束本来就只是"接受并记录",这里只是
+    // 顺手少建一条索引,不该让一条以前能跑的建表语句突然失败.
+    for (column, kind) in unique_keys {
+        if let Some(def) = columns.iter_mut().find(|def| def.name == column) {
+            def.unique = kind;
+        }
     }
 
     // CHECK 现在才降级:它面对**整张表**的扁平 schema
@@ -1411,6 +1452,22 @@ fn constraint_keys(keys: &[Node]) -> Result<String> {
         names.push(name);
     }
     Ok(names.join(", "))
+}
+
+/// `PRIMARY KEY (...)` / `UNIQUE (...)` 里**恰好一列**时给出那个列名.
+///
+/// 本版的索引是单列的哈希索引,所以只有单列约束能顺手建出索引来;多列的返回
+/// `None`(那条约束仍然只是"接受并记录").认不出列名也返回 `None`--见调用点
+/// 的注释:这一条只影响"建不建索引",不该把以前能跑的建表语句拒掉.
+fn single_key_column(c: &pg_query::protobuf::Constraint) -> Result<Option<String>> {
+    if c.keys.len() != 1 {
+        return Ok(None);
+    }
+    Ok(match &c.keys[0].node {
+        Some(node::Node::String(s)) => Some(s.sval.clone()),
+        Some(node::Node::ColumnRef(c)) => ref_parts(&c.fields).map(|parts| parts.join(".")),
+        _ => None,
+    })
 }
 
 /// `FOREIGN KEY (...) REFERENCES t(...) [ON DELETE ...] [ON UPDATE ...]` 的文本.
@@ -1812,6 +1869,9 @@ fn column_permutation(insert: &InsertStmt, target: &[Column]) -> Result<Vec<Opti
 /// (与 PostgreSQL 一致:`SET a = b, b = a` 换的是两列原本的值).执行是"顺序扫一
 /// 遍,逐行改"(见 [`Stmt::Update`])--没有 JOIN,没有 `RETURNING`.
 ///
+/// `WHERE` 里能挑出索引路径时顺手挑一条(TODO 3.16):它只是**访问路径**,谓词照旧
+/// 整个留在 `filter` 里逐行复核,所以挑不出来(或者挑错)最多是慢.
+///
 /// 这里显式拒绝的写法:`WITH`,`UPDATE ... FROM`,`RETURNING`,下标/字段赋值,
 /// 同一列赋值两次,以及值与 `WHERE` 里的**子查询**(那里没有求值环境:整条语句
 /// 不建计划,程序直接在整行上 `eval`).
@@ -1846,7 +1906,8 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
         .columns(&table)
         .ok_or_else(|| DbError::UnknownSymbol { name: table.clone() })?
         .to_vec();
-    // `scan: None`:`UPDATE` 不建计划,所以这一项既不下推也不走索引
+    // `scan: None`:`UPDATE` 不建计划--它逐行改,要的是**行号**而不是行.
+    // 索引那条路走 `opt::pushdown::update_index_path`(见下面 `index` 字段).
     let scope = Scope::from_range(table.clone(), alias, columns.clone(), None, symbols);
 
     let mut sets: Vec<(usize, Prog)> = Vec::with_capacity(update.target_list.len());
@@ -1905,10 +1966,18 @@ fn lower_update(update: &UpdateStmt, symbols: &SymbolTable) -> Result<Stmt> {
         None => None,
     };
 
+    // 访问路径(TODO 3.16):只挑路径,`WHERE` 本身照旧逐行复核.
+    // `scope.ranges[0]` 就是这张表(`Scope::from_range` 只造一项).
+    let index = match &update.where_clause {
+        Some(expr) => opt::pushdown::update_index_path(expr, &scope.ranges[0], &scope)?,
+        None => None,
+    };
+
     Ok(Stmt::Update {
         table,
         sets,
         filter,
+        index,
     })
 }
 
@@ -2126,7 +2195,8 @@ fn lower_grouped(
         });
     }
 
-    // ---- 现在聚合规格齐了,建 Aggregate
+    // ---- 现在聚合规格齐了:能直接问行数的就别建 `Aggregate`(TODO 3.8),
+    //      否则建 Aggregate
     let agg_names: Vec<String> = agg
         .specs
         .iter()
@@ -2144,14 +2214,19 @@ fn lower_grouped(
     let mut all_names = agg.group_names.clone();
     all_names.extend(agg_names.iter().cloned());
 
-    let mut current = b.push(
-        Op::Aggregate {
-            group_by: agg.groups.clone(),
-            aggs: agg.specs.clone(),
-            names: all_names,
-        },
-        vec![input],
-    )?;
+    let mut current = match count_rows_directly(&agg, input, &b) {
+        // 输出 schema 与那个 `Aggregate` 一模一样,所以上面那半段
+        // (`HAVING` / `ORDER BY` / `Project` / `LIMIT`)一个字都不用改.
+        Some(table) => b.push(Op::CountRows { table, name: agg_names[0].clone() }, Vec::new())?,
+        None => b.push(
+            Op::Aggregate {
+                group_by: agg.groups.clone(),
+                aggs: agg.specs.clone(),
+                names: all_names,
+            },
+            vec![input],
+        )?,
+    };
 
     // ---- HAVING:在 Aggregate 之上,Project 之下(所以用不了输出别名,与 PG 一致)
     if let Some(having) = having {
@@ -2177,6 +2252,42 @@ fn lower_grouped(
     }
 
     b.finish(current)
+}
+
+/// 这条分组查询能直接问 [`Table::nrows`](crate::db::table::Table::nrows) 吗
+/// (TODO 3.8);能就给出那张表的**符号表名字**.
+///
+/// 条件一个都不能少:
+///
+/// * 没有 `GROUP BY`(有分组就得逐组数);
+/// * 聚合**恰好一个** `COUNT(*)`(没有参数,不是 `DISTINCT`,没有 `FILTER`)--
+///   别的聚合都要真读值;
+/// * 它的输入是**一张一点都没被过滤的基表**(`Scan` 且 `filter` / `index` 都空):
+///   有 `WHERE` 就得先筛,而"筛过之后还剩几行"没有现成的事实可问.
+///
+/// `EXPLAIN` 里那个 `Scan` 会因此变成**不可达节点**(合法:plan.rs 的文件头写着),
+/// 于是它既不建源也不执行;而 `CountRows` 自己就把这张表报给了 `used_columns`,
+/// 权限检查一分不少.
+fn count_rows_directly(agg: &AggLowering, input: NodeId, b: &PlanBuilder) -> Option<String> {
+    if !agg.groups.is_empty() || agg.specs.len() != 1 {
+        return None;
+    }
+    let spec = &agg.specs[0];
+    if spec.func != AggFunc::Count
+        || spec.arg.is_some()
+        || spec.distinct
+        || spec.filter.is_some()
+    {
+        return None;
+    }
+    match b.op(input) {
+        Some(Op::Scan {
+            table,
+            filter: None,
+            index: None,
+        }) => Some(table.clone()),
+        _ => None,
+    }
 }
 
 /// `SELECT DISTINCT` 吗.
@@ -2856,6 +2967,47 @@ fn outer_chain<'s>(scope: &Scope<'s>) -> Vec<Scope<'s>> {
     std::iter::once(scope.clone())
         .chain(scope.outers.iter().cloned())
         .collect()
+}
+
+/// 把 `expr` **在直接外层**降级成一个程序(外层键,TODO 8.7).
+///
+/// 相关子查询里的 `c.tconst = b.tconst` 要用索引探测的话,键必须是"外层那一层的
+/// `b.tconst`":在内层作用域里降级出来的是 `Step::Outer { depth, index }`,执行时
+/// 从外层行栈取(见 `ir::exec` 的 `ExecCtx`).返回 `None` 表示这个写法落不下来
+/// (调用方退回顺序扫描,不是错误).
+///
+/// 只认**直接把外层作用域当键**那一种:`scope.outers.first()` 就是直接外层,
+/// 所以列引用解出来是 `Resolved::Outer { depth: 0, .. }`(相对外层自己而言).
+pub(crate) fn lower_outer_key(expr: &Node, scope: &Scope<'_>) -> Option<Prog> {
+    let outer = scope.outers.first()?;
+    let mut p = ProgBuilder::new();
+    let reg = lower_expr(expr, outer, &mut p).ok()?;
+    let program = p.finish(reg);
+    if program.has_subquery() || program.has_outer() {
+        return None;
+    }
+
+    // 落下来的是"按**外层那一层的扁平 schema**编的"程序(`b.k` 是那一层的第 0 列),
+    // 而执行时它面对的是**内层这张表的行**(键在 `Scan` 那里求值,`index_key` 传的
+    // 输入行是空的).两边的列号不是一回事,所以把外层那些列号**重排到这张表上**:
+    // 外层列 → 这张表里同名的列;重排不了(外层那一列这张表没有)就老实放弃,
+    // 退回顺序扫描.
+    let columns = outer.schema();
+    let mut renamed: Vec<Step> = Vec::with_capacity(program.steps().len());
+    for step in program.steps() {
+        renamed.push(match step {
+            Step::Col { dst, index } => {
+                let source = columns.get(*index)?;
+                let local = scope.column_index_named(&source.name)?;
+                Step::Col { dst: *dst, index: local }
+            }
+            other => other.clone(),
+        });
+    }
+    let program = Prog::new(renamed, program.result(), program.nregs());
+
+    // 重排出来的键读的是"这张表里同名的列"--调用方还要核一下那一列就是索引列
+    Some(program)
 }
 
 /// `SubLink`:标量子查询,`EXISTS`,`IN`/`= ANY`/`= ALL (子查询)`.
@@ -4141,6 +4293,19 @@ impl<'s> Scope<'s> {
         self.symbols
     }
 
+    /// 本层的列名 → 扁平下标(按列名找;重名取第一个).
+    ///
+    /// "外层键"重排要用它(见 [`lower_outer_key`]):外层那一层里的第 `i` 列,拿到
+    /// **这张表**里同名的那一列上,键才在正确的 schema 上求值.
+    pub(crate) fn column_index_named(&self, name: &str) -> Option<usize> {
+        self.ranges
+            .iter()
+            .flat_map(|range| range.columns.iter().enumerate().map(move |(i, c)| (range.offset + i, c)))
+            .find(|(_, column)| column.name == name)
+            .map(|(index, _)| index)
+    }
+
+
     /// 扁平 schema.
     fn schema(&self) -> Vec<Column> {
         self.ranges
@@ -4148,6 +4313,7 @@ impl<'s> Scope<'s> {
             .flat_map(|r| r.columns.iter().cloned())
             .collect()
     }
+
 
     /// 扁平下标 → 那一列的类型.上下文定型要用.
     pub(crate) fn column_type_at(&self, index: usize) -> Option<DataType> {

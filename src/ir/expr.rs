@@ -663,6 +663,45 @@ impl Prog {
         self.nregs
     }
 
+    /// 这个程序就是个**常量**吗(从头到尾只有一条 `Const`).
+    ///
+    /// [`ProgBuilder::finish`] 会把"不读列,也没有子查询 / 外层引用"的程序折成
+    /// 这个样子(TODO 3.7),于是调用方(例如 `opt::pushdown` 认恒真 / 恒假合取项)
+    /// 能一眼看出"这个谓词其实是常数".
+    pub fn as_const(&self) -> Option<&Scalar> {
+        match (self.steps.as_slice(), self.result) {
+            ([Step::Const { dst, value }], result) if *dst == result => Some(value),
+            _ => None,
+        }
+    }
+
+    /// 常量折叠(TODO 3.7):不读列,也没有子查询 / 外层引用的程序,**求值一次**
+    /// 折成一个 `Const`.
+    ///
+    /// 折不动就**原样返回**,三种情况都算:
+    ///
+    /// * 读了列 / 有子查询 / 有外层引用 -- 它本来就不是常量;
+    /// * **类型检查不过** -- 折叠不能替 [`Prog::verify`] 放行一个本该被拒的程序
+    ///   (`apply` 有几处比类型规则宽松,见 [`ProgBuilder::binary`]).没有列的常量
+    ///   程序拿空 schema 校验正是它该有的那一关;
+    /// * 求值报错(`1/0`,`'abc'::int`)-- 错误留给**运行期**.
+    ///
+    /// 第三条是刻意的:把从不求值的死分支(`CASE WHEN 1 = 0 THEN 1/0 ELSE 42 END`
+    /// 里的 `1/0`)变成降级期错误是**回归**,不是优化(见 `tests/ir_lazy.rs` 与
+    /// 文件头的"表达式内部也有惰性").
+    fn fold_constants(self) -> Prog {
+        if !self.columns().is_empty() || self.has_subquery() || self.has_outer() {
+            return self;
+        }
+        if self.verify(&[]).is_err() {
+            return self;
+        }
+        match self.eval(&[]) {
+            Ok(value) => Prog::new(vec![Step::Const { dst: 0, value }], 0, 1),
+            Err(_) => self,
+        }
+    }
+
     /// 静态校验:先定义后使用,下标不越界,结果已定义,逐 step 类型推导.
     ///
     /// 返回结果类型.`input` 是本算子**输入**的列定义.
@@ -686,17 +725,7 @@ impl Prog {
                 Step::Const { dst, value } => write_reg(&mut defined, *dst, value.ty(), at)?,
                 Step::Unary { dst, op, src } => {
                     let src_ty = read_reg(&defined, *src, at)?;
-                    let ty = match op {
-                        UnOp::Neg => {
-                            require(src_ty, int_type(), at, &tr!("ir.expr.015").into_owned())?;
-                            int_type()
-                        }
-                        UnOp::Not => {
-                            require(src_ty, ScalarType::Bool, at, "NOT")?;
-                            ScalarType::Bool
-                        }
-                    };
-                    write_reg(&mut defined, *dst, ty, at)?;
+                    write_reg(&mut defined, *dst, unary_type(*op, src_ty, at)?, at)?;
                 }
                 Step::Binary { dst, op, lhs, rhs } => {
                     let l = read_reg(&defined, *lhs, at)?;
@@ -852,15 +881,7 @@ impl Prog {
                 Step::Const { dst, value } => put(&mut regs, *dst, value.clone(), self.nregs)?,
                 Step::Unary { dst, op, src } => {
                     let s = get(&regs, *src, self.nregs)?;
-                    let v = match op {
-                        UnOp::Neg => Scalar::Value(Value::Int(
-                            s.as_int()
-                                .ok_or(EvalError::NotAnInt)?
-                                .checked_neg()
-                                .ok_or(EvalError::Overflow { op: "-" })?,
-                        )),
-                        UnOp::Not => Scalar::Truth(s.as_truth().ok_or(EvalError::NotABool)?.not()),
-                    };
+                    let v = apply_unary(*op, s)?;
                     put(&mut regs, *dst, v, self.nregs)?;
                 }
                 Step::Binary { dst, op, lhs, rhs } => {
@@ -955,19 +976,8 @@ impl Prog {
                     put(&mut regs, *dst, v, self.nregs)?;
                 }
                 Step::IsNull { dst, src, negated } => {
-                    // 对**真值**来说,"是 NULL"就是 UNKNOWN -- `(a = b) IS NULL`
-                    // 在 SQL 里是合法且常用的写法.
-                    let is_null = match get(&regs, *src, self.nregs)? {
-                        Scalar::Value(v) => v.is_null(),
-                        Scalar::Truth(t) => t == Tri::Unknown,
-                    };
-                    // 结果永远确定,不会 Unknown:这正是 IS NULL 存在的理由
-                    let truth = if is_null != *negated {
-                        Tri::True
-                    } else {
-                        Tri::False
-                    };
-                    put(&mut regs, *dst, Scalar::Truth(truth), self.nregs)?;
+                    let v = apply_is_null(get(&regs, *src, self.nregs)?, *negated);
+                    put(&mut regs, *dst, v, self.nregs)?;
                 }
                 Step::Subquery { dst, spec } => {
                     // 内层的外层引用面对的是**本程序面对的那一行**,所以这里要把
@@ -1293,10 +1303,23 @@ impl Prog {
 ///
 /// 它**不做类型检查**(看不到输入 schema),类型统一留给 [`Prog::verify`].
 /// 因此这里的方法都返回 [`Reg`] 而不是 `Result`.
+///
+/// # 常量折叠(TODO 3.7)
+///
+/// 这里顺手做一件降级期的小事:算得出来的算术/比较/函数调用**当场算掉**,
+/// 只发一条 `Step::Const`(`WHERE a = 1 + 1` 于是编成 `a = 2`,每行少算一次加法).
+/// 靠的是 `consts` 这张旁表:哪个寄存器装着常量,只看它的生产者是谁.
+/// 求值与校验都不看它,折叠不成功就照原样发那条 step,语义一分不改.
 #[derive(Debug, Default)]
 pub struct ProgBuilder {
     steps: Vec<Step>,
     nregs: Reg,
+    /// 每个寄存器是不是**常量**:`Const` 是,别的生产的都不是.
+    ///
+    /// 只服务折叠:折叠失败(`1/0` 之类)就不记,于是老程序原样留着,
+    /// 错误照旧在**运行期**报(死分支里的 `1/0` 不许变成降级期错误,
+    /// 见 `tests/ir_lazy.rs`).
+    consts: Vec<Option<Scalar>>,
 }
 
 impl ProgBuilder {
@@ -1305,13 +1328,20 @@ impl ProgBuilder {
         ProgBuilder {
             steps: Vec::new(),
             nregs: 0,
+            consts: Vec::new(),
         }
     }
 
     fn fresh(&mut self) -> Reg {
         let reg = self.nregs;
         self.nregs += 1;
+        self.consts.push(None);
         reg
+    }
+
+    /// 这个寄存器现在装着常量吗(折叠用).
+    fn constant(&self, reg: Reg) -> Option<&Scalar> {
+        self.consts.get(reg as usize)?.as_ref()
     }
 
     /// 读输入行的第 `index` 列.
@@ -1344,19 +1374,44 @@ impl ProgBuilder {
     /// 任意常量.
     pub fn const_(&mut self, value: Scalar) -> Reg {
         let dst = self.fresh();
-        self.steps.push(Step::Const { dst, value });
+        self.steps.push(Step::Const {
+            dst,
+            value: value.clone(),
+        });
+        self.consts[dst as usize] = Some(value);
         dst
     }
 
-    /// 一元运算.
+    /// 一元运算.源是常量,而且**类型也对**才算掉(折叠),否则照原样发.
     pub fn unary(&mut self, op: UnOp, src: Reg) -> Reg {
+        let folded = self
+            .constant(src)
+            .cloned()
+            .filter(|value| unary_type(op, value.ty(), 0).is_ok())
+            .and_then(|value| apply_unary(op, value).ok());
+        if let Some(value) = folded {
+            return self.const_(value);
+        }
+
         let dst = self.fresh();
         self.steps.push(Step::Unary { dst, op, src });
         dst
     }
 
-    /// 二元运算.
+    /// 二元运算.两侧都是常量,而且**类型也对**才算掉(折叠),否则照原样发.
+    ///
+    /// 类型那一半不能省:`apply` 有几处比类型规则**宽松**(`||` 与 `LIKE` 族会拿
+    /// 任意两个值拼文本),折叠若只看 `apply` 就会替 `verify` 放行一个本该被拒的
+    /// 程序(`SELECT 'a' || 1` 是最现成的例子).
     pub fn binary(&mut self, op: BinOp, lhs: Reg, rhs: Reg) -> Reg {
+        let folded = match (self.constant(lhs).cloned(), self.constant(rhs).cloned()) {
+            (Some(l), Some(r)) if binary_type(op, l.ty(), r.ty(), 0).is_ok() => apply(op, l, r).ok(),
+            _ => None,
+        };
+        if let Some(value) = folded {
+            return self.const_(value);
+        }
+
         let dst = self.fresh();
         self.steps.push(Step::Binary { dst, op, lhs, rhs });
         dst
@@ -1399,8 +1454,21 @@ impl ProgBuilder {
         dst
     }
 
-    /// 标量函数调用.
+    /// 标量函数调用.参数全是常量,而且**类型也对**才算掉(`UPPER('a')` 那种).
     pub fn call(&mut self, func: ScalarFunc, args: Vec<Reg>) -> Reg {
+        let folded = args
+            .iter()
+            .map(|reg| self.constant(*reg).cloned())
+            .collect::<Option<Vec<Scalar>>>()
+            .filter(|values| {
+                let types: Vec<ScalarType> = values.iter().map(Scalar::ty).collect();
+                call_type(func, &types, 0).is_ok()
+            })
+            .and_then(|values| apply_call(func, &values).ok());
+        if let Some(value) = folded {
+            return self.const_(value);
+        }
+
         let dst = self.fresh();
         self.steps.push(Step::Call { dst, func, args });
         dst
@@ -1415,8 +1483,18 @@ impl ProgBuilder {
         dst
     }
 
-    /// 类型转换(`x::numeric`).
+    /// 类型转换(`x::numeric`).源是常量,而且**类型也对**才算掉;转不动(文本解析
+    /// 不出来)照原样发,那时它是一个**运行期**错误(`'abc'::int`).
     pub fn cast(&mut self, src: Reg, to: DataType) -> Reg {
+        let folded = self
+            .constant(src)
+            .cloned()
+            .filter(|value| cast_type(value.ty(), to, 0).is_ok())
+            .and_then(|value| cast_value(value, to).ok());
+        if let Some(value) = folded {
+            return self.const_(value);
+        }
+
         let dst = self.fresh();
         self.steps.push(Step::Cast { dst, src, to });
         dst
@@ -1444,20 +1522,25 @@ impl ProgBuilder {
         dst
     }
 
-    /// `IS NULL` / `IS NOT NULL`.
+    /// `IS NULL` / `IS NOT NULL`.源是常量就算掉(它永远不会失败).
     pub fn is_null(&mut self, src: Reg, negated: bool) -> Reg {
+        if let Some(value) = self.constant(src).cloned() {
+            return self.const_(apply_is_null(value, negated));
+        }
+
         let dst = self.fresh();
         self.steps.push(Step::IsNull { dst, src, negated });
         dst
     }
 
-    /// 收尾:指定哪个寄存器是结果.
+    /// 收尾:指定哪个寄存器是结果,**顺手把整个程序折成常量**(TODO 3.7).
     pub fn finish(self, result: Reg) -> Prog {
         Prog {
             steps: self.steps,
             result,
             nregs: self.nregs,
         }
+        .fold_constants()
     }
 }
 
@@ -1669,6 +1752,56 @@ fn arithmetic_family(ty: ScalarType, at: usize, op: BinOp) -> Result<TypeFamily>
             other
         )))),
     }
+}
+
+/// 一元运算的类型规则(`Step::Unary`),校验与常量折叠共用.
+///
+/// `NOT` 只要真值,取负只要 `INT`(`INT` 与 `NUMERIC` 的放大只发生在比较与算术里,
+/// 不在取负上).
+fn unary_type(op: UnOp, src: ScalarType, at: usize) -> Result<ScalarType> {
+    match op {
+        UnOp::Neg => {
+            require(src, int_type(), at, &tr!("ir.expr.015").into_owned())?;
+            Ok(int_type())
+        }
+        UnOp::Not => {
+            require(src, ScalarType::Bool, at, "NOT")?;
+            Ok(ScalarType::Bool)
+        }
+    }
+}
+
+/// 一元运算的求值(`Step::Unary`).
+///
+/// **执行与常量折叠共用它**:[`Prog::eval_with`] 按它算,`ProgBuilder::unary`
+/// 也按它折--两处各写一份迟早会分叉.
+fn apply_unary(op: UnOp, value: Scalar) -> std::result::Result<Scalar, EvalError> {
+    Ok(match op {
+        UnOp::Neg => Scalar::Value(Value::Int(
+            value
+                .as_int()
+                .ok_or(EvalError::NotAnInt)?
+                .checked_neg()
+                .ok_or(EvalError::Overflow { op: "-" })?,
+        )),
+        UnOp::Not => Scalar::Truth(value.as_truth().ok_or(EvalError::NotABool)?.not()),
+    })
+}
+
+/// `IS [NOT] NULL` 的求值(`Step::IsNull`),执行与常量折叠共用.
+///
+/// 对**真值**来说,"是 NULL"就是 UNKNOWN -- `(a = b) IS NULL` 在 SQL 里是合法
+/// 且常用的写法.结果永远确定,不会 Unknown:这正是 `IS NULL` 存在的理由.
+fn apply_is_null(value: Scalar, negated: bool) -> Scalar {
+    let is_null = match value {
+        Scalar::Value(v) => v.is_null(),
+        Scalar::Truth(t) => t == Tri::Unknown,
+    };
+    Scalar::Truth(if is_null != negated {
+        Tri::True
+    } else {
+        Tri::False
+    })
 }
 
 pub(crate) fn apply(op: BinOp, l: Scalar, r: Scalar) -> std::result::Result<Scalar, EvalError> {

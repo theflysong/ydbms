@@ -68,7 +68,9 @@ PhysTab                          ← db::source::materialize
 - 优化器只挑**目录里真有**的索引(没有就顺序扫描)--本版不为"也许有用"在建计划时
   先把表扫一遍,那比顺序扫描还贵;
 - `INSERT` 把新键**追加**进去(`SymbolTable::index_keys_of` + `maintain_indexes`),
-  `UPDATE` **整体作废**(`invalidate_indexes`,下次用到时重建一次).作废必须
+  `UPDATE` **只作废"写到的列"上的那一份**(`invalidate_indexes(table, written)`,
+  TODO 3.15),下次用到时重建一次.`update_row` 是原地替换,行号不动,所以没被写到的
+  列,它那份"键 → 行号"仍然完全有效--作废它就是下次白重建一遍整表.作废必须
   **先做**:中途出错也不能留下拿旧行号回答新键的索引;
 - `DROP SCHEMA ... CASCADE` 连同表一起清;索引**不落盘**.
 
@@ -158,13 +160,71 @@ PhysTab                          ← db::source::materialize
 
 - **真强制**:列级 `NOT NULL`(`Table::validate`),`DEFAULT`(`Column::default`,
   INSERT 缺列时补,见 `lower_insert`),`CHECK`(`checks.rs` 的 `CheckedTable`);
+- **单列 `PRIMARY KEY`:建索引 + 真强制唯一性**(TODO 8.7).列上留下
+  `Column::unique = Unique::Key`,执行时顺手建一条索引(名字 `<表>_pkey`),之后
+  重复键在**三条写路径**上都报错:
+  - `INSERT` / `COPY`:语句层那个"这一句见过哪些键"的台账(`stmt.rs` 的
+    `IndexKeys`)在**行落库之前**判,索引失效着就现扫一遍那一列--不能只在"索引
+    恰好建好着"的时候判,否则改过表之后会有一段时间**静默放过重复键**;
+  - `UPDATE`:索引作废之后当场把唯一索引按新数据重建一遍,撞了报错,没撞就顺手
+    把索引恢复成有效.不这么做的话,一个把两行改成同一个主键的 `UPDATE` 会成功地
+    留下错的表,直到下一次查询才冒出来;
+  - 重建(`rebuild_indexes`,打开库时):唯一索引建在一张**已经有重复行**的表上,
+    建都建不出来(`Index::build`).
+- **单列 `UNIQUE`:建索引(访问路径),唯一性仍然不强制**.列上留下
+  `Unique::Unique`,名字 `<表>_<列>_key`,重复键照旧放行--与主键**有意不同**;
+- **相关子查询里的等值谓词也走索引**(`opt::pushdown` 的"外层键"):`EXISTS
+  (SELECT 1 FROM c WHERE c.tconst = b.tconst)` 的内层只有一张表,**没有连接**可以
+  挂索引嵌套循环,于是少了这条路时内层每来一行都要扫一遍整表(`tests.sql` 的
+  Test 10.3 在 499999 行上因此跑不完).做法见下面"外层键"那一段;
 - **接受但如实记进 `unenforced`**:`PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY ...
-  REFERENCES ...`(不做唯一性与引用检查;`ON DELETE` 的动作也没有语义--没有 DELETE);
+  REFERENCES ...`(多列的那两种不建索引也不强制,单列的也照旧列出来--"约束有没有
+  被强制"这句话对 `UNIQUE` 仍然是"没有";`ON DELETE` 的动作也没有语义,没有
+  `DELETE`);
 - **拒绝**:`DEFERRABLE` / `INITIALLY DEFERRED` / `NOT VALID`,`IDENTITY`,
   `GENERATED`,`COLLATE`.
 
+**隐含索引与显式索引是同一套设施**,但两条口径不同:
+
+- 名字按 PostgreSQL 的口径合成,变成**生效名**才进目录(`imdb.title_basics_pkey`);
+- 隐含索引**不许单独 `DROP INDEX`**(`IndexSymbol::implicit`):它与约束是一体的,
+  而本版没有 `ALTER TABLE ... DROP CONSTRAINT`,放行就等于"约束说没就没".
+  `DROP SCHEMA ... CASCADE` 走的是内部 `retain`,连表带索引一起清;
+- 索引**不落盘**,`Column::unique` 落:打开库时 `SymbolTable::rebuild_indexes` 按它
+  把访问路径重建回来(幂等:同列同口径的索引已经有的就跳过).
+
 `CHECK` 与索引**不落盘**(它们不是列定义:`CHECK` 是程序,索引是会话级目录对象).
-`DEFAULT` 在 [`Column`](crate::db::table::Column) 里,跟着模式文件走.
+`DEFAULT` 在 [`Column`](crate::db::table::Column) 里,跟着模式文件走;
+`Column::unique` 也一样(它是"这一列上本该有一条索引"的事实,不只是记号).
+
+### 外层键:相关子查询的等值谓词当索引探测(TODO 8.7)
+
+相关子查询的内层**只有一张表**时,`c.tconst = b.tconst` 这种谓词三条路都走不通:
+它不是常量(对不上"键不读列"那条快路),没有别的 FROM 项可连接(`opt::join` 的索引
+嵌套循环是给连接用的),推给 `Scan.filter` 又不成立(`Scan.filter` 面对的行必须是
+这张表自己的 schema,而且它**没有外层行**,读 `Step::Outer` 只会报"没有求值环境").
+于是只剩"`Scan` 之后逐行 `Filter`",内层每来一行都扫一遍整表.
+
+`opt::pushdown` 的 `index_path` 因此多认一种键:**只读外层行**的表达式
+(`key.has_outer() && key.columns().is_empty()`).它进 `IndexPath.outer`,键要过一道
+`irgen::lower_outer_key`:
+
+- 表达式在**直接外层**的作用域里降级(`b.tconst` 是那一层的第 0 列);
+- 再把那些列号**重排到内层这张表上**--按**列名**找同名的列.重排不了(两边不同名)
+  就放弃,退回顺序扫描;
+- 于是 `IndexPath.key` 是本表里**同名的**那一列,`Plan::analyze` 只多核一条"它恰好
+  只读索引那一列",别的检查(同族,不许是别的列)一个字都不放;
+- 执行时 `index_key` 把**外层行栈顶那一行**喂给这个键(`eval_with`),`IndexSource`
+  一次只取命中的那几行.相关的等值谓词因此从"一行一次全表扫"变成"一行一次索引
+  探测"(实测:Test 10.3 从"3 分钟无进展"到 1.6 秒).
+
+两条要守的:
+
+- 谓词本身**照旧留在上面的 `Filter` 里**(`probe_only` 只是额外挑一条路径):索引
+  是访问路径,挑不出来(没索引 / 不同名 / 不是等值)就是原来的顺序扫描,一分语义
+  都不改;
+- 两边**必须同名**:重排靠列名,内层没有同名的列就退回顺序扫描(有意的保守--
+  `c.tconst = b.other_id` 这种情况本版不给它一条可能漏行的索引路).
 
 ### `VACUUM` / `ANALYZE`:接受,但是**空转**
 
@@ -200,8 +260,9 @@ psql 的 `\copy` 与它是**同一件事**(引擎与数据文件在同一个进�
   (见 `src/db/AGENTS.md`).
 - **边读边插**:`BufReader::lines()` 一行一行来,不先攒成 `Vec<Row>`--`init.sql` 那
   四张表共 177 万行.
-- **写路径与 `INSERT` 一字不差**:`relation_mut(...).insert(row)` 加
-  `index_keys_of` + `maintain_indexes`.漏了索引那一步就是"索引少一批键"的安静错答案.
+- **写路径与 `INSERT` 一字不差**:`relation_append(...).insert(row)` 加
+  `index_keys_of` + `maintain_indexes`(追加式写入口,撤销记录也因此便宜,见
+  TODO 3.17).漏了索引那一步就是"索引少一批键"的安静错答案.
 - **失败靠隐式事务整句回滚**(`execute_stmt_with`):文件不存在报 `Io`,字段数不符与
   读不出来的字段报带**行号**的 `Format`.显式事务里则与别的语句同一条口径(不整句
   回滚,要撤销就 `ROLLBACK`).
@@ -295,14 +356,18 @@ schema 的,所以只有从 root 往回推才算得出来([`Plan::used_columns`](
 
 `BEGIN` / `COMMIT` / `ROLLBACK` 是真的,撤销记录(`symbol.rs` 里私有的 `Tx`)跟着
 **符号表**走--因为要撤销的东西全在那儿:表数据,有哪些符号,索引,schema 名,
-`search_path`.三条规矩:
+`search_path`.四条规矩:
 
-- **目录快照在事务开始时取一份**(只有名字,不含数据,所以廉价);**整表快照按需**
-  --事务里第一次要改或被删某张表之前,`Table::snapshot()` 克隆一份.于是大表事务的
-  代价是"一次整表克隆",不是"整个库";
-- **任何会改数据 / 删符号的路径都必须先 `snapshot_before_write`**:今天只有两处
-  (`relation_mut` 与 `drop_schema`).漏一处,回滚就会**静默丢表**(`undo` 里那句
-  `panic!` 就是给这件事准备的);
+- **目录快照在事务开始时取一份**(只有名字,不含数据,所以廉价);**表的撤销记录按需**,
+  而且按**写的方式**分两种(TODO 3.17):
+  - `relation_append`(`INSERT` / `COPY`)只记下"事务里第一次追加之前的行数"--
+    撤销就是 `Table::truncate_to`,表里的值**一个都不复制**;
+  - `relation_mut`(`UPDATE`,以及 `drop_schema` 那种整张表要回来的)记一份整表克隆
+    (`Table::snapshot`).两种可以叠在同一张表上(`BEGIN; INSERT; UPDATE; ROLLBACK;`),
+    撤销的顺序是"先恢复整表克隆,再截断到追加之前的行数";
+- **任何会改数据 / 删符号的路径都必须先记一笔**(`relation_mut` /
+  `relation_append` / `drop_schema` 是仅有的三处).漏一处,回滚就会**静默丢表**
+  (`undo` 里那句 `panic!` 就是给这件事准备的);
 - **回滚之后必须把所有索引槽作废**:索引是"键 → 行号",行号可能已经变了,
   留着就是拿旧行号回答新键--一个安静的错答案.
 
@@ -322,10 +387,15 @@ schema 的,所以只有从 root 往回推才算得出来([`Plan::used_columns`](
 
 - **不认识的写法一律显式拒绝**(`DbError::Unsupported`),绝不猜.宁可拒绝,也不要
   给一个安静的错误答案.文件头列着当前仍拒绝哪些写法.
-- `UPDATE` 的值与 `WHERE` 都是**不建计划**直接 `eval` 的程序(顺序扫一遍,逐行改):
-  所以那里**显式拒绝子查询**(`reject_subqueries`)--没有求值环境.所有 `SET`
-  表达式在**旧行**上求值,整行算完再 `Table::update_row` 一次落库(约束看到的是
-  最终那一行).`UPDATE` 之前**先**把目标表上的索引整体作废.
+- `UPDATE` 的值与 `WHERE` 都是**不建计划**直接 `eval` 的程序(逐行改,顺序扫或者
+  走索引路径,见 [`Stmt::Update`](stmt.rs)):所以那里**显式拒绝子查询**
+  (`reject_subqueries`)--没有求值环境.所有 `SET` 表达式在**旧行**上求值,整行算完
+  再 `Table::update_row` 一次落库(约束看到的是最终那一行).`UPDATE` 只作废
+  **写到的列**上的索引(TODO 3.15),而且是在**选出要改的行号之后**才作废--
+  行号先按 `WHERE` 的访问路径一次选完,别让脚下的路在改的中途失效.
+- `opt::pushdown::update_index_path` 是 `UPDATE` 的访问路径(只挑路径,谓词照旧
+  整个留在 `Stmt::Update::filter` 里逐行复核);它与 `SELECT` 共用 `index_path`,
+  但**不建计划**--`UPDATE` 要的是行号而不是行.
 - `lower_expr_in` 的 `agg` 参数是**分组模式**:`Some` 时聚合调用变成对聚合输出的列
   引用,裸列引用去 `GROUP BY` 列表里找.
 - **聚合抽取是一趟做的**:用 AST 节点地址认同一个聚合.不要改回"先收集再改写"的
@@ -335,9 +405,30 @@ schema 的,所以只有从 root 往回推才算得出来([`Plan::used_columns`](
 - **`contains_aggregate` 必须走进 `CASE WHEN` 的条件/值,`ORDER BY` 的键**:
   它决定"这是不是一个分组查询",判错会让合法的聚合(`CASE WHEN COUNT(*) > 0 THEN ...`,
   `ORDER BY COUNT(*)`)被当成"出现在了不能出现的位置".
-- **`contains_aggregate` 必须走进 `CASE WHEN` 的条件/值,`ORDER BY` 的键**:
-  它决定"这是不是一个分组查询",判错会让合法的聚合(`CASE WHEN COUNT(*) > 0 THEN ...`,
-  `ORDER BY COUNT(*)`)被当成"出现在了不能出现的位置".
+
+### 两条规则式降级:常量折叠(3.7)与 `COUNT(*)`(3.8)
+
+- **常量折叠**:`ProgBuilder` 一边编一边把算得出来的算术 / 比较 / 函数调用算掉
+  (`consts` 旁表记着哪个寄存器是常量),`finish` 再把"不读列,没有子查询 / 外层引用"
+  的**整个程序**折成一条 `Const`.两条**闸门**不能省:
+  - 折叠必须**类型也过得去**(`binary_type` / `unary_type` / `call_type` /
+    `cast_type`)--`apply` 有几处比类型规则宽松(`||` 与 `LIKE` 族会拿任意两个值拼
+    文本),只看 `apply` 就会替 `verify` 放行 `SELECT 'a' || 1` 这种本该被拒的程序;
+  - **折叠失败就原样留着**(`1/0`,`'abc'::int`):错误仍旧在**运行期**报--
+    把从不求值的死分支(`CASE WHEN 1 = 0 THEN 1/0 ELSE 42 END`)变成降级期错误
+    是**回归**,口径见 `tests/ir_lazy.rs`.
+- **合取项的恒真 / 恒假**(`opt::pushdown::plan_where`):恒真的项**丢掉**;第一个恒
+  不成立的项是 `AND` 链上的**终点**--它右边的项全是死项(丢掉),左边的照旧留着
+  (`AND` 从左到右求值,左边那些该报的错照旧报).`Filter` 里只剩一个恒不成立的常量
+  谓词时,`exec` 的 `FilterSource` **一行都不拉**;而那张表**仍旧留在计划里**--
+  权限检查问的是 `Plan::used_columns`,把表摘掉就等于 `WHERE 1 = 0` 绕开了
+  `SELECT` 权限(这一条有端到端测试:`usr_share.rs`).
+- **`COUNT(*)` 问行数**(`Op::CountRows`):单张基表,没有 `WHERE`,没有 `GROUP BY`,
+  聚合只有一个 `COUNT(*)` 时,答案就是 `Table::nrows()`--一行都不读.判据在
+  `irgen::count_rows_directly`,它要求输入是**裸 `Scan`**(`filter` / `index` 都空).
+  输出 schema 与"一个 `COUNT(*)` 的 `Aggregate`"逐字相同,所以 `HAVING` / `ORDER BY`
+  / `Project` 那半段一个字都不用改;表名照旧报给 `used_columns`(空集合,与
+  `COUNT(*)` 那条"一列都没读"同一个口径).
 
 ### 表达式内部也有惰性:分支是自足子程序
 
@@ -389,9 +480,17 @@ schema 的,所以只有从 root 往回推才算得出来([`Plan::used_columns`](
 - **执行**:`ExecCtx`(`exec.rs`)持有**外层行栈**与两个缓存.求值 `Step::Subquery`
   时把"本程序面对的那一行"压进栈,造一份内层源,收成一个标量,弹回来--
   "为外层每一行重开一份内层源"就是多调一次 `build_pipeline`.
-- **缓存的是内层的行,不是最终标量**:`x IN (SELECT ...)` 的左半边是外层表达式,
-  逐行不同;把最终真值缓存下来会安静地给错答案(实测踩过).相关的每行重开,
-  未相关的(`correlated == false`)只算一次.
+- **按模式缓存**(TODO 3.9):未相关(`correlated == false`)的内层只算一次,而且各模式
+  **只留真正需要的那一点**(`SubCache`):
+  - `EXISTS` -- 一行就定真值,真值是个常量,一行都不用留;
+  - 标量 -- 最多两行(第二行就是"多于一行"的错;确认"只有一行"仍要拉到结尾);
+  - `= ANY`(就是 `IN`)-- 内层那一列的**值集合**,逐外层行 O(1).键要把
+    `INT` 与 `NUMERIC` 归一到同一个键空间(运行时比较会放大 `Int` → `Numeric`,
+    直接拿 `Value` 当键会**安静地漏行**);
+  - 其余量化(非等值 / `ALL`)-- 内层的行,逐行比.
+- **缓存的是内层的值 / 行,绝不是"这个子查询的真值"**:`x IN (SELECT ...)` 的左半边是
+  外层表达式,逐行不同;把最终真值缓存下来会安静地给错答案(实测踩过).相关的每行
+  重开,未相关的只算一次.
 - **两条闸门**:含子查询 / 外层引用的谓词**不下推**,也不当索引键--它们面对的行
   必须是降级时那个 schema(推给单表 `Scan` 就换了一行),而
   **`outers[0] == 该节点的 `program_input`** 是 `Plan::analyze` 强制的不变量.

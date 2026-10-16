@@ -61,11 +61,11 @@ fn build_database() -> SymbolTable {
     // 访问路径只来自**目录**(TODO 3.6):给 `f.value` 建一条索引,
     // 否则 `WHERE value = 10` 就是顺序扫描
     symbols
-        .create_index("f_value", "f", 1, false)
+        .create_index("f_value", "f", 1, false, false)
         .expect("给 f.value 建索引");
     // 连接内侧要能建索引,索引嵌套循环才挑得出来
     symbols
-        .create_index("t_x", "t", 0, false)
+        .create_index("t_x", "t", 0, false, false)
         .expect("给 t.x 建索引");
     symbols
 }
@@ -643,13 +643,38 @@ fn a_predicate_over_two_tables_stays_in_a_filter() {
 }
 
 #[test]
-fn a_constant_predicate_is_not_pushed() {
+fn a_true_constant_predicate_is_dropped() {
     let symbols = build_database();
 
-    // 常量谓词(不读列)不推:推到哪张表都是白搭,留在 Filter 里
+    // 恒真的合取项(TODO 3.7)在降级时就没了:它不影响哪些行留下,
+    // 留着一个 `Filter` 就是让每一行都白算一次 `1 = 1`
     assert_eq!(
         explain(&symbols, "SELECT * FROM f WHERE 1 = 1"),
-        "Filter([1 = 1])\n  Scan(f, filter=[])\n"
+        "Scan(f, filter=[])\n"
+    );
+}
+
+#[test]
+fn a_false_constant_predicate_leaves_an_empty_filter() {
+    let symbols = build_database();
+
+    // 恒不成立:整条 `WHERE` 折成一个常量谓词,`Filter` 留着(`exec` 的
+    // `FilterSource` 见到它一行都不拉),而**那张表仍旧在计划里**--
+    // 权限检查靠的就是这个(见 `tests/ir_fold.rs` 与 `tests/usr_share.rs`)
+    assert_eq!(
+        explain(&symbols, "SELECT * FROM f WHERE 1 = 0"),
+        "Filter([false])\n  Scan(f, filter=[])\n"
+    );
+}
+
+#[test]
+fn a_constant_arithmetic_operand_is_folded() {
+    let symbols = build_database();
+
+    // `1 + 1` 在降级期就算掉了:每一行都不必再算一次加法
+    assert_eq!(
+        explain(&symbols, "SELECT * FROM f WHERE x = 1 + 1"),
+        "Scan(f, filter=[x = 2])\n"
     );
 }
 

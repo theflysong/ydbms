@@ -129,6 +129,7 @@ cmd.engine.098: "可建角色"
 cmd.engine.099: "NOINHERIT"
 cmd.engine.100: "用法:\\copy <表> FROM '<数据文件>',例如 \\copy imdb.title_basics FROM 'data/title.basics.tsv'\n本版它就是 SQL 的 COPY:路径按**进程的当前目录**解析(与 \\ir 不同),只认不带 WITH 选项的 text 格式\n"
 cmd.engine.101: "%{arg0}  → 载入 %{arg1} 行到 %{arg2}\n"
+cmd.engine.102: " (顺手建了索引:%{arg0})"
 
 # ---- src/cmd/repl.rs ----
 cmd.repl.001: "再见."
@@ -170,6 +171,7 @@ db.index.001: "建索引时读不到第 %{arg0} 行第 %{arg1} 列"
 db.index.002: "上面刚建过"
 db.index.003: "上面刚查过"
 db.index.004: "读不到第 %{arg0} 行"
+db.index.005: "重复键值违反唯一约束 \"%{arg0}\"(%{arg1})=(%{arg2})"
 
 # ---- src/db/source.rs ----
 db.source.001: "读取第 %{arg0} 行失败"
@@ -245,7 +247,7 @@ ir.exec.022: "COUNT(DISTINCT) 溢出 i32"
 ir.exec.023: "SUM 的整数溢出"
 ir.exec.024: "分组键不能是真值"
 ir.exec.025: "聚合的参数不能是真值"
-
+ir.exec.026: "索引键要读外层行,可是外层行栈是空的(相关子查询之外不该出现这种键)"
 # ---- src/ir/expr.rs ----
 ir.expr.001: "外层引用"
 ir.expr.002: "子查询"
@@ -511,7 +513,6 @@ ir.opt.join.001: "只有一个键"
 
 # ---- src/ir/opt/pushdown.rs ----
 ir.opt.pushdown.001: "调用方保证至少有一个谓词"
-ir.opt.pushdown.002: "可下推的项一定有基表 Scan"
 
 # ---- src/ir/plan.rs ----
 ir.plan.001: "计划里没有任何节点"
@@ -582,6 +583,8 @@ ir.stmt.021: "列 `%{arg0}` 读不出来:%{arg1}"
 # ---- src/ir/symbol.rs ----
 ir.symbol.001: "事务快照丢了表 `%{arg0}`(有删除路径漏了快照)"
 ir.symbol.002: "DROP SCHEMA %{arg0}(名下还有 %{arg1} 张表,%{arg2} 条索引,请写 CASCADE;本版不做依赖检查)"
+ir.symbol.003: "DROP INDEX %{arg0}(它是 PRIMARY KEY 那条约束的索引,本版没有 `ALTER TABLE ... DROP CONSTRAINT`,删不掉)"
+ir.symbol.004: "回滚时截断不了表 `%{arg0}`:追加式的撤销记录要用 `Table::truncate_to`,它报了 %{arg1}(能 `insert` 的表必须也覆盖 `truncate_to`)"
 
 # ---- src/main.rs ----
 main.001: "错误:%{e}"

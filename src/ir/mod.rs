@@ -62,11 +62,13 @@
 //! `ROUND`/`UPPER`/`LOWER`/`LEFT`/`CONCAT_WS`/
 //! `LENGTH`/`EXTRACT(YEAR FROM ...)`/`CURRENT_DATE`,
 //! `::numeric` 与 `CAST`(**两个方向**:数值 / 日期 / 时间戳 ↔ `TEXT`),
-//! `CREATE TABLE`(`NOT NULL` / `DEFAULT` / `CHECK` 真强制;`PRIMARY KEY` / `UNIQUE` /
+//! `CREATE TABLE`(`NOT NULL` / `DEFAULT` / `CHECK` 真强制;**单列** `PRIMARY KEY`
+//! 顺手建索引并**真强制唯一性**,单列 `UNIQUE` 只建索引,多列的那两个与
 //! `FOREIGN KEY` 接受并**如实记录为未强制**),`INSERT`,`UPDATE`,
 //! `COPY <表> FROM '<文件>'`(COPY text 格式:制表符分列,`\N` 是 NULL,反斜杠按
 //! PostgreSQL 的转义表;**边读边插**;见 [`Stmt::Copy`](stmt::Stmt::Copy)),
-//! `CREATE INDEX` / `DROP INDEX`,`UNION [ALL]`,
+//! `UPDATE`(能用索引路径就用,只作废**写到的列**上的索引,见 [`Stmt::Update`]),
+//! `CREATE [UNIQUE] INDEX` / `DROP INDEX`,`UNION [ALL]`,
 //! **子查询**(标量 / `IN` / `EXISTS` / 相关引用 / 派生表 / `ANY`/`ALL`),
 //! NULL 与三值逻辑,`INT`/`TEXT`/`CHAR`/`VARCHAR`/`TIMESTAMP`/`DATE`/`NUMERIC`,
 //! **拉取式**的执行(见 [`exec`]),以及访问路径与连接上的几件事:
@@ -80,7 +82,13 @@
 //! * **连接策略**:嵌套循环 / [`JoinStrategy::Hash`] / [`JoinStrategy::IndexNestedLoop`],
 //!   由绑定器按等值键挑(索引嵌套循环要求内侧那列**目录里有索引**);
 //! * **表达式层的短路**:`CASE` 的分支与 `AND`/`OR` 的右侧是自足子程序,只有被
-//!   选中时才求值(死分支里的除零不再冒出来,见 [`Step`]).
+//!   选中时才求值(死分支里的除零不再冒出来,见 [`Step`]);
+//! * **常量折叠**(TODO 3.7):算得出来的算术 / 比较 / 函数调用在降级期就算掉,
+//!   不读列的程序整个折成一条 `Const`;合取项里的**恒真**项直接丢掉,**恒不成立**的
+//!   项让整条 `WHERE` 只剩它(`Filter([false])`,一行都不拉,而表仍旧留在计划里--
+//!   权限检查靠 `used_columns`).折叠失败(`1/0` 之类)原样留着,错误仍旧在运行期报;
+//! * **`COUNT(*)` 直接问行数**(TODO 3.8):单张基表,没有 `WHERE` / `GROUP BY`,
+//!   聚合只有一个 `COUNT(*)` 时用 [`Op::CountRows`],一行都不读.
 //!
 //! 语句层还认这些:`BEGIN`/`COMMIT`/`ROLLBACK`(**真事务**,撤销记录在
 //! [`SymbolTable`] 里;没有显式 `BEGIN` 时引擎给每条语句一个隐式事务,

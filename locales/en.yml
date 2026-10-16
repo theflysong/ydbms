@@ -129,6 +129,7 @@ cmd.engine.098: "createrole"
 cmd.engine.099: "NOINHERIT"
 cmd.engine.100: "Usage: \\copy <table> FROM '<data file>', for example \\copy imdb.title_basics FROM 'data/title.basics.tsv'\nIn this version it is the SQL COPY: the path is resolved against the **process working directory** (unlike \\ir), and only the text format without WITH options is accepted\n"
 cmd.engine.101: "%{arg0} -> Loaded %{arg1} row(s) into %{arg2}\n"
+cmd.engine.102: " (index(es) built: %{arg0})"
 
 # ---- src/cmd/repl.rs ----
 cmd.repl.001: "Bye."
@@ -170,6 +171,7 @@ db.index.001: "cannot read row %{arg0} column %{arg1} while building the index"
 db.index.002: "built just above"
 db.index.003: "looked up just above"
 db.index.004: "cannot read row %{arg0}"
+db.index.005: "duplicate key value violates unique constraint \"%{arg0}\" (%{arg1})=(%{arg2})"
 
 # ---- src/db/source.rs ----
 db.source.001: "failed to read row %{arg0}"
@@ -245,6 +247,7 @@ ir.exec.022: "COUNT(DISTINCT) overflows i32"
 ir.exec.023: "integer overflow in SUM"
 ir.exec.024: "a grouping key cannot be a truth value"
 ir.exec.025: "an aggregate argument cannot be a truth value"
+ir.exec.026: "the index key reads the outer row, but the outer row stack is empty (such a key must not appear outside a correlated subquery)"
 
 # ---- src/ir/expr.rs ----
 ir.expr.001: "outer reference"
@@ -511,7 +514,6 @@ ir.opt.join.001: "only one key"
 
 # ---- src/ir/opt/pushdown.rs ----
 ir.opt.pushdown.001: "the caller guarantees at least one predicate"
-ir.opt.pushdown.002: "a pushable item always has a base-table Scan"
 
 # ---- src/ir/plan.rs ----
 ir.plan.001: "the plan has no node at all"
@@ -582,6 +584,8 @@ ir.stmt.021: "cannot read column `%{arg0}`: %{arg1}"
 # ---- src/ir/symbol.rs ----
 ir.symbol.001: "the transaction snapshot lost table `%{arg0}` (a drop path missed the snapshot)"
 ir.symbol.002: "DROP SCHEMA %{arg0} (it still has %{arg1} table(s) and %{arg2} index(es), please write CASCADE; this version does no dependency checking)"
+ir.symbol.003: "DROP INDEX %{arg0} (it is the index of the PRIMARY KEY constraint, and this version has no `ALTER TABLE ... DROP CONSTRAINT` to drop it with)"
+ir.symbol.004: "cannot truncate table `%{arg0}` while rolling back: the append-only undo record needs `Table::truncate_to`, which reported %{arg1} (a table that can `insert` must override `truncate_to` too)"
 
 # ---- src/main.rs ----
 main.001: "Error: %{e}"

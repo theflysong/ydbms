@@ -318,7 +318,7 @@ fn the_rest_of_the_on_predicate_is_still_checked() {
 #[test]
 fn a_single_key_join_on_a_base_table_uses_the_index() {
     let mut symbols = ab(&[(1, 10)], &[(1, 100)]);
-    symbols.create_index("b_k", "b", 0, false).unwrap();
+    symbols.create_index("b_k", "b", 0, false, false).unwrap();
 
     let rendered = explain(&symbols, "SELECT a.k FROM a JOIN b ON a.k = b.k");
 
@@ -458,6 +458,7 @@ fn analyze_rejects_an_index_key_that_reads_a_column() {
         IndexPath {
             column: 0,
             key: col_prog(0),
+            outer: false,
         },
     )
     .unwrap();
@@ -478,7 +479,15 @@ fn analyze_rejects_an_index_key_of_another_family() {
     let mut p = ProgBuilder::new();
     let text = p.value(Value::Text("1".to_string()));
     let key = p.finish(text);
-    b.set_scan_index(scan, IndexPath { column: 0, key }).unwrap();
+    b.set_scan_index(
+        scan,
+        IndexPath {
+            column: 0,
+            key,
+            outer: false,
+        },
+    )
+    .unwrap();
 
     let err = b.finish(scan).unwrap().analyze(&symbols).unwrap_err();
 
@@ -647,7 +656,7 @@ fn counting_pair(a: &[i32], b: &[i32]) -> (SymbolTable, Rc<Counts>, Rc<Counts>) 
 fn an_index_scan_fetches_only_the_matching_rows() {
     let (mut symbols, counts) = counting(&[10, 11, 12, 13, 14]);
     // 访问路径只来自目录:先 `CREATE INDEX`(它扫一遍这一列把索引建出来)
-    symbols.create_index("t_x", "t", 0, false).unwrap();
+    symbols.create_index("t_x", "t", 0, false, false).unwrap();
 
     let plan = compile("SELECT * FROM t WHERE x = 13", &symbols).unwrap();
     let out = execute(&plan, &symbols).unwrap();
@@ -669,7 +678,7 @@ fn explain_shows_the_index_access_path() {
         "Scan(t, filter=[x = 12])\n"
     );
 
-    symbols.create_index("t_x", "t", 0, false).unwrap();
+    symbols.create_index("t_x", "t", 0, false, false).unwrap();
     assert_eq!(
         explain(&symbols, "SELECT * FROM t WHERE x = 12"),
         "Scan(t, index=[x], filter=[x = 12])\n"
@@ -691,7 +700,7 @@ fn an_index_scan_ignores_null_keys_and_keeps_duplicates() {
     }
     let mut symbols = SymbolTable::new();
     symbols.define("t", table).unwrap();
-    symbols.create_index("t_x", "t", 0, false).unwrap();
+    symbols.create_index("t_x", "t", 0, false, false).unwrap();
 
     let plan = compile("SELECT * FROM t WHERE x = 5", &symbols).unwrap();
     assert!(
@@ -708,11 +717,12 @@ fn an_index_scan_ignores_null_keys_and_keeps_duplicates() {
 #[test]
 fn a_limit_of_zero_never_rebuilds_an_invalidated_index() {
     let (mut symbols, counts) = counting(&[10, 11, 12, 13, 14]);
-    symbols.create_index("t_x", "t", 0, false).unwrap();
+    symbols.create_index("t_x", "t", 0, false, false).unwrap();
     let after_build = counts.cells.get();
 
     // 索引失效之后是**惰性**重建的:上层一行都不要,就一直不建
-    symbols.invalidate_indexes("t");
+    // (`UPDATE` 只作废**写到的列**上的索引,所以这里得点名那一列,见 TODO 3.15)
+    symbols.invalidate_indexes("t", &[0]);
     let plan = compile("SELECT * FROM t WHERE x = 13 LIMIT 0", &symbols).unwrap();
     let out = execute(&plan, &symbols).unwrap();
 
@@ -725,7 +735,7 @@ fn a_limit_of_zero_never_rebuilds_an_invalidated_index() {
 fn an_index_join_does_not_materialize_the_inner_rows() {
     // 外侧 3 行,内侧 3 行,只有键 1 对得上
     let (mut symbols, _, inner) = counting_pair(&[1, 2, 3], &[1, 4, 5]);
-    symbols.create_index("b_k", "b", 0, false).unwrap();
+    symbols.create_index("b_k", "b", 0, false, false).unwrap();
 
     let plan = compile("SELECT a.k FROM a JOIN b ON a.k = b.k", &symbols).unwrap();
     let out = execute(&plan, &symbols).unwrap();

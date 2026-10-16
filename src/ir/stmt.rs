@@ -15,6 +15,15 @@
 //! `insert`**,写路径与 `INSERT` 一字不差(索引键的追加也在内),于是约束,索引,
 //! 语句级原子性全都免费拿到.
 //!
+//! # 主键的唯一性在这里强制(TODO 8.7)
+//!
+//! `CREATE TABLE ... PRIMARY KEY` 会给那一列建一条**唯一**索引,而"重复键报错"
+//! 这条口径落在**这一层**,不在 `db` 也不在 `ir::exec`:判据要看索引槽位的
+//! `unique`,还要在索引**已经失效**时也成立(见 [`IndexKeys`]),而 `db` 那一层
+//! 不认识索引目录.三条写路径共用同一套判据:`INSERT` 与 `COPY` 在行落库**之前**
+//! 过一遍台账,`UPDATE` 改完当场把唯一索引按新数据重建一遍(撞了就报错,没撞就
+//! 顺手把索引恢复成有效).
+//!
 //! # 为什么必须逐条"降级 → 执行"
 //!
 //! 后面的语句依赖前面建出来的表:`INSERT INTO prime` 的降级需要 `prime` 已经
@@ -32,22 +41,25 @@
 //! [`has_top_level_terminator`] 是给 REPL 用的:判断"这段输入里有没有一句说完",
 //! 于是多行 SQL 能攒到分号才提交,而字符串/注释里的分号不会被误切.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use pg_query::protobuf::RawStmt;
 
+use crate::db::index::IndexSlot;
 use crate::db::phys::PhysTab;
 use crate::db::table::{
-    is_file_stem_safe, Column, ColumnsShape, DataType, DbError, Result, Row, TypeFamily, Value,
+    is_file_stem_safe, Column, ColumnsShape, DataType, DbError, Result, Row, Table, TypeFamily,
+    Value,
 };
 
 use super::checks::{Check, CheckedTable};
 
 use super::expr::Prog;
-use super::plan::Plan;
+use super::plan::{IndexPath, Plan};
 use super::symbol::{SymbolTable, TxKind};
 use super::{exec, irgen};
 use crate::usr::grants::Privilege;
@@ -73,6 +85,11 @@ pub enum Stmt {
         /// `NOT NULL`,`DEFAULT` 不在其中--它们与 `CHECK` 一样是**真的强制**的
         /// (前两个由 `Table::validate` 与 INSERT 的补值管,`CHECK` 见
         /// [`Check`]).
+        ///
+        /// **单列** `PRIMARY KEY` / `UNIQUE` 也在里面:它们在执行时顺手建了一条
+        /// 索引(见 [`Stmt::CreateIndex`] 与 [`SymbolTable::ensure_implicit_index`]),
+        /// 主键那条还真的强制唯一性;但"约束有没有被强制"这句话对 `UNIQUE`,以及对
+        /// **多列**的那两种仍然是"没有",所以照旧列出来.
         unenforced: Vec<String>,
         /// **真的强制**的 `CHECK` 约束:建表时把它们包进
         /// [`CheckedTable`],于是所有写路径都过约束.
@@ -113,10 +130,13 @@ pub enum Stmt {
         path: PathBuf,
     },
 
-    /// `CREATE INDEX [IF NOT EXISTS] name ON table (column)`.
+    /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column)`.
     ///
     /// 索引是**目录对象**(见 [`crate::db::index`]):这里只把名字,表,列记下来,
     /// 真正建索引与后续的维护/失效都在 [`SymbolTable`] 与执行器里.
+    ///
+    /// `unique` 那一份**真的强制唯一性**(重复键报错),所以 `CREATE UNIQUE INDEX`
+    /// 与 `CREATE INDEX` 不是"同一条语句多一个记号".
     CreateIndex {
         /// 索引名(可能带 schema 前缀).
         name: String,
@@ -124,6 +144,8 @@ pub enum Stmt {
         table: String,
         /// 建在**这张表**的第几列上.
         column: usize,
+        /// 语句里写了 `UNIQUE`.
+        unique: bool,
         /// 语句里写了 `IF NOT EXISTS`.
         if_not_exists: bool,
     },
@@ -148,6 +170,12 @@ pub enum Stmt {
         sets: Vec<(usize, Prog)>,
         /// `WHERE` 谓词;`None` 表示所有行都改.同样面对整张表的扁平 schema.
         filter: Option<Prog>,
+        /// 索引访问路径(TODO 3.16);`None` 就是顺序扫描.
+        ///
+        /// 与 `Scan` 的 `index` 同一个意思:它只是**访问路径**,`filter` 照旧逐行
+        /// 复核--挑不出来(没索引 / 不是等值 / 键读列)或者挑错都只是慢,不会算错.
+        /// 键不读本表的列,所以在**没有输入行**的前提下求值.
+        index: Option<IndexPath>,
     },
 
     /// 事务控制:`BEGIN` / `COMMIT` / `ROLLBACK`(见 [`TxOp`]).
@@ -607,6 +635,148 @@ fn io_error(path: &Path, e: std::io::Error) -> DbError {
     }
 }
 
+/// 给 [`DbError::DuplicateKey`] 补上**数据文件的行号**(`COPY` 那条路).
+///
+/// 数据文件里的问题要报成"文件内容的问题":只有行号能让用户找到那一行.
+/// 别的错误原样传出去(它们是表或值的毛病,不是文件的).
+fn copy_line_error(path: &Path, line_no: usize, e: DbError) -> DbError {
+    match e {
+        DbError::DuplicateKey {
+            index,
+            column,
+            value,
+        } => DbError::Format {
+            path: path.display().to_string(),
+            line: Some(line_no),
+            message: format!("{}", tr!("db.index.005", arg0 = index, arg1 = column, arg2 = value)),
+        },
+        other => other,
+    }
+}
+
+/// 一条语句里"这一句已经见过哪些键"的台账(主键唯一性的强制点,TODO 8.7).
+///
+/// **为什么要有它**:主键的唯一性靠索引,而索引是**可以失效**的(`UPDATE` 之后
+/// 下次用到时才重建).只在"索引建好着"的时候查重,会漏掉"表刚被改过,索引还失效
+/// 着"的那一段时间--那段时间里插一行重复主键会**静悄悄地成功**.
+///
+/// 台账的起点因此分两种:索引建好着就用它的**键集合**([`IndexSlot::keys`],只读,
+/// 不触发重建);索引失效着就**现扫一遍表**的这一个键列.之后每一行落库前先过台账,
+/// 于是同一条语句里新插进去的那些键也一起被纳入判据(重复主键报错,语句级回滚).
+///
+/// 台账**只在建表时声明了唯一性的那一列上有分量**(`UNIQUE` 列上那份索引不强制
+/// 唯一性,`IndexSlot::unique` 是 `false`,这里就什么都不做).
+struct IndexKeys {
+    /// 这一列上**强制唯一性**的索引槽位(通常是主键那条);没有就是空.
+    slots: Vec<(Rc<IndexSlot>, usize)>,
+    /// 已经见过的键.
+    seen: BTreeMap<usize, BTreeSet<Value>>,
+}
+
+impl IndexKeys {
+    /// 给一张表起一份台账(表的索引可能还没建,也可能已经失效).
+    fn new(symbols: &SymbolTable, table: &str) -> Self {
+        let slots: Vec<(Rc<IndexSlot>, usize)> = symbols
+            .unique_slots_of(table)
+            .into_iter()
+            .map(|(slot, _)| {
+                let column = slot.column();
+                (slot, column)
+            })
+            .collect();
+
+        let mut seen: BTreeMap<usize, BTreeSet<Value>> = BTreeMap::new();
+        for (slot, column) in &slots {
+            // 索引还在就直接拿它的键;失效了(或还没建)就按表现算一份--
+            // 重建索引那一趟本来就在逐行读这一列,这里读的量一模一样.
+            let keys = slot.keys().or_else(|| {
+                let relation = symbols.relation(table)?;
+                let mut keys = BTreeSet::new();
+                for row in 0..relation.nrows() {
+                    keys.insert(relation.value(row, *column)?);
+                }
+                Some(keys)
+            });
+            if let Some(keys) = keys {
+                seen.insert(*column, keys);
+            }
+        }
+
+        IndexKeys { slots, seen }
+    }
+
+    /// 这一行落库**之前**过一遍台账;某一列上撞了唯一性就报
+    /// [`DbError::DuplicateKey`](crate::db::table::DbError::DuplicateKey).
+    ///
+    /// 报错时**表里一行都没多**:调用点在 `Table::insert` 之前.
+    fn insert(&mut self, symbols: &SymbolTable, table: &str, row: &Row) -> Result<()> {
+        for (slot, column) in &self.slots {
+            let Some(value) = row.get(*column) else {
+                continue;
+            };
+            let seen = self.seen.entry(*column).or_default();
+            if !seen.insert(value.clone()) {
+                let column_name = symbols
+                    .columns(table)
+                    .and_then(|columns| columns.get(*column))
+                    .map(|def| def.name.clone())
+                    .unwrap_or_else(|| column.to_string());
+                return Err(DbError::DuplicateKey {
+                    index: slot.name().to_string(),
+                    column: column_name,
+                    value: format!("{}", value),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `WHERE` 在**借来的**这一行上成立吗(没有 `WHERE` 就是全都成立).
+///
+/// `UPDATE` 的过滤走它:只有确定的真留下(`UNKNOWN` 与 `FALSE` 一样跳过),
+/// 而被过滤掉的行**一次整行克隆都没有**(TODO 3.15).
+fn matches_where(filter: Option<&Prog>, row: &[Value]) -> Result<bool> {
+    match filter {
+        None => Ok(true),
+        Some(prog) => Ok(prog
+            .eval_truth(row)
+            .map_err(|e| e.into_db_error(None))?
+            .is_true()),
+    }
+}
+
+/// 索引路径命中的**行号**,一次查完(TODO 3.16).
+///
+/// 一次查完是**必须**的:命中的行马上要被改,而改到 `WHERE` 引用的列时那份索引会
+/// 当场作废--不能一边查一边改.查出来的行号还要拿 `WHERE` 整个复核一遍(索引只是
+/// 访问路径).
+///
+/// 目录里那条索引不在了(理论上不会:降级刚查过)就退回顺序扫描:宁可慢,
+/// 不要拿一条不确定的路径去改表.
+fn index_hits(
+    symbols: &SymbolTable,
+    relation: &dyn Table,
+    table: &str,
+    path: &IndexPath,
+) -> Result<Vec<usize>> {
+    // 键不读本表的列(`opt::pushdown::index_path` 挑的就是这种),空行上求值
+    let key = path
+        .key
+        .eval(&[])
+        .map_err(|e| e.into_db_error(None))?
+        .to_value()
+        .ok_or_else(|| DbError::IrRuntime {
+            node: None,
+            message: tr!("ir.exec.013").into_owned(),
+        })?;
+
+    match symbols.index_of(table, path.column) {
+        Some(slot) => slot.lookup(relation, &key),
+        None => Ok((0..relation.nrows()).collect()),
+    }
+}
+
 /// `COPY` 的一行 → 一行值.
 ///
 /// 制表符分列,字段与表的列**一一对应**(列清单在降级层已经拒绝),`\N` 与反转义
@@ -637,6 +807,18 @@ fn copy_row(line: &str, columns: &[Column], path: &Path, line_no: usize) -> Resu
     Ok(row)
 }
 
+/// 建表时**顺手**建出来的索引(TODO 8.7).
+///
+/// 只为**报告**:`CREATE TABLE ... PRIMARY KEY` 现在真的建了一条索引,用户得看得见
+/// (否则"这条查询为什么走了索引"没有任何线索).名字是生效名.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedIndex {
+    /// 索引名(生效名,例如 `imdb.title_basics_pkey`).
+    pub name: String,
+    /// 建在哪一列(列名).
+    pub column: String,
+}
+
 /// 一条语句执行完的结果.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -650,6 +832,8 @@ pub enum Outcome {
         unenforced: Vec<String>,
         /// **真的强制**的 `CHECK` 条数(见 [`Stmt::CreateTable::checks`]).
         checks: usize,
+        /// 顺手建出来的索引(空表示这一列上什么都没建).
+        indexes: Vec<CreatedIndex>,
     },
     /// 插入完成.
     Inserted {
@@ -800,11 +984,13 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
 
             if symbols.lookup(&name).is_some() {
                 if *if_not_exists {
-                    // `IF NOT EXISTS` 且已经有了:视为满足要求,不报错.
+                    // `IF NOT EXISTS` 且已经有了:视为满足要求,不报错(也不碰
+                    // 已经在那儿的索引--同名的索引属于原来那张表).
                     return Ok(Outcome::Created {
                         name,
                         unenforced: unenforced.clone(),
                         checks: checks.len(),
+                        indexes: Vec::new(),
                     });
                 }
                 return Err(DbError::DuplicateSymbol { name });
@@ -822,10 +1008,28 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             // 新表**先清同名残留**:删过的表名又被建出来时,旧授权不许悄悄生效
             dbs.forget_grants(&name)?;
 
+            // `PRIMARY KEY` / **单列** `UNIQUE` 顺手建索引(TODO 8.7):机制就是
+            // `CREATE INDEX` 那条路,所以"同一列上只会有一份"与"撞名退让"都由
+            // `ensure_implicit_index` 保证.主键那份还**强制唯一性**(见下面三条写
+            // 路径),`UNIQUE` 那份只当访问路径.
+            let mut indexes = Vec::new();
+            for (column, def) in columns.iter().enumerate() {
+                if def.unique.is_none() {
+                    continue;
+                }
+                let (index, _) =
+                    symbols.ensure_implicit_index(&name, column, def.unique.enforced())?;
+                indexes.push(CreatedIndex {
+                    name: index,
+                    column: def.name.clone(),
+                });
+            }
+
             Ok(Outcome::Created {
                 name,
                 unenforced: unenforced.clone(),
                 checks: checks.len(),
+                indexes,
             })
         }
 
@@ -864,12 +1068,17 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             dbs.check_table(symbols.role(), &effective, Privilege::Insert, &written)?;
 
             let mut inserted = 0usize;
+            let mut ledger = IndexKeys::new(symbols, table);
             for row in values {
+                // 唯一性先判:主键那份索引不许重复(TODO 8.7).判在**行落库之前**,
+                // 报错时表里一行都没多.
+                ledger.insert(symbols, table, &row)?;
                 // 索引要的键先取出来(行马上要搬进表里了)
                 let keys = symbols.index_keys_of(table, &row);
                 // 走 Table::insert,于是元数与类型校验都被复用.
+                // **追加式**写入口:撤销记录只记"截断回原来的行数"(TODO 3.17)
                 let rid = symbols
-                    .relation_mut(table)
+                    .relation_append(table)
                     .ok_or_else(|| DbError::UnknownSymbol {
                         name: table.clone(),
                     })?
@@ -904,15 +1113,23 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             // 中途失败不用在这里收拾--`execute_stmt_with` 那条隐式事务会整句回滚
             // (显式事务里则与别的语句同一条口径:不整句回滚,要撤销就 `ROLLBACK`).
             let mut inserted = 0usize;
+            let mut ledger = IndexKeys::new(symbols, table);
             for (index, line) in BufReader::new(file).lines().enumerate() {
                 let line = line.map_err(|e| io_error(path, e))?;
                 let row = copy_row(&line, &columns, path, index + 1)?;
 
+                // 唯一性先判:主键撞了就报带**行号**的错(数据文件的问题要说得像
+                // 数据文件的问题),而且整句回滚,表里不会留下装了一半的数据.
+                ledger
+                    .insert(symbols, table, &row)
+                    .map_err(|e| copy_line_error(path, index + 1, e))?;
+
                 // 与 `INSERT` 一字不差:索引要的键先取出来,行搬进表里,再追加键.
                 // 漏掉 `maintain_indexes` 就是"索引少了一批键"的安静错答案.
                 let keys = symbols.index_keys_of(table, &row);
+                // **追加式**写入口:撤销记录只记"截断回原来的行数"(TODO 3.17)
                 let rid = symbols
-                    .relation_mut(table)
+                    .relation_append(table)
                     .ok_or_else(|| DbError::UnknownSymbol {
                         name: table.clone(),
                     })?
@@ -931,6 +1148,7 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             table,
             sets,
             filter,
+            index,
         } => {
             // 同 `INSERT`:报告(以及提交点的脏表标记)用表自己的生效名
             let target = symbols
@@ -972,51 +1190,131 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
                 dbs.check_table(symbols.role(), &effective, Privilege::Select, &names)?;
             }
 
-            // **先**让这张表上的索引全部失效:万一中途出错(约束,短读),
-            // 已经改过的行也不会留下一份错的索引--宁可下次重建一遍
-            symbols.invalidate_indexes(table);
+            // ---- 先按 `WHERE` 把**要改的行号**选出来(TODO 3.15 与 3.16)
+            //
+            // 三条纪律:
+            //
+            // * 名字只解**一次**(老写法在每一行里重解一次,那是白干);
+            // * 谓词在**借来的**旧行上求值:命中的行才克隆整行(老写法在 `WHERE`
+            //   **之前**就克隆,被过滤掉的行白克隆--整行克隆 = 每个文本值各一次
+            //   堆分配);
+            // * 有索引路径就**先一次查完**(改到 `WHERE` 引用的列时,那份索引会当场
+            //   作废,所以别让脚下的路在扫的中途变动).
+            let hits = {
+                let relation = symbols.relation_exact(&effective).ok_or_else(|| {
+                    DbError::UnknownSymbol {
+                        name: table.clone(),
+                    }
+                })?;
 
-            let mut updated = 0usize;
-            for r in 0..nrows {
-                // 读旧行:所有 `SET` 表达式都在它上面求值
-                let row = symbols
-                    .relation(table)
-                    .and_then(|t| t.row(r))
-                    .ok_or_else(|| DbError::IrRuntime {
-                        node: None,
-                        message: format!("{}", tr!("ir.stmt.006", arg0 =  table, arg1 =  r)),
-                    })?;
+                let candidates: Box<dyn Iterator<Item = usize>> = match index {
+                    Some(path) => Box::new(index_hits(symbols, relation, &effective, path)?.into_iter()),
+                    None => Box::new(0..nrows),
+                };
 
-                if let Some(prog) = filter {
-                    // 只有确定的真才改:UNKNOWN 与 FALSE 一样跳过
-                    let truth = prog.eval_truth(&row).map_err(|e| e.into_db_error(None))?;
-                    if !truth.is_true() {
-                        continue;
+                let mut hits: Vec<usize> = Vec::new();
+                for r in candidates {
+                    let matched = match relation.row_ref(r) {
+                        // 物理表:谓词直接在借来的值上求值,零拷贝
+                        Some(row) => matches_where(filter.as_ref(), row)?,
+                        // 没有可借用存储的表(虚表):退回整行克隆,与过去一致
+                        None => {
+                            let row = relation.row(r).ok_or_else(|| DbError::IrRuntime {
+                                node: None,
+                                message: format!("{}", tr!("ir.stmt.006", arg0 = table, arg1 = r)),
+                            })?;
+                            matches_where(filter.as_ref(), &row)?
+                        }
+                    };
+                    if matched {
+                        hits.push(r);
                     }
                 }
+                hits
+            };
 
-                let mut new_row = row.clone();
-                for (index, prog) in sets {
-                    let value = prog
-                        .eval(&row)
-                        .map_err(|e| e.into_db_error(None))?
-                        .to_value()
-                        .ok_or_else(|| DbError::IrRuntime {
-                            node: None,
-                            message: tr!("ir.stmt.007").into_owned(),
-                        })?;
-                    new_row[*index] = coerce_to_column(value, &columns[*index].ty);
-                }
+            if hits.is_empty() {
+                // 一行都没命中:表不碰,也不留撤销记录(与过去一致)
+                return Ok(Outcome::Updated {
+                    table: effective,
+                    rows: 0,
+                });
+            }
 
-                // 整行一次落库:`Table::update_row` 管 typmod / NOT NULL,
-                // `CheckedTable` 管 CHECK -- 约束看到的是**最终**那一行
-                symbols
-                    .relation_mut(table)
-                    .ok_or_else(|| DbError::UnknownSymbol {
+            // ---- 让这张表上**写到的列**的索引失效(TODO 3.15)
+            //
+            // `update_row` 是**原地替换**,行号一行都不动--没被写到的列,它那份
+            // "键 → 行号"仍然完全有效,作废它就是下次用到时白重建一遍整表.
+            // 作废必须**先做**:万一中途出错(约束,短读),已经改过的行也不会留下
+            // 一份错的索引--宁可下次重建一遍.
+            let written_columns: Vec<usize> = sets.iter().map(|(index, _)| *index).collect();
+            symbols.invalidate_indexes(&effective, &written_columns);
+
+            // 唯一索引的槽位先记下来:**改完之后**要把它们按新数据重建一遍
+            // (见下面那段注释).`SET` 一列都没碰到唯一列时**不必**重建--那些列的
+            // 值一个都没动,唯一性不可能被破坏,而这一步是 O(整表)的:
+            // `update_*.sql` 全是"改无关列"的写法,无脑重建会把每条语句拖成整表扫.
+            let unique_columns = symbols.unique_columns_of(&effective);
+            let unique_slots: Vec<(Rc<IndexSlot>, String)> = match sets
+                .iter()
+                .any(|(column, _)| unique_columns.contains(column))
+            {
+                true => symbols.unique_slots_of(&effective),
+                false => Vec::new(),
+            };
+
+            // ---- 逐行改:一次拿到可变句柄,整段改完再还回去
+            //      (每一行都解一次名同样是白干,TODO 3.15)
+            let mut updated = 0usize;
+            {
+                let relation = symbols.relation_mut(&effective).ok_or_else(|| {
+                    DbError::UnknownSymbol {
                         name: table.clone(),
-                    })?
-                    .update_row(r, new_row)?;
-                updated += 1;
+                    }
+                })?;
+
+                for r in hits {
+                    // 读旧行:所有 `SET` 表达式都在它上面求值.只有命中的行才克隆.
+                    let row = relation.row(r).ok_or_else(|| DbError::IrRuntime {
+                        node: None,
+                        message: format!("{}", tr!("ir.stmt.006", arg0 = table, arg1 = r)),
+                    })?;
+
+                    let mut new_row = row.clone();
+                    for (index, prog) in sets {
+                        let value = prog
+                            .eval(&row)
+                            .map_err(|e| e.into_db_error(None))?
+                            .to_value()
+                            .ok_or_else(|| DbError::IrRuntime {
+                                node: None,
+                                message: tr!("ir.stmt.007").into_owned(),
+                            })?;
+                        new_row[*index] = coerce_to_column(value, &columns[*index].ty);
+                    }
+
+                    // 整行一次落库:`Table::update_row` 管 typmod / NOT NULL,
+                    // `CheckedTable` 管 CHECK -- 约束看到的是**最终**那一行
+                    relation.update_row(r, new_row)?;
+                    updated += 1;
+                }
+            }
+
+            // 唯一性**现在**查(主键,TODO 8.7):写到的那几列上的索引刚刚作废,而
+            // "改完之后有没有两行撞在同一个键上"还没有人查过.做法就是按新数据把
+            // 它们重建一遍--撞了当场报错(`Index::build` 那趟本来就在逐行读这一列),
+            // 没撞就**顺手把索引恢复成有效**,下一次查询连重建都省了.
+            //
+            // 不这么做的话,一个把两行改成同一个主键的 `UPDATE` 会成功地留下一个
+            // 错答案,直到下一次查询才冒出来--那正是本版处处要避免的那种安静错误.
+            for (slot, _) in &unique_slots {
+                let relation =
+                    symbols
+                        .relation_exact(&effective)
+                        .ok_or_else(|| DbError::UnknownSymbol {
+                            name: table.clone(),
+                        })?;
+                slot.build(relation)?;
             }
 
             Ok(Outcome::Updated {
@@ -1029,10 +1327,11 @@ fn run_stmt(stmt: &Stmt, symbols: &mut SymbolTable, dbs: &mut dyn Server) -> Res
             name,
             table,
             column,
+            unique,
             if_not_exists,
         } => {
             dbs.check_ddl(symbols.role(), "CREATE INDEX")?;
-            symbols.create_index(name, table, *column, *if_not_exists)?;
+            symbols.create_index(name, table, *column, *unique, *if_not_exists)?;
 
             // 报告里写清"建在哪张表的哪一列,多少个键"--索引是个真东西,不是记号
             let column_name = symbols

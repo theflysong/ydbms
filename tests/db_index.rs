@@ -109,7 +109,7 @@ impl Table for ShortTable {
 #[test]
 fn an_index_groups_rows_by_key() {
     let table = CountingTable::new(&[3, 1, 2, 1]);
-    let index = Index::build(&table, 0).unwrap();
+    let index = Index::build(&table, 0, false, "t").unwrap();
 
     assert_eq!(index.column(), 0);
     // 重复键的行号按**升序**(也就是表顺序)
@@ -123,7 +123,7 @@ fn an_index_groups_rows_by_key() {
 #[test]
 fn building_an_index_reads_only_the_indexed_column() {
     let table = CountingTable::new(&[3, 1, 2, 1]);
-    let index = Index::build(&table, 1).unwrap();
+    let index = Index::build(&table, 1, false, "t").unwrap();
 
     // 4 行 = 4 次单格读(**只读第 1 列**),一次整行读都没有
     assert_eq!(table.cells_read(), 4);
@@ -136,7 +136,7 @@ fn building_an_index_on_a_missing_column_is_an_error() {
     let table = CountingTable::new(&[1, 2]);
 
     assert_eq!(
-        Index::build(&table, 5),
+        Index::build(&table, 5, false, "t"),
         Err(DbError::ColumnOutOfBounds { index: 5, arity: 2 })
     );
 }
@@ -147,7 +147,7 @@ fn a_short_read_during_the_build_is_an_error() {
         shape: ColumnsShape::new(vec![Column::new("x", DataType::Int)]),
     };
 
-    let err = Index::build(&table, 0).unwrap_err();
+    let err = Index::build(&table, 0, false, "t").unwrap_err();
 
     assert!(matches!(err, DbError::IrRuntime { .. }), "got {err:?}");
     assert!(err.to_string().contains("建索引时读不到"), "{err}");
@@ -162,7 +162,7 @@ fn numeric_keys_use_the_canonical_text() {
     table.insert(vec![Value::numeric("1.50").unwrap()]).unwrap();
     table.insert(vec![Value::numeric("2").unwrap()]).unwrap();
 
-    let index = Index::build(&table, 0).unwrap();
+    let index = Index::build(&table, 0, false, "t").unwrap();
 
     assert_eq!(index.nkeys(), 2);
     assert_eq!(index.lookup(&Value::numeric("1.5").unwrap()), &[0, 1]);
@@ -176,7 +176,7 @@ fn an_index_source_is_a_row_source_over_one_key() {
     let table = CountingTable::new(&[1, 2, 1, 3, 1]);
 
     // 建索引是**惰性**的:光造游标一行都不读(`LIMIT 0` 之下连索引都不建)
-    let slot = Rc::new(IndexSlot::new(0));
+    let slot = Rc::new(IndexSlot::new(0, false, "t_x"));
     let mut source = IndexSource::new(&table, slot, Value::Int(1));
     assert_eq!(table.cells_read(), 0);
     assert_eq!(table.rows_read(), 0);
@@ -200,7 +200,7 @@ fn an_index_source_is_a_row_source_over_one_key() {
 #[test]
 fn an_index_source_for_a_missing_key_yields_nothing() {
     let table = CountingTable::new(&[1, 2]);
-    let slot = Rc::new(IndexSlot::new(0));
+    let slot = Rc::new(IndexSlot::new(0, false, "t_x"));
     let mut source = IndexSource::new(&table, slot, Value::Int(99));
 
     assert_eq!(source.next(), None);

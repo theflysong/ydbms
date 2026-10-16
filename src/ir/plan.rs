@@ -122,14 +122,26 @@ impl JoinStrategy {
 
 /// 一次索引访问:走第 `column` 列上的索引,要查的键由 `key` 求值.
 ///
-/// `key` **不能引用列**:索引是访问路径而不是算子,它没有输入行,键在空行上
-/// 求值.这条由 [`Plan::analyze`] 强制.
+/// `key` **不能引用本查询的列**(索引是访问路径而不是算子,它没有输入行,键在
+/// 空的输入行上求值)--这条由 [`Plan::analyze`] 强制.
+///
+/// # `outer`:相关子查询里作索引探测(TODO 8.7)
+///
+/// 相关子查询的内层查询**只有一张表**,于是 `c.tconst = b.tconst` 这种谓词既
+/// 没有别的 FROM 项可连接(`opt::join` 的索引嵌套循环挂不上去),又不是常量
+/// (对不上"键不读列"那条快路),只能退化成 `Scan` 之后的逐行 `Filter`--
+/// 内层每来一行都要把整张表扫一遍.
+///
+/// `outer` 为 `true` 时 `key` 读的是**外层行**(`Step::Outer`),于是这一列上的
+/// 索引可以当**探测**用:`index=[tconst]` 加一个外层键,内层一次只读命中那几行.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexPath {
     /// 索引建在哪一列(**这张表自己**的列下标).
     pub column: usize,
-    /// 要查的键;不读列.
+    /// 要查的键;不读本查询的列,但 `outer` 时**可以**读外层行.
     pub key: Prog,
+    /// 键读的是**外层行**吗(相关子查询的等值探测).
+    pub outer: bool,
 }
 
 /// 聚合函数.
@@ -214,7 +226,8 @@ pub enum Op {
         /// 索引访问路径;有它就按键取行,没有就顺序扫描.
         ///
         /// 它只是**访问路径**:`filter` 照旧逐行求值,所以路径挑错也只是慢,
-        /// 不会算错.
+        /// 不会算错.`IndexPath::outer` 那一份(相关子查询的等值探测)同理--
+        /// 谓词本身留在上面的 `Filter` 里,索引只是让它少读几行.
         index: Option<IndexPath>,
     },
     /// 选择.
@@ -276,6 +289,23 @@ pub enum Op {
         /// 先跳过多少行.
         offset: u64,
     },
+    /// 数一张基表的行数,**一行都不读**(TODO 3.8).
+    ///
+    /// `SELECT COUNT(*) FROM t`(单张基表,没有 `WHERE`,没有 `GROUP BY`,聚合只有
+    /// 一个 `COUNT(*)`)走它:答案就是 [`Table::nrows`](crate::db::table::Table::nrows),
+    /// 那是现成的事实,不必把整张表拉一遍再数一遍.输出 schema 与"一个 `COUNT(*)`
+    /// 的 [`Op::Aggregate`]"**逐字相同**(一列 `INT`),所以它上面那半段
+    /// (`HAVING` / `ORDER BY` / `Project` / `LIMIT`)一个字都不用改.
+    ///
+    /// 表名与 `Scan` 一样是**符号表里的名字**(`search_path` 还没展开),
+    /// 所以它也照样被 [`Plan::used_columns`] 报给权限检查--`COUNT(*)` 的
+    /// "一列都没读"是**空集合**,不是"没有这张表".
+    CountRows {
+        /// 符号表里的名字.
+        table: String,
+        /// 输出列名(与 `Aggregate` 那条路一样,取自聚合函数名).
+        name: String,
+    },
     /// 单行零列的关系.`SELECT 1 + 1` 这种没有 FROM 的查询用它当底座.
     SingleRow,
 }
@@ -284,7 +314,7 @@ impl Op {
     /// 这个算子需要几个输入.
     pub fn input_arity(&self) -> usize {
         match self {
-            Op::Scan { .. } | Op::SingleRow => 0,
+            Op::Scan { .. } | Op::SingleRow | Op::CountRows { .. } => 0,
             Op::Filter { .. }
             | Op::Project { .. }
             | Op::Sort { .. }
@@ -302,6 +332,7 @@ impl Op {
             Op::Filter { .. } => "Filter",
             Op::Project { .. } => "Project",
             Op::Aggregate { .. } => "Aggregate",
+            Op::CountRows { .. } => "CountRows",
             Op::Join { .. } => "Join",
             Op::Sort { .. } => "Sort",
             Op::Distinct => "Distinct",
@@ -431,6 +462,20 @@ impl Plan {
                         verify_index_path(path, table, &columns, id)?;
                     }
                     (columns.clone(), Some(columns))
+                }
+
+                // 数行数:输出只有一列 `INT`,名字由绑定器给(与 `Aggregate` 那条路
+                // 一样取自聚合函数名).表名要认得出,否则 `COUNT(*)` 会把错字瞒过去.
+                Op::CountRows { table, name } => {
+                    if symbols.columns(table).is_none() {
+                        return Err(DbError::UnknownSymbol {
+                            name: table.clone(),
+                        });
+                    }
+                    (
+                        vec![Column::new(name.clone(), DataType::Int)],
+                        None,
+                    )
                 }
 
                 Op::Filter { predicate } => {
@@ -783,6 +828,16 @@ impl Plan {
                         wants.push((left, left_columns));
                         wants.push((right, right_columns));
                     }
+                }
+                // `COUNT(*)` **一列都没读**:空集合就是"这张表上至少有一列的权限"
+                // (与聚合那条路同一个口径,见 `ir/AGENTS.md`).表名与 `Scan` 一样
+                // 解成**生效名**再报,免得权限检查按写下来的名字去问.
+                Op::CountRows { table, .. } => {
+                    let name = symbols
+                        .relation(table)
+                        .map(|relation| relation.name().to_string())
+                        .unwrap_or_else(|| table.clone());
+                    merge_used(out, name, Some(BTreeSet::new()));
                 }
                 Op::SingleRow => {}
             }
@@ -1149,7 +1204,7 @@ fn needs_every_column(prog: &Prog) -> bool {
 /// 穷尽 match:加新算子时会编译报错,不会漏掉某个程序的子查询校验.
 fn for_each_program<'a>(op: &'a Op, visit: &mut dyn FnMut(&'a Prog)) {
     match op {
-        Op::SingleRow | Op::Distinct | Op::Union { .. } => {}
+        Op::SingleRow | Op::Distinct | Op::Union { .. } | Op::CountRows { .. } => {}
         Op::Scan { filter, index, .. } => {
             if let Some(prog) = filter {
                 visit(prog);
@@ -1406,11 +1461,24 @@ fn verify_index_path(path: &IndexPath, table: &str, columns: &[Column], id: Node
     })?;
 
     let ty = path.key.verify(columns).map_err(|e| at(id, e))?;
-    if !path.key.columns().is_empty() {
-        return Err(invalid(
-            id,
-            tr!("ir.plan.030").into_owned(),
-        ));
+    // **常量键**不读列:它在没有输入行的前提下求值(见 [`IndexPath::key`]).
+    //
+    // **外层键**例外(TODO 8.7):降级时(`opt::pushdown` 的 `lower_outer_key`)它被
+    // 重排成"面对**这张表的行**"的程序--外层那一层的列被搬到这张表里**同名**的列
+    // 上,执行时 `Scan` 喂进去的正是外层行(`index_key` 传的就是外层行栈顶那一行).
+    // 于是它**恰好**只读索引那一列;别的列一律算降级坏了.
+    match path.outer {
+        true => {
+            let key_columns = path.key.columns();
+            if key_columns.len() != 1 || !key_columns.contains(&path.column) {
+                return Err(invalid(id, tr!("ir.plan.030").into_owned()));
+            }
+        }
+        false => {
+            if !path.key.columns().is_empty() {
+                return Err(invalid(id, tr!("ir.plan.030").into_owned()));
+            }
+        }
     }
 
     match ty {
@@ -1536,6 +1604,7 @@ fn render(id: NodeId, node: &Node, analysis: &Analysis) -> String {
     let input = analysis.program_input(id);
     match &node.op {
         Op::SingleRow => "SingleRow".to_string(),
+        Op::CountRows { table, .. } => format!("CountRows({})", table),
         Op::Scan {
             table,
             filter,

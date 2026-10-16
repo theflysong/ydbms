@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Table, TabShape, Value};
+use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, Table, TabShape, Unique, Value};
 use ydbms::db::PhysTab;
 use ydbms::pers::{CsvPersister, Persister, TablePath};
 
@@ -121,8 +121,38 @@ fn writes_the_expected_file_pair() {
 }
 
 #[test]
-fn csv_quoting_round_trips_awkward_column_names() {
-    let dir = TempDir::new("quoting");
+fn a_primary_key_marker_survives_the_schema_file() {
+    // TODO 8.7:`Column::unique` 是"这一列上本该有一条索引"的落盘标记(索引本身
+    // 不落盘),所以它必须能原样往返;而 `Unique::None` 的列**不写**这个键,
+    // 旧文件的字节因此一个都不变.
+    let dir = TempDir::new("unique");
+    let at = TablePath::new(dir.path(), "p");
+    let shape = ColumnsShape::new(vec![
+        Column::new("k", DataType::Int).with_unique(Unique::Key),
+        Column::new("u", DataType::Int).with_unique(Unique::Unique),
+        Column::new("v", DataType::Int),
+    ]);
+    let mut saved = PhysTab::new("p", &shape);
+    saved
+        .insert(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        .unwrap();
+
+    let persister = CsvPersister::new();
+    persister.save(&saved, &at).unwrap();
+
+    // 主键与 `UNIQUE` 分得开,没标记的那一列**没有这个键**
+    let raw = std::fs::read_to_string(at.schema_path()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(json["columns"][0]["unique"].as_str(), Some("key"));
+    assert_eq!(json["columns"][1]["unique"].as_str(), Some("unique"));
+    assert!(json["columns"][2].get("unique").is_none(), "{json}");
+
+    let loaded = persister.load(&at).unwrap();
+    assert_eq!(loaded.columns(), saved.columns(), "标记要原样回到列定义里");
+}
+
+#[test]
+fn csv_quoting_round_trips_awkward_column_names() {    let dir = TempDir::new("quoting");
     let at = TablePath::new(dir.path(), "quoted");
 
     // 目前只有 INT,值里不可能出现逗号;列名是唯一能走到 CSV 引号逻辑的地方.

@@ -1349,6 +1349,7 @@ impl Session {
                 name,
                 unenforced,
                 checks,
+                indexes,
             }) => {
                 // 强制了什么,没强制什么都要如实说:`CHECK` 是真的在写行时求值的,
                 // 而 `unenforced` 里的那些**只是记下来**
@@ -1356,6 +1357,20 @@ impl Session {
                     0 => String::new(),
                     n => format!("{}", tr!("cmd.engine.022", arg0 =  n)),
                 };
+                // 顺手建出来的索引也要说(TODO 8.7):不然"这条查询为什么走了索引"
+                // 就没有任何线索
+                let built = match indexes.is_empty() {
+                    true => String::new(),
+                    false => format!(
+                        "{}",
+                        tr!("cmd.engine.102", arg0 =  indexes
+                            .iter()
+                            .map(|index| format!("{}({})", index.name, index.column))
+                            .collect::<Vec<_>>()
+                            .join(","))
+                    ),
+                };
+                let enforced = format!("{}{}", enforced, built);
                 if unenforced.is_empty() {
                     self.info(&format!("{}", tr!("cmd.engine.023", arg0 =  head, arg1 =  name, arg2 =  enforced)));
                 } else {
@@ -1722,6 +1737,10 @@ impl Session {
 ///
 /// 任何一张读不回来就整体失败,不留下装了一半的符号表;调用方([`Session::open_with_sinks`]
 /// 与 [`Session::switch_database`])拿返回的集合当"磁盘上应该有哪些"的起点.
+///
+/// 载入之后按 [`Column::unique`](crate::db::table::Column::unique) 把 `PRIMARY KEY`
+/// / `UNIQUE` 那几条索引**重建**回来(TODO 8.7):索引是会话级的目录对象,不落盘,
+/// 而"这一列上本该有访问路径"是表的事实--不重建的话,`ysql` 一重启主键就退回全表扫.
 fn load_tables(symbols: &mut SymbolTable, db: &Database) -> Result<BTreeSet<String>> {
     let tables = db.load_tables()?;
 
@@ -1732,6 +1751,7 @@ fn load_tables(symbols: &mut SymbolTable, db: &Database) -> Result<BTreeSet<Stri
         batch.push(Symbol::relation(table.name().to_string(), table));
     }
     symbols.extend(batch)?;
+    symbols.rebuild_indexes()?;
 
     Ok(known_on_disk)
 }

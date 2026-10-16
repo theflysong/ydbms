@@ -3,7 +3,11 @@
 //! 全部用**小合成表**,期望值是手算的--这样断言的是"算得对不对",而不是
 //! "和我们自己的实现一致".
 
-use ydbms::db::table::{DataType, DbError, TabShape, Table, Value};
+use std::cell::Cell;
+use std::collections::BTreeSet;
+use std::rc::Rc;
+
+use ydbms::db::table::{Column, ColumnsShape, DataType, DbError, TabShape, Table, Value};
 use ydbms::db::PhysTab;
 use ydbms::ir::{run_script, Outcome, SymbolTable};
 
@@ -596,4 +600,113 @@ fn coalesce_over_an_aggregate_is_still_a_grouped_query() {
     // 否则这个聚合会被当成"出现在了不能出现的位置"
     let mut db = db(FIXTURE);
     assert_eq!(one(&mut db, "SELECT COALESCE(COUNT(*), 0) FROM t"), "5");
+}
+
+// ------------------------------------- `COUNT(*)` 无 `WHERE` 时问 `nrows()`(3.8)
+
+/// 一张会数数的 `t(x INT)`:整行读(`row`)与单格读(`value`)分开数.
+struct CountingTable {
+    shape: ColumnsShape,
+    rows: Vec<Vec<Value>>,
+    rows_read: Rc<Cell<usize>>,
+}
+
+impl CountingTable {
+    fn new(values: &[i32], rows_read: &Rc<Cell<usize>>) -> Self {
+        CountingTable {
+            shape: ColumnsShape::new(vec![Column::new("x", DataType::Int)]),
+            rows: values.iter().map(|v| vec![Value::Int(*v)]).collect(),
+            rows_read: Rc::clone(rows_read),
+        }
+    }
+}
+
+impl TabShape for CountingTable {
+    fn columns(&self) -> &[Column] {
+        self.shape.columns()
+    }
+}
+
+impl Table for CountingTable {
+    fn name(&self) -> &str {
+        "t"
+    }
+
+    fn nrows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row(&self, r: usize) -> Option<Vec<Value>> {
+        self.rows_read.set(self.rows_read.get() + 1);
+        self.rows.get(r).cloned()
+    }
+
+    fn value(&self, r: usize, c: usize) -> Option<Value> {
+        self.rows.get(r).and_then(|row| row.get(c)).cloned()
+    }
+}
+
+/// 一张 100 行的计数表(行数够大:老写法会读 100 次 `row`).
+fn counting() -> (SymbolTable, Rc<Cell<usize>>) {
+    let rows_read = Rc::new(Cell::new(0));
+    let mut symbols = SymbolTable::new();
+    let values: Vec<i32> = (0..100).collect();
+    symbols
+        .define("t", CountingTable::new(&values, &rows_read))
+        .expect("建 t");
+    (symbols, rows_read)
+}
+
+#[test]
+fn count_star_without_a_where_asks_the_row_count() {
+    let (mut symbols, rows_read) = counting();
+
+    // 答案就是 `nrows()`
+    assert_eq!(one(&mut symbols, "SELECT COUNT(*) AS n FROM t"), "100");
+    assert_eq!(rows_read.get(), 0, "一行都不该被读");
+
+    // 计划里没有 `Aggregate`,也没有 `Scan`
+    let plan = ydbms::ir::compile("SELECT COUNT(*) FROM t", &symbols).expect("降级");
+    let rendered = plan.explain(&symbols).expect("渲染");
+    assert!(rendered.contains("CountRows(t)"), "{rendered}");
+    assert!(!rendered.contains("Aggregate"), "{rendered}");
+    assert!(!rendered.contains("Scan"), "{rendered}");
+
+    // 权限那一半:`COUNT(*)` 一列都没读,但**那张表仍旧报在计划里**
+    // (空集合 = "这张表上至少有一列的 SELECT",见 `tests/ir_columns.rs`)
+    let used = plan.used_columns(&symbols).expect("列使用分析");
+    assert_eq!(used.get("t"), Some(&Some(BTreeSet::new())), "{used:?}");
+}
+
+#[test]
+fn count_star_with_a_where_still_scans() {
+    let (mut symbols, rows_read) = counting();
+
+    // 有 `WHERE` 就得先筛:那是 `Aggregate` 那条路,行为不变
+    assert_eq!(one(&mut symbols, "SELECT COUNT(*) AS n FROM t WHERE x > 49"), "50");
+    assert!(rows_read.get() > 0, "筛过一遍:{} 次整行读", rows_read.get());
+
+    let plan = ydbms::ir::compile("SELECT COUNT(*) FROM t WHERE x > 49", &symbols).expect("降级");
+    let rendered = plan.explain(&symbols).expect("渲染");
+    assert!(rendered.contains("Aggregate"), "{rendered}");
+}
+
+#[test]
+fn count_of_something_else_is_not_the_row_count() {
+    let (mut symbols, rows_read) = counting();
+
+    // `COUNT(x)` 要跳过 NULL,`COUNT(DISTINCT x)` 要去重,`SUM(x)` 要读值 --
+    // 都不是"行数",一条都不许走那条捷径
+    for sql in [
+        "SELECT COUNT(x) AS n FROM t",
+        "SELECT COUNT(DISTINCT x) AS n FROM t",
+        "SELECT SUM(x) AS n FROM t",
+        "SELECT AVG(x) AS n FROM t",
+    ] {
+        let plan = ydbms::ir::compile(sql, &symbols).expect("降级");
+        let rendered = plan.explain(&symbols).expect("渲染");
+        assert!(rendered.contains("Aggregate"), "{sql}:{rendered}");
+        one(&mut symbols, sql);
+    }
+    assert!(rows_read.get() > 0, "这些聚合真的要读值");
 }

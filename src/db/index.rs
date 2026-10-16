@@ -16,9 +16,26 @@
 //!
 //! * `CREATE INDEX` 立刻扫一遍表把索引建出来(这笔代价这时候付);
 //! * `INSERT` 只把新行**追加**进去(不重建);
-//! * `UPDATE` 之后索引失效,下一次用到它时重建一份(只重建一次);
+//! * `UPDATE` 只让**写到的那些列**上的索引失效(TODO 3.15:`update_row` 是原地替换,
+//!   行号不动,别的列那份"键 → 行号"仍然有效),下一次用到它时重建一份(只重建一次);
 //! * 没有索引的列**不建索引**:查询就是顺序扫描--本版不会为了"也许有用"先把表
 //!   扫一遍(`CREATE INDEX` 才是让人掏这笔钱的地方).
+//!
+//! # `unique`:主键那一份**真强制**唯一性(TODO 8.7)
+//!
+//! 同样一份"键 → 行号",但 [`IndexSlot::unique`] 是 `true` 的那一份会被语句层
+//! 当成唯一性的依据:
+//!
+//! * `INSERT` / `COPY`:每一行落库之前,按"这一句见过哪些键"的台账查一次重
+//!   (台账的起点是 [`IndexSlot::keys`],见 `crate::ir::stmt` 的 `IndexKeys`);
+//! * `UPDATE`:写到的列上的索引作废之后当场按新数据查一遍重,不让重键留到下一次
+//!   查询才冒出来;
+//! * 重建:唯一索引建在一张**已经有重复行**的表上,建都建不出来([`Index::build`]).
+//!
+//! 主键那份是隐含的 `unique` 索引来源(`CREATE TABLE ... PRIMARY KEY`,单列);
+//! `CREATE UNIQUE INDEX` 也走同一条路.**`UNIQUE` 列上的索引不是** `unique` 的:
+//! 它只当访问路径,重复键照样放行--这是本版记录在案的偏差,口径写在
+//! `src/ir/AGENTS.md`.
 //!
 //! # 键就是 [`Value`]
 //!
@@ -28,7 +45,7 @@
 //! [`crate::ir::Plan::analyze`] 静态强制,否则索引会安静地漏掉本该匹配的行.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use super::source::RowSource;
@@ -38,9 +55,19 @@ use super::table::{Column, DbError, Result, Row, Table, Value};
 ///
 /// `NULL` 也是一个键(`WHERE x IS NULL` 将来可以直接查它);至于 `x = NULL`
 /// 永远匹配不上任何行,那是**求值侧**的事,不由索引负责.
+///
+/// # `unique`:主键那一份才强制唯一性(TODO 8.7)
+///
+/// 同样是"键 → 行号",但 [`IndexSlot::insert_row`] / [`IndexSlot::verify_unique`]
+/// 在 `unique` 的索引上会**拒绝**重复键,报 [`DbError::DuplicateKey`].
+///
+/// 为什么不是"所有索引都强制":`UNIQUE` 列上的索引**只当访问路径**(重复键仍然
+/// 放行,这是本版长期记录在案的偏差),主键那份才强制.差别就靠这一个标记,
+/// 而它跟着 [`IndexSlot`] 走,所以"哪一份索引"与"强不强制"永远是同一件事.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     column: usize,
+    unique: bool,
     buckets: HashMap<Value, Vec<usize>>,
 }
 
@@ -50,7 +77,12 @@ impl Index {
     /// 只读**这一列**([`Table::value`]),不整行克隆--这是它比物化整表省的
     /// 地方.短读(`nrows()` 说有这一行,`value()` 却给不出来)算实现坏了,
     /// 报 [`DbError::IrRuntime`],不当作读到结尾.
-    pub fn build(table: &dyn Table, column: usize) -> Result<Self> {
+    ///
+    /// `unique` 时**当场**查重:同一个键落在两个行号上就报
+    /// [`DbError::DuplicateKey`].于是"把一条唯一索引建在一张已经有重复行的表上"
+    /// 不会先建出一份自相矛盾的索引再算账--建不出来就是建不出来.报错里的
+    /// `index` 用 `name`(生效索引名),那一列的名字从表上取.
+    pub fn build(table: &dyn Table, column: usize, unique: bool, name: &str) -> Result<Self> {
         let arity = table.arity();
         if column >= arity {
             return Err(DbError::ColumnOutOfBounds { index: column, arity });
@@ -62,15 +94,39 @@ impl Index {
                 node: None,
                 message: format!("{}", tr!("db.index.001", arg0 =  row, arg1 =  column)),
             })?;
+            if unique && buckets.contains_key(&key) {
+                return Err(DbError::DuplicateKey {
+                    index: name.to_string(),
+                    column: column_name(table, column),
+                    value: format!("{}", key),
+                });
+            }
             buckets.entry(key).or_default().push(row);
         }
 
-        Ok(Index { column, buckets })
+        Ok(Index {
+            column,
+            unique,
+            buckets,
+        })
     }
 
     /// 索引建在哪一列上.
     pub fn column(&self) -> usize {
         self.column
+    }
+
+    /// 这一份索引强制唯一性吗(只有主键那份是).
+    pub fn unique(&self) -> bool {
+        self.unique
+    }
+
+    /// 这个键已经在索引里了吗.
+    ///
+    /// 只看**有没有键**,不看那个桶里有多少行:唯一性的判据是"这个值出现过",
+    /// 不是"这个值只出现过一次".
+    pub fn contains(&self, key: &Value) -> bool {
+        self.buckets.contains_key(key)
     }
 
     /// 这个键的行号,**升序**;没有这个键就是空切片.
@@ -83,30 +139,55 @@ impl Index {
         self.buckets.len()
     }
 
-    /// 追加一行(`INSERT` 之后维护索引用).
+    /// 追加一个键 → 行号.
     ///
     /// 不校验键与列是否同族:键是从**那一列自己**读出来的(见
     /// [`IndexSlot::insert_row`] 的调用点),同族是构造上的事实.
+    ///
+    /// 这里**不查重**:唯一性的台账在语句层(见 `crate::ir::stmt` 的
+    /// `IndexKeys`),这里只管"把这一行挂到它的键上".
     pub fn insert(&mut self, key: Value, rid: usize) {
         self.buckets.entry(key).or_default().push(rid);
     }
+}
+
+/// 第 `column` 列的**列名**,取不到就拿列号顶上.
+///
+/// 只为了把 [`DbError::DuplicateKey`] 写得像 PostgreSQL 那样.
+fn column_name(table: &dyn Table, column: usize) -> String {
+    table
+        .columns()
+        .get(column)
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| column.to_string())
 }
 
 /// 一列上的**索引槽位**:一份可以失效,可以重建的索引.
 ///
 /// 它被 [`Rc`] 共享给正在跑的游标,所以内部状态放在 [`RefCell`] 里:目录是
 /// `&SymbolTable` 借出去的,而"失效 / 重建 / 追加一行"都要改它.
+///
+/// `unique` 是**建这个槽位的人**给的:`CREATE TABLE ... PRIMARY KEY` 与
+/// `CREATE UNIQUE INDEX` 给 `true`,别的给 `false`(见 [`Index::unique`]).
 #[derive(Debug, Default)]
 pub struct IndexSlot {
     column: usize,
+    /// 这一份索引强不强制唯一性吗(只有主键 / `CREATE UNIQUE INDEX` 那份是).
+    unique: bool,
+    /// 这份索引的名字(生效名).只为了把 [`DbError::DuplicateKey`] 报得像
+    /// PostgreSQL 那样--"哪一条唯一约束被撞了"要从这里说.
+    name: String,
     built: RefCell<Option<Index>>,
 }
 
 impl IndexSlot {
-    /// 一个还没建的空槽位(属于第 `column` 列).
-    pub fn new(column: usize) -> Self {
+    /// 一个还没建的空槽位(属于第 `column` 列,`unique` 决定它强不强制唯一性,
+    /// `name` 是它在目录里的名字).
+    pub fn new(column: usize, unique: bool, name: impl Into<String>) -> Self {
         IndexSlot {
             column,
+            unique,
+            name: name.into(),
             built: RefCell::new(None),
         }
     }
@@ -116,11 +197,25 @@ impl IndexSlot {
         self.column
     }
 
+    /// 这一份索引强制唯一性吗.
+    pub fn unique(&self) -> bool {
+        self.unique
+    }
+
     /// 现在建好一份(已经建过就重建).`CREATE INDEX` 走它.
+    ///
+    /// `unique` 的槽位在这里**顺带查重**:`Index::build` 那一趟本来就在逐行读
+    /// 这一列,所以"把唯一索引建在有重复行的表上"当场就报
+    /// [`DbError::DuplicateKey`].
     pub fn build(&self, table: &dyn Table) -> Result<()> {
-        let index = Index::build(table, self.column)?;
+        let index = Index::build(table, self.column, self.unique, &self.name)?;
         *self.built.borrow_mut() = Some(index);
         Ok(())
+    }
+
+    /// 这份索引的名字(生效名);手写的槽位可能是空串.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// 保证有索引,然后查这个键的行号.
@@ -140,6 +235,10 @@ impl IndexSlot {
     ///
     /// 索引**已经失效**(或者还没建)就什么都不做:下次用到时按需重建一遍,
     /// 于是这里不必为了维护而扫一次表.
+    ///
+    /// 唯一性**不在这里查**:强制点是语句层那句"这一句见过哪些键"的台账
+    /// (见 `crate::ir::stmt` 的 `IndexKeys`),`INSERT` / `COPY` / `UPDATE` 共用
+    /// 同一套判据,而且索引**失效着**也不会漏掉强制.
     pub fn insert_row(&self, key: Value, rid: usize) {
         if let Some(index) = self.built.borrow_mut().as_mut() {
             index.insert(key, rid);
@@ -149,6 +248,15 @@ impl IndexSlot {
     /// 作废(`UPDATE` 写完表之后).下次用到时重建.
     pub fn invalidate(&self) {
         *self.built.borrow_mut() = None;
+    }
+
+    /// 现在这一份索引里的**全部键**;还没建(或已失效)就是 `None`.
+    ///
+    /// 只读,不触发重建--语句层拿它给"这一句见过哪些键"的台账起个头(见
+    /// `crate::ir::stmt` 的 `IndexKeys`).
+    pub fn keys(&self) -> Option<BTreeSet<Value>> {
+        let built = self.built.borrow();
+        Some(built.as_ref()?.buckets.keys().cloned().collect())
     }
 
     /// 已经建好了吗(测试与报告用).

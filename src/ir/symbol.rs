@@ -20,15 +20,18 @@
 //! # 事务也在这里(4.1)
 //!
 //! 撤销记录(私有的 `Tx`)放在符号表里,因为**要撤销的东西全在这儿**:表数据(符号表
-//! 持有 `Box<dyn Table>`),有哪些符号,索引,schema 名,`search_path`.两条口径:
+//! 持有 `Box<dyn Table>`),有哪些符号,索引,schema 名,`search_path`.四条口径:
 //!
 //! * **目录快照**在事务开始时取一份(只有名字,**不含数据**,所以是廉价的);
-//! * **整表快照**按需--事务里**第一次**要改或被删某张表之前,把它整表克隆一份
-//!   ([`Table::snapshot`]).于是大表事务的代价是"一次整表克隆",而不是"整个库".
-//!
-//! 两条不变式:**任何会改数据或删符号的路径都必须先 `snapshot_before_write`**
-//! (`relation_mut` 与 `drop_schema` 是仅有的两处),否则回滚会静默丢表;
-//! **回滚之后必须把所有索引槽作废**(行号可能变了,留着就是拿旧行号回答新键).
+//! * **表的撤销记录按需**,而且按**写的方式**分两种(TODO 3.17):
+//!   [`relation_append`](SymbolTable::relation_append)(`INSERT` / `COPY`)只记下
+//!   "第一次追加之前的行数"--撤销是截断,表里的值一个都不复制;
+//!   [`relation_mut`](SymbolTable::relation_mut)(`UPDATE`,以及删表的路径)记一份
+//!   整表克隆([`Table::snapshot`]).两种可以叠在同一张表上,撤销时"先恢复克隆,
+//!   再截断";
+//! * **任何会改数据或删符号的路径都必须先记一笔**(`relation_mut` /
+//!   `relation_append` / `drop_schema` 是仅有的三处),否则回滚会静默丢表;
+//! * **回滚之后必须把所有索引槽作废**(行号可能变了,留着就是拿旧行号回答新键).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -49,6 +52,12 @@ pub struct IndexSymbol {
     pub table: String,
     /// "列 + 当前那一份索引".执行器与优化器都借它.
     pub slot: Rc<IndexSlot>,
+    /// 它是不是 `PRIMARY KEY` 那条约束**顺手**建出来的(TODO 8.7).
+    ///
+    /// 只用来拒绝 `DROP INDEX`:隐含索引与约束是一体的,而本版没有
+    /// `ALTER TABLE ... DROP CONSTRAINT`,放行就等于"约束说没就没".显式的
+    /// `CREATE INDEX` / `CREATE UNIQUE INDEX` 一律为 `false`.
+    pub implicit: bool,
 }
 
 impl IndexSymbol {
@@ -56,6 +65,43 @@ impl IndexSymbol {
     pub fn column(&self) -> usize {
         self.slot.column()
     }
+
+    /// 这份索引强制唯一性吗.
+    pub fn unique(&self) -> bool {
+        self.slot.unique()
+    }
+}
+
+/// "这一列上本该有一条索引"(TODO 8.7 的口径).
+///
+/// 它把 `PRIMARY KEY` / **单列** `UNIQUE` 与运行时那两种索引接上:按 PostgreSQL
+/// 的口径合成名字,并决定这一份强不强制唯一性.
+///
+/// * **主键**:`<表>_pkey`,**强制**唯一性(重复键报错);
+/// * **`UNIQUE` 列**:`<表>_<列名>_key`,只当**访问路径**,重复键照旧放行
+///   (与主键有意不同,口径见 `src/ir/AGENTS.md`).
+///
+/// `table` 必须是**生效名**(`imdb.title_crew`),合成出来的名字也带那一段前缀:
+/// 索引与它的表在同一个 schema 里,这是 PostgreSQL 的口径.这一点不是风格--
+/// **打开库时 `rebuild_indexes` 跑在 `set_search_path` 之前**(库级默认值还没套上
+/// 会话),按 `search_path` 加前缀的话,同一张表的索引在"刚建出来"与"重新打开"
+/// 两条路上会得到**两个不同的名字**,而选择路径是按列查的,于是重开之后索引就
+/// **看不见了**(实测:这个坑让 `Test 10.3` 从"跑得完"变回"跑不完").
+///
+/// 返回 `(合成名, 强不强制唯一性)`,给 [`SymbolTable::ensure_index`] 用.
+pub fn implicit_index(
+    table: &str,
+    columns: &[Column],
+    column: usize,
+    primary: bool,
+) -> (String, bool) {
+    let name = match (primary, columns.get(column)) {
+        (true, _) => format!("{}_pkey", table),
+        (false, Some(column_def)) => format!("{}_{}_key", table, column_def.name),
+        // 列号越界:名字随便给一个,`Index::build` 会把它报出来
+        (false, None) => format!("{}_key", table),
+    };
+    (name, primary)
 }
 
 /// 符号表里的一条记录.
@@ -189,33 +235,69 @@ struct Tx {
     kind: TxKind,
     /// 事务开始时的目录.只有名字,**不含数据**.
     catalog: CatalogSnapshot,
-    /// 事务里被改过或被删掉的表:第一次碰它时整表克隆一份,回滚时盖回去.
+    /// 事务里被改过或被删掉的表:第一次碰它时记一条撤销记录,回滚时用它盖回去.
     ///
     /// 键是表的**生效名**(符号表里存的那个),与脏表标记同一套口径.
-    tables: BTreeMap<String, Box<dyn Table>>,
+    tables: BTreeMap<String, UndoTable>,
+}
+
+/// 一张表的撤销记录.
+///
+/// 两种形态,按**写的方式**分(见 [`Write`]),同一张表可能两种都有:
+///
+/// * **纯追加**(`INSERT` / `COPY`):只记下"事务里第一次追加之前的行数",
+///   撤销 = 截断回去--表里的值一个都不用复制(TODO 3.17);
+/// * **原地改写**(`UPDATE`,以及 `DROP SCHEMA` 那种整张表要回来的):只能整表克隆
+///   一份(`UPDATE` 改的是已有行的内容,要盖回去就得有那份老数据).
+///
+/// 先追加后改写(`BEGIN; INSERT; UPDATE; ROLLBACK;`)时两种会**叠**在一起:
+/// 撤销的顺序是"先恢复整表克隆,再截断到追加前的行数"--克隆那一份是"改写之前"
+/// 的状态(里面已经含了先前追加的那些行),截断再把它们去掉,一步都不多余.
+#[derive(Default)]
+struct UndoTable {
+    /// 纯追加:事务里**第一次**追加之前的行数.
+    appended: Option<usize>,
+    /// 有过原地改写时的整表克隆.
+    full: Option<Box<dyn Table>>,
+}
+
+/// 一次写入是**追加**还是**原地改写**:撤销记录的形态按它分(见 [`UndoTable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Write {
+    /// 只往表尾加行(`INSERT` / `COPY`).
+    Append,
+    /// 改已有行的内容,或者整张表要能回来(`UPDATE` / `DROP SCHEMA ... CASCADE`).
+    InPlace,
 }
 
 impl fmt::Debug for Tx {
     /// 手写 `Debug`:`Box<dyn Table>` 不要求 `Debug`,而 [`SymbolTable`] 派生着
-    /// `Debug`.打印表名与行数就够定位问题了.
+    /// `Debug`.打印表名与"这份撤销记录是什么形态"就够定位问题了.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tables: Vec<(&str, String)> = self
+            .tables
+            .iter()
+            .map(|(name, undo)| {
+                // 名字是给读日志的人看的:用 `clone` / `truncate` 这两个标识符,
+                // 不要写文案(文案一律走 `tr!`,见 `src/i18n.rs`)
+                let shape = match &undo.full {
+                    Some(table) => format!("clone({})", table.nrows()),
+                    None => format!("truncate({})", undo.appended.unwrap_or(0)),
+                };
+                (name.as_str(), shape)
+            })
+            .collect();
         f.debug_struct("Tx")
             .field("kind", &self.kind)
-            .field(
-                "tables",
-                &self
-                    .tables
-                    .iter()
-                    .map(|(name, table)| (name.as_str(), table.nrows()))
-                    .collect::<Vec<_>>(),
-            )
+            .field("tables", &tables)
             .finish()
     }
 }
 
 /// 事务开始时的目录:符号(只有名字),索引,schema 名,`search_path`,当前角色.
 ///
-/// **数据不在里面**--它按需整表克隆(见 [`SymbolTable::snapshot_before_write`]).
+/// **数据不在里面**--它按需记一笔(整表克隆,或者"截断回 N 行");见
+/// [`SymbolTable::snapshot_before_write`].
 struct CatalogSnapshot {
     symbols: Vec<SnapEntry>,
     indexes: Vec<IndexSymbol>,
@@ -337,7 +419,23 @@ impl SymbolTable {
     /// 这张表时先克隆一份(见私有的 `snapshot_before_write`).
     pub fn relation_mut(&mut self, name: &str) -> Option<&mut Box<dyn Table>> {
         let index = self.resolve_index(name)?;
-        self.snapshot_before_write(index);
+        self.snapshot_before_write(index, Write::InPlace);
+        self.write_handle(index)
+    }
+
+    /// 名字 → **可变**的表句柄,并且按**纯追加**记撤销记录(`INSERT` / `COPY` 用).
+    ///
+    /// 与 [`relation_mut`](SymbolTable::relation_mut) 只差撤销记录的形态:追加
+    /// 只往表尾加行,所以撤销只需要"把表截断回原来的 N 行"(TODO 3.17)--
+    /// 一个值都不复制,大表也一样便宜.
+    pub fn relation_append(&mut self, name: &str) -> Option<&mut Box<dyn Table>> {
+        let index = self.resolve_index(name)?;
+        self.snapshot_before_write(index, Write::Append);
+        self.write_handle(index)
+    }
+
+    /// 按符号下标取可变句柄(两个写入口共用).
+    fn write_handle(&mut self, index: usize) -> Option<&mut Box<dyn Table>> {
         match self.symbols.get_mut(index)? {
             Symbol::Relation { table, .. } => Some(table),
             Symbol::Alias { .. } => None,
@@ -398,8 +496,8 @@ impl SymbolTable {
 
     /// 引擎给**一条语句**开的隐式事务.已经有事务(隐式或显式)时什么都不做.
     ///
-    /// 只对写路径有意义:快照是**按需**的([`snapshot_before_write`]),所以一条
-    /// 只读语句什么都没克隆,代价就是几个名字的拷贝.
+    /// 只对写路径有意义:撤销记录是**按需**的([`snapshot_before_write`]),所以一条
+    /// 只读语句什么都没记,代价就是几个名字的拷贝.
     ///
     /// [`snapshot_before_write`]: SymbolTable::snapshot_before_write
     pub(crate) fn begin_implicit(&mut self) {
@@ -477,32 +575,47 @@ impl SymbolTable {
         }
     }
 
-    /// 事务里**第一次**要改(或要删)第 `index` 个符号的表之前,整表克隆一份进 undo.
+    /// 事务里**第一次**要改(或要删)第 `index` 个符号的表之前,记一条撤销记录.
     ///
-    /// 任何"会改数据 / 会删符号"的路径都必须先调它:`relation_mut`(`INSERT` 与
-    /// `UPDATE` 唯一的写入口)与 `drop_schema`(符号连同数据一起消失).
-    /// 键用**符号自己的名字**:回滚按目录快照重建,对的就是这个名字.
-    fn snapshot_before_write(&mut self, index: usize) {
+    /// 任何"会改数据 / 会删符号"的路径都必须先调它:[`relation_mut`](SymbolTable::relation_mut)
+    /// (原地改写),`relation_append`(`INSERT` / `COPY`),以及
+    /// `drop_schema`(符号连同数据一起消失).键用**符号自己的名字**:回滚按目录
+    /// 快照重建,对的就是这个名字.
+    ///
+    /// 记什么是 `write` 说了算(见 [`UndoTable`]):追加只记行数,原地改写整表克隆.
+    /// 两种可以叠在同一张表上,已经记过的部分不重记--**已经克隆过的那一份才是
+    /// 要盖回去的**,再克隆一次就把它覆盖成"改过一半"的那份了.
+    fn snapshot_before_write(&mut self, index: usize, write: Write) {
         let name = match self.symbols.get(index) {
             Some(Symbol::Relation { name, .. }) => name.clone(),
             // 别名:数据在它指向的关系符号上,那个符号自己会被钩子照到
             _ => return,
         };
 
-        // 不在事务里,或者事务里已经克隆过它了:都不用再克隆.**已经克隆过的那一份
-        // 才是要盖回去的**--再克隆一次就把它覆盖成"改过一半"的那份了.
-        match self.tx.as_ref() {
-            None => return,
-            Some(tx) if tx.tables.contains_key(&name) => return,
-            Some(_) => {}
+        // 不在事务里,或者该记的都记过了:都不用再动
+        match self.tx.as_ref().and_then(|tx| tx.tables.get(&name)) {
+            Some(undo) if undo.full.is_some() => return,
+            // `appended` 记的是**第一次**追加之前的行数,第二次追加不必再记
+            Some(undo) if undo.appended.is_some() && write == Write::Append => return,
+            _ => {}
         }
 
-        let snapshot = match self.symbols.get(index) {
-            Some(Symbol::Relation { table, .. }) => table.snapshot(),
+        let (full, appended) = match self.symbols.get(index) {
+            Some(Symbol::Relation { table, .. }) => match write {
+                Write::Append => (None, Some(table.nrows())),
+                Write::InPlace => (Some(table.snapshot()), None),
+            },
             _ => return,
         };
+
         if let Some(tx) = self.tx.as_mut() {
-            tx.tables.insert(name, snapshot);
+            let undo = tx.tables.entry(name).or_default();
+            if undo.appended.is_none() {
+                undo.appended = appended;
+            }
+            if undo.full.is_none() {
+                undo.full = full;
+            }
         }
     }
 
@@ -525,7 +638,7 @@ impl SymbolTable {
         }
 
         // 2) 按快照重建符号表.事务开始时存在的关系,要么没动过(还在 `live` 里),
-        //    要么被钩子克隆过(在 `tx.tables` 里);两边都没有只可能是某条删除路径
+        //    要么被钩子记过(在 `tx.tables` 里);两边都没有只可能是某条删除路径
         //    漏了 `snapshot_before_write`--那会让这张表连同数据一起**静默消失**,
         //    所以这里宁可炸掉.
         let mut symbols = Vec::with_capacity(tx.catalog.symbols.len());
@@ -533,10 +646,44 @@ impl SymbolTable {
         for entry in tx.catalog.symbols {
             match entry {
                 SnapEntry::Relation(name) => {
-                    let table = restored
-                        .remove(&name)
-                        .or_else(|| live.remove(&name))
-                        .unwrap_or_else(|| panic!("{}", tr!("ir.symbol.001", arg0 =  name)));
+                    let (mut table, appended) = match restored.remove(&name) {
+                        // 有整表克隆:用它(现成的那一份丢掉)
+                        Some(UndoTable {
+                            full: Some(table),
+                            appended,
+                        }) => {
+                            live.remove(&name);
+                            (table, appended)
+                        }
+                        // 只记过"纯追加":表还是现成那一份,截断就行
+                        Some(UndoTable {
+                            full: None,
+                            appended,
+                        }) => (
+                            live.remove(&name).unwrap_or_else(|| {
+                                panic!("{}", tr!("ir.symbol.001", arg0 = name))
+                            }),
+                            appended,
+                        ),
+                        None => (
+                            live.remove(&name).unwrap_or_else(|| {
+                                panic!("{}", tr!("ir.symbol.001", arg0 = name))
+                            }),
+                            None,
+                        ),
+                    };
+
+                    // 追加式的撤销记录:截断回事务里第一次追加之前的行数
+                    // (表里的值一个都不用复制,TODO 3.17)
+                    if let Some(rows) = appended {
+                        if let Err(error) = table.truncate_to(rows) {
+                            // 截断不了就没有第二份数据可以拿出来盖:这是**实现坏了**
+                            // (能 `insert` 的表必须覆盖 `truncate_to`),宁可炸掉也
+                            // 不留给用户一张没回滚掉的表.
+                            panic!("{}", tr!("ir.symbol.004", arg0 = name, arg1 = error));
+                        }
+                    }
+
                     symbols.push(Symbol::Relation { name, table });
                 }
                 SnapEntry::Alias { name, target } => {
@@ -577,6 +724,7 @@ impl SymbolTable {
         name: &str,
         table: &str,
         column: usize,
+        unique: bool,
         if_not_exists: bool,
     ) -> Result<String> {
         let name = self.effective_name(name);
@@ -585,33 +733,203 @@ impl SymbolTable {
         let exists = self.indexes.iter().any(|index| index.name == name);
         if self.lookup(&name).is_some() || exists {
             if if_not_exists {
+                // PostgreSQL 的 `IF NOT EXISTS` 就是看**名字**:名字在,它什么都不做
+                // (哪怕那条索引建在别的表/别的列上).保留这个口径,免得幂等脚本
+                // 里的 `CREATE INDEX IF NOT EXISTS` 突然开始报错.
                 return Ok(name);
             }
             return Err(DbError::DuplicateSymbol { name });
         }
 
-        let relation = self
-            .relation(&table)
-            .ok_or_else(|| DbError::UnknownSymbol {
-                name: table.clone(),
-            })?;
+        let (name, _) = self.ensure_index(&name, &table, column, unique, if_not_exists, false)?;
+        Ok(name)
+    }
 
-        // 建一份索引:错的列号在这里就会被 `Index::build` 报出来
-        let slot = IndexSlot::new(column);
+    /// "这一列上要有一条索引"的唯一落点(显式的 `CREATE INDEX` 与主键那条隐含索引
+    /// 都走它).
+    ///
+    /// * `name` **空** 表示没有名字可依:按 PostgreSQL 的口径合成
+    ///   ([`implicit_index`]),撞名就加 `_1`,`_2` 直到空出来;
+    /// * `name` 非空就是显式名字,冲突的处理与 [`create_index`](SymbolTable::create_index)
+    ///   原样一致(报 [`DbError::DuplicateSymbol`],`if_not_exists` 命中时放行);
+    /// * `unique` 决定这一份强不强制唯一性--**主键**与 `CREATE UNIQUE INDEX` 是
+    ///   `true`,单列 `UNIQUE` 那份是 `false`(见 [`crate::db::index`]);
+    /// * `implicit` 记的是"它是约束顺手建出来的":只影响
+    ///   [`drop_index`](SymbolTable::drop_index) 的口径.
+    ///
+    /// 返回 `(生效索引名, 这一次是不是真建了)`:已经有一份**同列且唯一性一致**的
+    /// 索引时复用它,返回 `false`--于是
+    /// [`rebuild_indexes`](SymbolTable::rebuild_indexes) 是幂等的,重复调用与"用户
+    /// 自己 `CREATE INDEX` 过的那一列"都不会再建第二份.
+    pub fn ensure_index(
+        &mut self,
+        name: &str,
+        table: &str,
+        column: usize,
+        unique: bool,
+        if_not_exists: bool,
+        implicit: bool,
+    ) -> Result<(String, bool)> {
+        let table = self.effective_name(table);
+        // **裸名**在这里展开成生效名(与表名同一套规则).显式 (`CREATE INDEX`) 走
+        // 那条路时 `create_index` 已经展开过一次,这里再展开是**幂等**的;隐含的
+        // (`PRIMARY KEY` 顺手那条)给的是裸名,就靠这一句落到表所在的 schema 里.
+        let name = self.effective_name(name);
+
+        // 同一个名字已经有一条索引:要么报错,要么(写了 `IF NOT EXISTS`)当满足要求
+        if let Some(at) = self.indexes.iter().position(|index| index.name == name) {
+            if !if_not_exists {
+                return Err(DbError::DuplicateSymbol {
+                    name: name.to_string(),
+                });
+            }
+            return Ok((self.indexes[at].name.clone(), false));
+        }
+        // 名字被**表 / 别名**占了(它们在同一个名单里).合成名可以直接换一个;
+        // 显式名字只能报错,与 `create_index` 的老口径一致.
+        if !name.is_empty() && self.lookup(&name).is_some() {
+            if if_not_exists {
+                return Ok((name.to_string(), false));
+            }
+            return Err(DbError::DuplicateSymbol {
+                name: name.to_string(),
+            });
+        }
+
+        // 这一列上已经有一份**口径相同**的索引,就用它:同一个"列 + 唯一性"建两份
+        // 是纯浪费,而且会让 `indexes_of` 报出两条一样的.
+        if let Some(index) = self.indexes.iter().find(|index| {
+            index.table == table && index.column() == column && index.unique() == unique
+        }) {
+            return Ok((index.name.clone(), false));
+        }
+
+        let name = match name.is_empty() {
+            true => self.auto_index_name("", &table, column, unique),
+            false => name,
+        };
+
+        let relation = self.relation(&table).ok_or_else(|| DbError::UnknownSymbol {
+            name: table.clone(),
+        })?;
+
+        // 建一份索引:错的列号在这里就会被 `Index::build` 报出来;`unique` 的还会
+        // 顺带查重(表里已经有重复行就建不出来).
+        let slot = IndexSlot::new(column, unique, name.clone());
         slot.build(relation)?;
 
         self.indexes.push(IndexSymbol {
             name: name.clone(),
             table,
             slot: Rc::new(slot),
+            implicit,
         });
-        Ok(name)
+        Ok((name, true))
+    }
+
+    /// 合成一个**没被占用**的索引名(占用 = 任何符号名,或任何索引名).
+    ///
+    /// `desired` 是 [`implicit_index`] 给的口径名(空串表示"没有名字可依",由这里
+    /// 现算),撞上了就加 `_1`,`_2`,......索引的选择路径按**列**查,名字只用于显示
+    /// 与报错,所以这里怎么退让都不会影响哪条查询走索引.
+    fn auto_index_name(&self, desired: &str, table: &str, column: usize, unique: bool) -> String {
+        let base = match desired.is_empty() {
+            true => implicit_index(table, self.columns(table).unwrap_or(&[]), column, unique).0,
+            false => desired.to_string(),
+        };
+        if !self.name_taken(&base) {
+            return base;
+        }
+        for n in 1.. {
+            let candidate = format!("{}_{}", base, n);
+            if !self.name_taken(&candidate) {
+                return candidate;
+            }
+        }
+        unreachable!("a free index name always exists")
+    }
+
+    /// 这个名字被符号或索引占了吗.
+    fn name_taken(&self, name: &str) -> bool {
+        self.lookup(name).is_some() || self.indexes.iter().any(|index| index.name == name)
+    }
+
+    /// 建表时给 `PRIMARY KEY` / 单列 `UNIQUE` 顺手建的那条索引(TODO 8.7).
+    ///
+    /// `enforced` 决定这一份强不强制唯一性(主键强制,`UNIQUE` 不强制),也决定
+    /// 合成名的后缀(`_pkey` / `_<列>_key`).返回 `(索引名, 这一次是不是真建了)`.
+    ///
+    /// 合成名是**裸名**([`implicit_index`]),这里交给 `effective_name` 按当时的
+    /// `search_path` 加前缀:于是 `search_path` 是 `imdb` 时它叫 `imdb.movies_pkey`,
+    /// 与 PostgreSQL 把索引放进表所在的 schema 同一套,而且一张表只有一个索引名.
+    pub fn ensure_implicit_index(
+        &mut self,
+        table: &str,
+        column: usize,
+        enforced: bool,
+    ) -> Result<(String, bool)> {
+        let table = self.effective_name(table);
+        // 合成名已经带**表所在的 schema**(见 [`implicit_index`] 的"打开库"那段),
+        // 而 `ensure_index` 那次 `effective_name` 是幂等的,不会再动它.
+        let (desired, _) = {
+            let columns = self.columns(&table).unwrap_or(&[]);
+            implicit_index(&table, columns, column, enforced)
+        };
+        // `if_not_exists = true`:同名索引已经在那儿(比如 `rebuild_indexes` 第二次
+        // 跑)就复用它--这条路上"名字撞了"永远不该是错误,它就是我刚建的那一条.
+        self.ensure_index(&desired, &table, column, enforced, true, true)
+    }
+
+    /// 建表时该给哪几列顺手建索引:`(表名, 列下标, 强不强制唯一性)`.
+    ///
+    /// 判据只有一处([`crate::db::table::Unique`]),于是"哪一列上有隐含索引"
+    /// 不会有两份说法.
+    pub fn unique_columns(&self) -> Vec<(String, usize, bool)> {
+        let mut out = Vec::new();
+        for symbol in &self.symbols {
+            let Symbol::Relation { name, table } = symbol else {
+                continue;
+            };
+            for (column, def) in table.columns().iter().enumerate() {
+                if !def.unique.is_none() {
+                    out.push((name.clone(), column, def.unique.enforced()));
+                }
+            }
+        }
+        out
+    }
+
+    /// 打开库之后,把 `Column::unique` 标记的那些索引**重建**回来.
+    ///
+    /// 索引是会话级的目录对象(不落盘),而"这一列上本该有访问路径"是**表的事实**
+    /// (跟着模式文件走).没有这一步,`ysql` 一重启主键就退回全表扫--`tests.sql`
+    /// 的 Test 10.3 会当场从"跑得完"变成"跑不完".
+    ///
+    /// 幂等:已经有**同列同口径**索引的列跳过(见 [`ensure_index`](SymbolTable::ensure_index)),
+    /// 所以重复调用,以及"用户自己 `CREATE INDEX` 过的那一列"都不会建第二份.
+    /// 返回这一次真建了哪几条(给测试与报告用).
+    pub fn rebuild_indexes(&mut self) -> Result<Vec<(String, usize)>> {
+        let mut built = Vec::new();
+        for (table, column, enforced) in self.unique_columns() {
+            let (name, created) = self.ensure_implicit_index(&table, column, enforced)?;
+            if created {
+                built.push((name, column));
+            }
+        }
+        Ok(built)
     }
 
     /// `DROP INDEX [IF EXISTS] name`.返回被删掉的索引名.
+    ///
+    /// **隐含索引(主键那条)不许单独删**:它与约束是一体的,而本版没有
+    /// `ALTER TABLE ... DROP CONSTRAINT`,删掉就等于"约束说没就没".显式建的索引
+    /// 照删不误.
     pub fn drop_index(&mut self, name: &str, if_exists: bool) -> Result<String> {
         let name = self.effective_name(name);
         match self.indexes.iter().position(|index| index.name == name) {
+            Some(at) if self.indexes[at].implicit => Err(DbError::Unsupported {
+                feature: format!("{}", tr!("ir.symbol.003", arg0 = name)),
+            }),
             Some(at) => {
                 self.indexes.remove(at);
                 Ok(name)
@@ -637,6 +955,32 @@ impl SymbolTable {
             .iter()
             .filter(|index| index.table == table)
             .map(|index| (index.name.clone(), index.column()))
+            .collect()
+    }
+
+    /// 表名是**生效名**:哪些索引强不强制唯一性(TODO 8.7).
+    pub fn unique_slots_of(&self, table: &str) -> Vec<(Rc<IndexSlot>, String)> {
+        let table = self.effective_name(table);
+        self.indexes
+            .iter()
+            .filter(|index| index.table == table && index.unique())
+            .map(|index| (Rc::clone(&index.slot), index.name.clone()))
+            .collect()
+    }
+
+    /// 这张表上**强不强制唯一性**的索引建在哪几列上.
+    ///
+    /// `UPDATE` 靠它决定"这次改动有没有可能撞键":`SET` 一列都没碰到这些列时,
+    /// 唯一性**不可能**被破坏(那些列的值一个都没动),于是整表查重那一步可以
+    /// 整段省掉--它是 O(整表),而 `tests.sql` / `update_*.sql` 里的 `UPDATE`
+    /// 全是改无关列(`runtime_minutes` + 1 之类),这条省下来的是**每一次**语句.
+    pub fn unique_columns_of(&self, table: &str) -> Vec<usize> {
+        // 调用点(`UPDATE`)是热路径:名字只解一次,别在每次比较里再走一遍 `candidates`
+        let table = self.effective_name(table);
+        self.indexes
+            .iter()
+            .filter(|index| index.table == table && index.unique())
+            .map(|index| index.column())
             .collect()
     }
 
@@ -673,14 +1017,19 @@ impl SymbolTable {
         }
     }
 
-    /// `UPDATE` 之后让这张表上的索引全部失效(下次用到时重建).
+    /// `UPDATE` 之后让这张表上**写到的列**的索引失效(下次用到时重建).
     ///
     /// 为什么不是现场维护:一行的改动会挪动好几个键,逐个改与"整体作废,下次重建"
     /// 相比既容易错也不划算;`UPDATE` 本来就要扫全表.
-    pub fn invalidate_indexes(&mut self, table: &str) {
+    ///
+    /// 为什么**不是作废全部**(TODO 3.15):`update_row` 是**原地替换**,行号一行都
+    /// 不动--于是没被写到的列,它那份"键 → 行号"仍然**完全有效**,作废它就是下一
+    /// 次用到时白重建一遍整表(那是 O(整表) 的).作废必须**先做**:中途出错也不能
+    /// 留下拿旧行号回答新键的索引.
+    pub fn invalidate_indexes(&mut self, table: &str, written: &[usize]) {
         let table = self.effective_name(table);
         for index in &self.indexes {
-            if index.table == table {
+            if index.table == table && written.contains(&index.column()) {
                 index.slot.invalidate();
             }
         }
@@ -752,7 +1101,7 @@ impl SymbolTable {
             .map(|(index, _)| index)
             .collect();
         for index in doomed_slots {
-            self.snapshot_before_write(index);
+            self.snapshot_before_write(index, Write::InPlace);
         }
 
         self.symbols
