@@ -296,6 +296,8 @@ ir.expr.044: "step %{arg0}: EXTRACT 的参数必须是 TIMESTAMP / DATE 或日�
 ir.expr.045: "step %{arg0}: 不能把 %{arg1} 转成 %{arg2}"
 ir.expr.046: "step %{arg0}: COALESCE 的第 %{arg1} 个参数类型是 %{arg3},与前面统一不了(当前是 %{arg2})"
 ir.expr.047: "看不懂的 %{arg1} 文本 `%{arg0}`:%{arg2}"
+ir.expr.048: "step %{arg0}: IN 的键与左值 %{arg1} 不是同一大类--跨大类在值层面是不同的键,拿集合查会漏行"
+ir.expr.049: "step %{arg0}: IN 的左值必须是值或 NULL,实际是 %{arg1}"
 
 # ---- src/ir/irgen.rs ----
 ir.irgen.001: "没有解析出任何语句"

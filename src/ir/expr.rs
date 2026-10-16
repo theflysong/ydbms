@@ -29,7 +29,8 @@
 //! 不在本文件,见 [`crate::ir::value`].
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::rc::Rc;
 
 use crate::db::table::{Column, DataType, DecimalOp, DbError, Result, TypeFamily, Value};
 
@@ -250,6 +251,58 @@ impl UnOp {
     }
 }
 
+/// `IN` 列表里的那一组常量(见 [`Step::InSet`]).
+///
+/// `values` 留着**原样**(按书写顺序,含重复项与 NULL),渲染与"列表里有 NULL 吗"
+/// 用它;`set` 是求值用的那一份--`Value` 的 `Hash` 与派生的 `Eq` 对齐(见
+/// `src/db/AGENTS.md` 的那条不变式),可以直接当键.
+///
+/// 只在**每一项都折成了常量**,而且**每一项都与左值同族**(或 NULL)时才建得出来
+/// (见 `irgen::lower_in`):跨大类的值(`Int(1)` 与 `Numeric("1")`)不是同一个键,
+/// 拿集合去查会安静地漏行.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InValues {
+    values: Vec<Value>,
+    set: HashSet<Value>,
+    /// 列表里有 `NULL` 吗.它决定"没命中"是 `False` 还是 `Unknown`.
+    has_null: bool,
+}
+
+impl InValues {
+    /// 按书写顺序收下这一组常量.
+    pub fn new(values: Vec<Value>) -> Self {
+        let has_null = values.iter().any(Value::is_null);
+        let set = values.iter().cloned().collect();
+        InValues {
+            values,
+            set,
+            has_null,
+        }
+    }
+
+    /// 这一组键**全都在** `family` 这个大类的键空间里吗(NULL 不算,它谁都收).
+    ///
+    /// 这是"能不能拿 `Value` 当键直接比"的判据:不同大类的值在 `Value` 层面**不是
+    /// 同一个键**,而运行时比较会放大 `INT` → `NUMERIC`--那两种口径不一致,只走
+    /// OR 链那条(它按 `apply` 的规则比).降级期用 [`InValues::new`] 收下常量之前
+    /// 先问它一次.
+    pub fn same_family(&self, family: TypeFamily) -> bool {
+        self.values
+            .iter()
+            .all(|value| value.is_null() || value.family() == Some(family))
+    }
+
+    /// 列表里的常量,按书写顺序(渲染用).
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    /// 这个值在列表里吗.
+    fn contains(&self, value: &Value) -> bool {
+        self.set.contains(value)
+    }
+}
+
 /// 一条指令.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -418,6 +471,33 @@ pub enum Step {
         /// 源寄存器.
         src: Reg,
         /// 是 `IS NOT NULL` 吗.
+        negated: bool,
+    },
+    /// `regs[dst] = (regs[src] IN <集合>)`,或 `NOT IN`(`negated`).
+    ///
+    /// `x IN (a, b, ...)` 本来折成一条**左深 OR 链**(每项一个自足子程序,逐项比),
+    /// 于是逐行求值是 O(键数)--而 `WHERE` 又是一趟全表扫,两个乘起来就是
+    /// **O(行数 x 键数)**(实测:`name_basics` 50 万行上 1000 个键要 84 秒).
+    /// 列表里的键**全是常量**时折成这一条:降级期把常量收进 [`InValues`],逐行
+    /// O(1) 探测.
+    ///
+    /// 四条口径:
+    ///
+    /// * **不是"全部常量"就退回 OR 链**(见 `irgen::lower_in`):`x IN (1, 1/0)` 的
+    ///   惰性(命中第一项就不再算第二项)是**有测试钉着**的,而 `1/0` 折不动;
+    /// * **三值逻辑**:左值是 NULL → `Unknown`;命中 → 真(`NOT IN` 是假);
+    ///   没命中而列表里有 NULL → `Unknown`(与 `x = NULL` 同一条);
+    /// * **同族才用**(`InValues::same_family`):`Value::Int(1)` 与 `Value::Numeric("1")`
+    ///   在值层面不是同一个键,跨大类拿集合查会**安静地漏行**;那种列表退回 OR 链,
+    ///   让 `apply` 按它自己的规则放大再比.
+    InSet {
+        /// 目的寄存器.
+        dst: Reg,
+        /// 源寄存器(要查的那个值).
+        src: Reg,
+        /// 列表里的那一组常量.
+        values: Rc<InValues>,
+        /// 是 `NOT IN` 吗.
         negated: bool,
     },
 }
@@ -819,6 +899,31 @@ impl Prog {
                     // `Plan::analyze` 核对(见 `Step::Outer` 的文档).
                     write_reg(&mut defined, *dst, *ty, at)?;
                 }
+                Step::InSet {
+                    dst, src, values, ..
+                } => {
+                    // 左值必须是**值**(或 NULL);`x IN (true)` 这种真值列表本来就被
+                    // `unify_branches` 挡住,这里只是把住自己这一关.
+                    match read_reg(&defined, *src, at)? {
+                        ScalarType::Value(family) => {
+                            // 集合里的键与左值**同族**--不同族在值层面不是同一个键,
+                            // 这条由降级(`InValues::same_family`)挑过一次,手写的
+                            // 程序在这里被挡住.
+                            if !values.same_family(family) {
+                                return Err(invalid(format!("{}", tr!("ir.expr.048", arg0 = 
+                                    at, arg1 =  family
+                                ))));
+                            }
+                        }
+                        ScalarType::Null => {}
+                        other => {
+                            return Err(invalid(format!("{}", tr!("ir.expr.049", arg0 = 
+                                at, arg1 =  other
+                            ))))
+                        }
+                    }
+                    write_reg(&mut defined, *dst, ScalarType::Bool, at)?;
+                }
             }
         }
 
@@ -993,6 +1098,37 @@ impl Prog {
                 Step::Outer { dst, depth, index, .. } => {
                     let v = env.outer(*depth, *index)?;
                     put(&mut regs, *dst, v, self.nregs)?;
+                }
+                Step::InSet {
+                    dst,
+                    src,
+                    values,
+                    negated,
+                } => {
+                    let truth = match get(&regs, *src, self.nregs)? {
+                        // NULL(以及真值里的 UNKNOWN)与谁比都是 UNKNOWN
+                        Scalar::Value(value) if value.is_null() => Tri::Unknown,
+                        Scalar::Truth(Tri::Unknown) => Tri::Unknown,
+                        Scalar::Value(value) => {
+                            if values.contains(&value) {
+                                match negated {
+                                    true => Tri::False,
+                                    false => Tri::True,
+                                }
+                            } else if values.has_null {
+                                // 没命中,但"等于 NULL"是 UNKNOWN,`NOT IN` 也一样
+                                Tri::Unknown
+                            } else {
+                                match negated {
+                                    true => Tri::True,
+                                    false => Tri::False,
+                                }
+                            }
+                        }
+                        // `verify` 只放行值类型与 NULL,真值进不来
+                        Scalar::Truth(_) => return Err(EvalError::NotABool),
+                    };
+                    put(&mut regs, *dst, Scalar::Truth(truth), self.nregs)?;
                 }
             }
         }
@@ -1278,6 +1414,32 @@ impl Prog {
                     set(&mut texts, *dst, format!("({} {})", inner, op));
                     set(&mut compound, *dst, false);
                 }
+                Step::InSet {
+                    dst,
+                    src,
+                    values,
+                    negated,
+                } => {
+                    let inner = at(&texts, *src);
+                    let op = if *negated { "NOT IN" } else { "IN" };
+                    // 列表可能很长(`IN (1000 个常量)` 是常有的事),全打出来会把
+                    // 计划淹没:只渲染前几个,剩下的用省略号.
+                    let mut shown: Vec<String> = values
+                        .values()
+                        .iter()
+                        .take(EXPLAIN_IN_ITEMS)
+                        .map(|value| value.to_string())
+                        .collect();
+                    if values.values().len() > shown.len() {
+                        shown.push("...".to_string());
+                    }
+                    set(
+                        &mut texts,
+                        *dst,
+                        format!("{} {} ({})", inner, op, shown.join(", ")),
+                    );
+                    set(&mut compound, *dst, false);
+                }
                 Step::Binary { dst, op, lhs, rhs } => {
                     let l = if flag(&compound, *lhs) {
                         format!("({})", at(&texts, *lhs))
@@ -1510,6 +1672,21 @@ impl ProgBuilder {
         dst
     }
 
+    /// `x IN <集合>`(`negated` 是 `NOT IN`),见 [`Step::InSet`].
+    ///
+    /// 只有 `irgen::lower_in` 那句"每一项都是常量,而且与左值同族"成立时才发它;
+    /// 别处要发就自己保证那两条(不然就是安静的错答案或"惰性没了").
+    pub fn in_set(&mut self, src: Reg, values: InValues, negated: bool) -> Reg {
+        let dst = self.fresh();
+        self.steps.push(Step::InSet {
+            dst,
+            src,
+            values: Rc::new(values),
+            negated,
+        });
+        dst
+    }
+
     /// 读外层查询的某一列(相关子查询用).
     pub fn outer(&mut self, depth: u16, index: usize, ty: ScalarType) -> Reg {
         let dst = self.fresh();
@@ -1566,9 +1743,16 @@ fn step_dst(step: &Step) -> Option<Reg> {
         | Step::Cast { dst, .. }
         | Step::Subquery { dst, .. }
         | Step::Outer { dst, .. }
-        | Step::IsNull { dst, .. } => Some(*dst),
+        | Step::IsNull { dst, .. }
+        | Step::InSet { dst, .. } => Some(*dst),
     }
 }
+
+/// `EXPLAIN` 里 [`Step::InSet`] 那个列表最多渲染几项.
+///
+/// 列表可以是 `IN (1000 个常量)`(实测里就是),全打出来会把计划淹没;多出来的用
+/// 一个 `...` 顶上--渲染只是给人看的,求值用的是整份集合.
+const EXPLAIN_IN_ITEMS: usize = 8;
 
 /// 一个子程序的渲染结果是"复合表达式"吗(渲染时要不要加括号).
 ///

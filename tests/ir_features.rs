@@ -10,7 +10,7 @@
 use ydbms::db::table::{DataType, DbError, TabShape, Table, Value};
 use ydbms::db::PhysTab;
 use ydbms::ir::irgen::civil_date_from_days;
-use ydbms::ir::{compile, execute, run_script, Outcome, SymbolTable};
+use ydbms::ir::{compile, execute, run_script, Op, Outcome, Prog, Step, SymbolTable};
 
 /// ```text
 /// id | name      | score | joined                  | 备注
@@ -113,6 +113,94 @@ fn in_list_uses_the_column_type_for_the_literals() {
     assert_eq!(
         ints(&symbols, "SELECT id FROM t WHERE joined IN ('2024-03-04 00:00:00')", 0),
         vec![2]
+    );
+}
+
+// ------------------------------- `IN` 列表折成一次集合探测(TODO 3.18)
+
+/// 一条查询里 `Scan` 上那个下推的谓词(单表查询降级出来就一个 `Scan` 节点).
+fn scan_filter(symbols: &SymbolTable, sql: &str) -> Prog {
+    let plan = compile(sql, symbols).unwrap_or_else(|e| panic!("`{sql}` 降级失败:{e}"));
+    plan.nodes
+        .iter()
+        .find_map(|node| match &node.op {
+            Op::Scan {
+                filter: Some(prog), ..
+            } => Some(prog.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("`{sql}` 的 `Scan` 上没有下推的谓词"))
+}
+
+/// 程序里有几条 `InSet`.
+fn in_set_steps(prog: &Prog) -> usize {
+    prog.steps()
+        .iter()
+        .filter(|step| matches!(step, Step::InSet { .. }))
+        .count()
+}
+
+/// 程序里有几条 `Or`(OR 链的样子).
+fn or_steps(prog: &Prog) -> usize {
+    prog.steps()
+        .iter()
+        .filter(|step| matches!(step, Step::Or { .. }))
+        .count()
+}
+
+#[test]
+fn a_constant_in_list_becomes_one_set_probe() {
+    // 全常量 + 同族:折成一个 `InSet`,逐行 O(1) 探测(而不是逐项比)
+    let symbols = db();
+    let filter = scan_filter(&symbols, "SELECT id FROM t WHERE id IN (1, 3, 5)");
+    assert_eq!(in_set_steps(&filter), 1, "整条列表就该是一个集合探测");
+    assert_eq!(or_steps(&filter), 0, "不该再有 OR 链");
+    // 结果与 OR 链那条路逐字相同(含重复项)
+    assert_eq!(
+        ints(&symbols, "SELECT id FROM t WHERE id IN (5, 1, 3, 1) ORDER BY id", 0),
+        vec![1, 3, 5]
+    );
+}
+
+#[test]
+fn a_non_constant_in_list_still_walks_the_or_chain() {
+    // `1/0` 折不动:这条路必须退回 OR 链,否则"命中第一项就不再算第二项"那条
+    // 惰性就没了(见 `tests/ir_lazy.rs`)
+    let symbols = db();
+    let filter = scan_filter(&symbols, "SELECT id FROM t WHERE id IN (1, 1/0)");
+    assert_eq!(in_set_steps(&filter), 0, "折不动的不许折进集合");
+    assert!(or_steps(&filter) > 0, "要退回 OR 链");
+
+    // 引用了列的键(`id IN (score)`)同理:那不是常量
+    let filter = scan_filter(&symbols, "SELECT id FROM t WHERE id IN (score)");
+    assert_eq!(in_set_steps(&filter), 0);
+}
+
+#[test]
+fn a_cross_family_in_list_keeps_the_or_chain() {
+    // 列表里有个 NUMERIC(`2.5`),而列是 INT:跨大类的值在 `Value` 层面不是同一个键,
+    // 拿集合查会漏行--所以退回 OR 链,让运行时的比较去放大
+    let symbols = db();
+    let filter = scan_filter(&symbols, "SELECT id FROM t WHERE id IN (1, 2.5)");
+    assert_eq!(in_set_steps(&filter), 0, "跨大类不许走集合");
+    assert_eq!(
+        ints(&symbols, "SELECT id FROM t WHERE id IN (1, 2.5) ORDER BY id", 0),
+        vec![1]
+    );
+}
+
+#[test]
+fn in_with_a_null_in_the_list_is_unknown_when_it_misses() {
+    // 集合那条路上的三值逻辑:没命中而列表里有 NULL → UNKNOWN(不是 FALSE)
+    let symbols = db();
+    assert_eq!(
+        ints(&symbols, "SELECT id FROM t WHERE id IN (1, NULL) ORDER BY id", 0),
+        vec![1]
+    );
+    assert_eq!(ints(&symbols, "SELECT id FROM t WHERE id NOT IN (1, 2, NULL)", 0).len(), 0);
+    assert_eq!(
+        texts(&symbols, "SELECT name FROM t WHERE id IN (1, 2, NULL) ORDER BY id", 0),
+        vec!["Alice".to_string(), "bob".to_string()]
     );
 }
 

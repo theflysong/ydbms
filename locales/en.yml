@@ -297,6 +297,8 @@ ir.expr.044: "step %{arg0}: the argument of EXTRACT must be TIMESTAMP / DATE or 
 ir.expr.045: "step %{arg0}: cannot cast %{arg1} to %{arg2}"
 ir.expr.046: "step %{arg0}: argument %{arg1} of COALESCE has type %{arg3}, which cannot be unified with %{arg2}"
 ir.expr.047: "cannot read `%{arg0}` as %{arg1}: %{arg2}"
+ir.expr.048: "step %{arg0}: the keys of IN and the left side %{arg1} are not the same type class -- across type classes the keys differ at the value level, so a set lookup would miss rows"
+ir.expr.049: "step %{arg0}: the left side of IN must be a value or NULL, but it is %{arg1}"
 
 # ---- src/ir/irgen.rs ----
 ir.irgen.001: "no statement was parsed"

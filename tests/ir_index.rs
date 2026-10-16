@@ -169,20 +169,20 @@ fn explain_shows_the_index_path_for_an_in_list() {
     // 没有索引:那条 `IN` 只能逐行算(`((x = 1) OR (x = 3))`)
     assert_eq!(
         explain(&db, "SELECT x FROM t WHERE x IN (1, 3)"),
-        "Scan(t, filter=[(x = 1) OR (x = 3)])\n"
+        "Scan(t, filter=[x IN (1, 3)])\n"
     );
 
     ok(&mut db, "CREATE INDEX t_x ON t (x)");
     // 有索引:一次一个键,各键的桶合并就是命中的行(谓词照旧逐行复核)
     assert_eq!(
         explain(&db, "SELECT x FROM t WHERE x IN (1, 3)"),
-        "Scan(t, index=[x], filter=[(x = 1) OR (x = 3)])\n"
+        "Scan(t, index=[x], filter=[x IN (1, 3)])\n"
     );
 
     // `NOT IN` **不能**走索引:索引答的是"在不在这些键里",答不了"不在"
     assert_eq!(
         explain(&db, "SELECT x FROM t WHERE x NOT IN (1, 3)"),
-        "Scan(t, filter=[(x <> 1) AND (x <> 3)])\n"
+        "Scan(t, filter=[x NOT IN (1, 3)])\n"
     );
 }
 
@@ -223,7 +223,7 @@ fn an_in_list_with_null_still_probes_and_let_the_predicate_decide() {
 
     assert_eq!(
         explain(&db, "SELECT x FROM t WHERE x IN (1, NULL)"),
-        "Scan(t, index=[x], filter=[(x = 1) OR (x = NULL)])\n"
+        "Scan(t, index=[x], filter=[x IN (1, NULL)])\n"
     );
     assert_eq!(rows(&db, "SELECT x FROM t WHERE x IN (1, NULL)"), 1);
 }

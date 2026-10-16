@@ -83,9 +83,10 @@ use crate::usr::{Password, PasswordAction, RoleAttrChange, RoleAttrs};
 
 use super::checks::Check;
 use super::expr::{
-    unified_branch_type, BinOp, Prog, ProgBuilder, Reg, ScalarFunc, Step, SubMode, SubPlan, UnOp,
+    unified_branch_type, BinOp, InValues, Prog, ProgBuilder, Reg, ScalarFunc, Step, SubMode, SubPlan,
+    UnOp,
 };
-use super::value::ScalarType;
+use super::value::{Scalar, ScalarType};
 use super::opt;
 use super::plan::{
     passthrough_column, plan_has_outer, project_column, AggFunc, AggSpec, JoinKind, JoinStrategy,
@@ -3956,14 +3957,51 @@ pub(crate) fn lower_in_key_set(
     Ok(Some((index, keys)))
 }
 
+/// 列表里每一项都**折成了常量**吗;是就把它们收成一个集合(见 [`Step::InSet`]).
+///
+/// 折不动(`1/0`,`'abc'::int`)或者折出来不是值(真值,子查询,读列)的一律返回
+/// `None`--那条路照旧走 OR 链,求值顺序与报错口径一个字都不变.
+///
+/// 每一项都按 `expected`(左列的类型)定型,于是 `ts IN ('2024-01-15')` 里的字面量
+/// 仍然落在时间戳上;`same_family` 那道闸门留给调用方(它才知道左值的类型).
+fn constant_in_values(
+    items: &[Node],
+    scope: &Scope<'_>,
+    expected: Option<&DataType>,
+    mut agg: Option<&mut AggLowering>,
+) -> Result<Option<InValues>> {
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let mut p = ProgBuilder::new();
+        let reg = lower_expr_in(item, scope, expected, agg.as_deref_mut(), &mut p)?;
+        match p.finish(reg).as_const() {
+            Some(Scalar::Value(value)) => values.push(value.clone()),
+            // 读列 / 子查询 / 外层引用 / 折不动:集合这条路走不通
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(InValues::new(values)))
+}
+
 /// `x IN (a, b, c)` 与 `x NOT IN (a, b, c)`.
 ///
 /// 语法树里这是一个 [`AExpr`] (`kind = AexprIn`,`name` 是 `=` 或 `<>`),右边是
-/// `List`.折成 `x = a OR x = b ...`(`NOT IN` 折成 `<> ... AND ...`):Kleene 三值
-/// 逻辑下这与 PostgreSQL **完全等价**--`x NOT IN (1, NULL)` 也该是 UNKNOWN.
+/// `List`.两种折法,挑得出来的那种**逐行更便宜**:
 ///
-/// 第 2 项起都放进**自足子程序**,用 [`Step::Or`](super::expr::Step::Or) /
-/// `And` 串起来,于是与 `AND`/`OR` 一样短路:`x IN (1, 1/0)` 只要第一项就命中.
+/// * **全常量 + 与左值同族**时折成一个**集合**([`Step::InSet`],TODO 3.18):逐行
+///   O(1) 探测.不这么办的话,`x IN (1000 个常量)` 是拿那 1000 个键对**每一行**各
+///   比一次(实测:`name_basics` 50 万行上 84 秒);
+/// * 否则折成 `x = a OR x = b ...`(`NOT IN` 折成 `<> ... AND ...`):Kleene 三值
+///   逻辑下这与 PostgreSQL **完全等价**--`x NOT IN (1, NULL)` 也该是 UNKNOWN.
+///   第 2 项起都放进**自足子程序**,用 [`Step::Or`](super::expr::Step::Or) /
+///   `And` 串起来,于是与 `AND`/`OR` 一样短路:`x IN (1, 1/0)` 只要第一项就命中.
+///
+/// 三条闸门缺一不可(缺了就是安静的错答案,或者把惰性弄丢):
+///
+/// * 左值必须是**裸列**--只有那样才在降级期知道它的类型;
+/// * 每一项都得**折成常量**:`1/0` 折不动(常量折叠失败就原样留着),它在 OR 链里
+///   只在该被求值时才炸,折进集合就等于提前求值了;
+/// * 每一项都得与左值**同族**:跨大类的值不是同一个键,集合查不到而 OR 链查得到.
 ///
 /// `x IN (SELECT ...)` 是 `SubLink`,不走这里.
 fn lower_in(
@@ -3994,12 +4032,26 @@ fn lower_in(
     // 用左边的列类型给列表元素定型(`ts IN ('2024-01-15')`)
     let expected = bare_column_type(lhs, scope);
 
+    // 左值先降级:它总要算,集合那条路也拿它的类型当"同族"的判据
+    let left = lower_expr_in(lhs, scope, None, agg.as_deref_mut(), p)?;
+
+    // 集合那条路(见函数头那三条闸门)
+    if let Some(column) = &expected {
+        let family = column.family();
+        if let Some(values) =
+            constant_in_values(items, scope, Some(column), agg.as_deref_mut())?
+        {
+            if values.same_family(family) {
+                return Ok(p.in_set(left, values, negated));
+            }
+        }
+    }
+
     let cmp = if negated { BinOp::Ne } else { BinOp::Eq };
 
     // 第一项直接写在 `p` 里(它总要被算),其余各项各成一个子程序
     let mut iter = items.iter();
     let first = iter.next().expect(&tr!("ir.irgen.189").into_owned());
-    let left = lower_expr_in(lhs, scope, None, agg.as_deref_mut(), p)?;
     let right = lower_expr_in(first, scope, expected.as_ref(), agg.as_deref_mut(), p)?;
     let mut acc = p.binary(cmp, left, right);
 
