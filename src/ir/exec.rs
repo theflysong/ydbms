@@ -897,20 +897,56 @@ impl RowSource for ScanSource<'_> {
             return None;
         }
 
+        // 没有下推的谓词:直接拉一行(借一眼没人判,白花一次 `row_ref`)
+        if self.filter.is_none() {
+            return self.base.next();
+        }
+
         loop {
-            let row = self.base.next()?;
-            let keep = match self.filter {
-                Some(prog) => match truth_of(prog, &row, &[], &self.ctx) {
-                    Ok(truth) => truth.is_true(),
+            // 先借一眼(TODO 3.19):谓词在借来的值上跑,被丢掉的行**一个值都不克隆**
+            if let Some(borrowed) = self.base.peek() {
+                match self.keep(borrowed) {
+                    Ok(true) => return self.base.next(),
+                    Ok(false) => {
+                        self.base.skip();
+                        continue;
+                    }
                     Err(e) => {
-                        self.error = Some(e.into_db_error(Some(self.node)));
+                        self.error = Some(e);
                         return None;
                     }
-                },
-                None => true,
-            };
-            if keep {
-                return Some(row);
+                }
+            }
+
+            // 借不出来(索引路径,磁盘基表):退回"先整行克隆,再求值"那条老路
+            let row = self.base.next()?;
+            match self.keep(&row) {
+                Ok(true) => return Some(row),
+                Ok(false) => {}
+                Err(e) => {
+                    self.error = Some(e);
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<&[Value]> {
+        // 自己能借的那一条:只有**没有自己的谓词**时才等于"下一行"--
+        // 有谓词就得逐行判,那要看下一行,借不出来
+        match self.filter {
+            None => self.base.peek(),
+            Some(_) => None,
+        }
+    }
+
+    fn skip(&mut self) {
+        // 没有自己的谓词时,丢掉一行的意思就是"让下面挪一格"(一个值都不克隆);
+        // 有谓词时下面那条路要看一眼才知道留不留,退回 `next`
+        match self.filter {
+            None => self.base.skip(),
+            Some(_) => {
+                let _ = self.next();
             }
         }
     }
@@ -918,6 +954,18 @@ impl RowSource for ScanSource<'_> {
     fn error(&self) -> Option<&DbError> {
         // 访问路径的错误(短读,建索引失败)在 `base` 里,谓词的错误在这里
         self.error.as_ref().or_else(|| self.base.error())
+    }
+}
+
+impl ScanSource<'_> {
+    /// 这一行留不留(`None` 表示没有下推的谓词 = 都留).
+    fn keep(&self, row: &[Value]) -> std::result::Result<bool, DbError> {
+        let Some(prog) = self.filter else {
+            return Ok(true);
+        };
+        truth_of(prog, row, &[], &self.ctx)
+            .map(|truth| truth.is_true())
+            .map_err(|e| e.into_db_error(Some(self.node)))
     }
 }
 
@@ -972,13 +1020,27 @@ impl RowSource for FilterSource<'_> {
         }
 
         loop {
+            // 与 `ScanSource` 同一条口径:借得到就先判,丢掉的行不克隆(TODO 3.19)
+            if let Some(borrowed) = self.input.peek() {
+                match self.keep(borrowed) {
+                    Ok(true) => return self.input.next(),
+                    Ok(false) => {
+                        self.input.skip();
+                        continue;
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        return None;
+                    }
+                }
+            }
+
             let row = self.input.next()?;
-            match truth_of(self.predicate, &row, &[], &self.ctx) {
-                // 只有确定的真才留:UNKNOWN 与 FALSE 一样被丢掉
-                Ok(truth) if truth.is_true() => return Some(row),
+            match self.keep(&row) {
+                Ok(true) => return Some(row),
                 Ok(_) => {}
                 Err(e) => {
-                    self.error = Some(e.into_db_error(Some(self.node)));
+                    self.error = Some(e);
                     return None;
                 }
             }
@@ -987,6 +1049,15 @@ impl RowSource for FilterSource<'_> {
 
     fn error(&self) -> Option<&DbError> {
         self.error.as_ref().or_else(|| self.input.error())
+    }
+}
+
+impl FilterSource<'_> {
+    /// 这一行留不留.
+    fn keep(&self, row: &[Value]) -> std::result::Result<bool, DbError> {
+        truth_of(self.predicate, row, &[], &self.ctx)
+            .map(|truth| truth.is_true())
+            .map_err(|e| e.into_db_error(Some(self.node)))
     }
 }
 

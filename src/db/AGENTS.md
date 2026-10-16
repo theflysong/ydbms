@@ -70,7 +70,11 @@ Option<&[Value]>`(默认给 `None` = "没有可借用的存储").**调用方见�
 
 页式基表([`HeapTab`](../pers/heap.rs),TODO 7.5)给的是 `None`:它的值是从页里**解码**
 出来的(注定要拥有),借不出去.于是那条快路径在磁盘表上退回整行克隆--想把它也补上,
-要的是"解码进一块可复用的缓冲"(TODO 3.19).
+要的是"解码进一块可复用的缓冲"(值还得借得出去,今天做不到).
+
+借行的两条口子在 [`RowSource::peek`](source.rs) / [`RowSource::skip`](source.rs)
+(TODO 3.19):顺序扫描与选择用它们"先借一眼再判",丢掉的行一个值都不克隆.
+`TableCursor` 把它们接到 [`Table::row_ref`](table.rs) 上.
 
 ### 自己落盘的表(`Table::paged`)
 

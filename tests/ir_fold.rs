@@ -49,13 +49,20 @@ impl Table for CountingTable {
         self.rows.len()
     }
 
+    /// 数的是"这一行的值被取用了几次":借读(`row_ref`)与克隆(`row`)各算一次.
+    ///
+    /// TODO 3.19 之后,谓词在**借来的**行上求值,所以"逐行算"未必走 `row`--
+    /// 这一列数的才是"谓词看了几行".
     fn row(&self, r: usize) -> Option<Row> {
         self.reads.set(self.reads.get() + 1);
         self.rows.get(r).cloned()
     }
 
     fn row_ref(&self, r: usize) -> Option<&[Value]> {
-        self.rows.get(r).map(|row| row.as_slice())
+        let row = self.rows.get(r)?;
+        // 只数**真取到值**的那些:越界的那一次借读不算"看了这一行"
+        self.reads.set(self.reads.get() + 1);
+        Some(row.as_slice())
     }
 }
 

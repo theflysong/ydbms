@@ -21,11 +21,15 @@ use ydbms::ir::{
 /// 一张会数自己 `row()` 被调过几次的表.
 ///
 /// 读数放在 `Rc<Cell<_>>` 里,测试才拿得到--符号表把表的所有权收走了.
+///
+/// `borrowed` 开着的时候它**能借行**(实现 [`Table::row_ref`]):`row()` 的读数就
+/// 是"克隆了几行",借读的那条路只有命中的行才走 `row`(TODO 3.19).
 struct CountingTable {
     name: String,
     shape: ColumnsShape,
     rows: Vec<Vec<Value>>,
     reads: Rc<Cell<usize>>,
+    borrowed: bool,
 }
 
 impl CountingTable {
@@ -38,6 +42,15 @@ impl CountingTable {
             shape,
             rows,
             reads,
+            borrowed: false,
+        }
+    }
+
+    /// 同上,但这张表**能借行**(走 `row_ref`).
+    fn borrowing(values: &[i32], reads: Rc<Cell<usize>>) -> Self {
+        CountingTable {
+            borrowed: true,
+            ..CountingTable::new(values, reads)
         }
     }
 }
@@ -61,6 +74,13 @@ impl Table for CountingTable {
         self.reads.set(self.reads.get() + 1);
         self.rows.get(r).cloned()
     }
+
+    fn row_ref(&self, r: usize) -> Option<&[Value]> {
+        match self.borrowed {
+            true => self.rows.get(r).map(|row| row.as_slice()),
+            false => None,
+        }
+    }
 }
 
 /// 一张装了 `t(x INT)` 的符号表,外加它的读数.
@@ -69,6 +89,16 @@ fn counting(values: &[i32]) -> (SymbolTable, Rc<Cell<usize>>) {
     let mut symbols = SymbolTable::new();
     symbols
         .define("t", CountingTable::new(values, Rc::clone(&reads)))
+        .expect("注册 t");
+    (symbols, reads)
+}
+
+/// 同上,但那张表**能借行**(`row_ref` 有实现).
+fn borrowing(values: &[i32]) -> (SymbolTable, Rc<Cell<usize>>) {
+    let reads = Rc::new(Cell::new(0));
+    let mut symbols = SymbolTable::new();
+    symbols
+        .define("t", CountingTable::borrowing(values, Rc::clone(&reads)))
         .expect("注册 t");
     (symbols, reads)
 }
@@ -136,6 +166,68 @@ fn limit_zero_pulls_nothing_not_even_the_offset() {
 
     assert_eq!(out.nrows(), 0);
     assert_eq!(reads.get(), 0, "LIMIT 0 的结果是空,连 offset 都不用跳");
+}
+
+#[test]
+fn a_selective_scan_does_not_clone_the_rows_it_drops() {
+    // TODO 3.19:`Scan` 的谓词在**借来的**行上求值,被丢掉的 90 行一个值都不克隆,
+    // 只有命中的 10 行才走 `row`(读数在这里就是"克隆了几行").
+    let (symbols, reads) = borrowing(&series(100));
+
+    let mut b = PlanBuilder::new();
+    let mut p = ProgBuilder::new();
+    let x = p.col(0);
+    let hundred = p.int(90);
+    let gt = p.binary(BinOp::Gt, x, hundred);
+    let s = b.scan_with_filter("t", p.finish(gt));
+    let plan = b.finish(s).unwrap();
+
+    let out = execute(&plan, &symbols).unwrap();
+    assert_eq!(out.nrows(), 10, "91..=100 十行");
+    assert_eq!(out.value(0, 0), Some(Value::Int(91)));
+    assert_eq!(
+        reads.get(),
+        10,
+        "只有留下的那 10 行被克隆(借读的那条路上,丢掉的行不克隆)"
+    );
+}
+
+#[test]
+fn a_scan_over_a_table_that_cannot_lend_rows_still_clones_every_row() {
+    // 借不出来(页式堆表的值是从页里解码出来的)就退回老路:每一行都要克隆一次
+    // 才能求值.这条钉住"降级之后仍然正确,只是多花那次克隆".
+    let (symbols, reads) = counting(&series(100));
+
+    let mut b = PlanBuilder::new();
+    let mut p = ProgBuilder::new();
+    let x = p.col(0);
+    let hundred = p.int(90);
+    let gt = p.binary(BinOp::Gt, x, hundred);
+    let s = b.scan_with_filter("t", p.finish(gt));
+    let plan = b.finish(s).unwrap();
+
+    let out = execute(&plan, &symbols).unwrap();
+    assert_eq!(out.nrows(), 10);
+    assert_eq!(reads.get(), 100, "借不出来:100 行都得克隆一次");
+}
+
+#[test]
+fn an_upper_filter_borrows_from_a_scan_that_has_none_of_its_own() {
+    // 谓词没被下推进扫描时,扫描本身不克隆(`peek` 透过去),上层的选择才克隆命中的
+    let (symbols, reads) = borrowing(&series(100));
+
+    let mut b = PlanBuilder::new();
+    let s = b.scan("t");
+    let mut p = ProgBuilder::new();
+    let x = p.col(0);
+    let fifty = p.int(50);
+    let lt = p.binary(BinOp::Lt, x, fifty);
+    let f = b.filter(s, p.finish(lt)).unwrap();
+    let plan = b.finish(f).unwrap();
+
+    let out = execute(&plan, &symbols).unwrap();
+    assert_eq!(out.nrows(), 49, "1..=49");
+    assert_eq!(reads.get(), 49, "只有留下的那些行被克隆");
 }
 
 #[test]

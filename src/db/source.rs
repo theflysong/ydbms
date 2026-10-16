@@ -16,6 +16,17 @@
 //!
 //! 其余算子(`Scan` / `Filter` / `Project` / `Limit`)全程流式:上层要一行,才往下拉一行.
 //!
+//! # 借一眼,而不是逐行克隆(TODO 3.19)
+//!
+//! [`RowSource::next`] 吐的是 owned 的行,所以"谓词把这一行丢掉"也要先克隆一次才能
+//! 求值.能**借行**的源([`TableCursor`] + [`Table::row_ref`])多给两条口子:
+//! [`peek`](RowSource::peek) 借一眼当前行(不推进,不克隆),[`skip`](RowSource::skip)
+//! 把它丢掉(不克隆).`Scan` 与 `Filter` 就用它们:丢掉的行**一个值都不克隆**,
+//! 只有留下的行才走 `next`(克隆一次,因为要给上层一个 owned 的行).
+//!
+//! 借不出来的源(索引路径,虚表,以及**从页里解码出来的磁盘基表**)`peek` 给 `None`,
+//! 上层就退回"先克隆再求值"那条老路--**只是慢,不会算错**.
+//!
 //! **索引**(见 [`crate::db::index`])攒的是**行号**而不是行,所以索引嵌套循环不物化
 //! 内侧.
 //!
@@ -26,7 +37,7 @@
 //! 又不丢掉运行期错误.一旦结束或出错,后续 `next()` 必须继续返回 `None`(幂等).
 
 use crate::db::phys::PhysTab;
-use crate::db::table::{Column, ColumnsShape, DbError, Result, Row, Table};
+use crate::db::table::{Column, ColumnsShape, DbError, Result, Row, Table, Value};
 
 /// 中间结果:一行一行拉,不是一张物化的表.
 ///
@@ -65,6 +76,26 @@ pub trait RowSource {
     /// 一旦结束或出错,后续调用必须继续返回 `None`--[`drain`] 的抽干循环与
     /// `Limit` 的跳过循环都依赖这一点.
     fn next(&mut self) -> Option<Row>;
+
+    /// **借一眼**下一行(不推进,不克隆);借不出来就返回 `None`(TODO 3.19).
+    ///
+    /// 这是给"谓词先看一眼,不合格就丢掉"准备的口子:借得到的实现(顺序游标 +
+    /// [`Table::row_ref`])上,被丢掉的那些行**一个值都不克隆**;借不出来的
+    /// (索引路径,虚表,以及从页里解码出来的磁盘基表)返回 `None`,调用方退回
+    /// [`next`](RowSource::next) 那条"先克隆再求值"的老路.
+    ///
+    /// `peek` 与 `next` 必须**指的是同一行**:`peek` 之后调 `next` 拿到的是 `peek`
+    /// 看到的那一行,不是它的下一行.
+    fn peek(&self) -> Option<&[Value]> {
+        None
+    }
+
+    /// 把 `peek` 看到的那一行**丢掉**(推进一行,不产出).
+    ///
+    /// 默认就是 `next()` 然后把行扔掉;能借的实现覆盖它是为了省掉那次克隆.
+    fn skip(&mut self) {
+        let _ = self.next();
+    }
 
     /// 上一次 `next` 返回 `None` 的原因;正常结束返回 `None`.
     ///
@@ -118,6 +149,18 @@ impl RowSource for TableCursor<'_> {
 
     fn columns(&self) -> &[Column] {
         self.table.columns()
+    }
+
+    fn peek(&self) -> Option<&[Value]> {
+        // 表能借就直接借(`PhysTab` 能,页式堆表不能--它的值是从页里解码出来的)
+        self.table.row_ref(self.at)
+    }
+
+    fn skip(&mut self) {
+        // 丢掉这一行:只挪位置,**不克隆**
+        if self.at < self.table.nrows() {
+            self.at += 1;
+        }
     }
 
     fn next(&mut self) -> Option<Row> {
